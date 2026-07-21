@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,8 +9,9 @@ use crate::telegram::{
     save_telegram_catalog, search_catalog,
 };
 use crate::util::{
-    LoopMode, fit_text, is_supported_audio_path, normalize_channel, progress_bar, safe_file_name,
-    shuffle_slice,
+    LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
+    parse_volume_settings, playback_controls, progress_bar, remove_queue_item, safe_file_name,
+    shuffle_slice, toggle_all,
 };
 #[test]
 fn safe_file_name_removes_windows_forbidden_chars() {
@@ -62,10 +64,26 @@ fn panel_text_is_padded_or_clipped() {
 }
 
 #[test]
+fn playback_control_table_has_aligned_rows() {
+    let rows = playback_controls();
+    let width = rows[0].chars().count();
+    assert!(rows.iter().all(|row| row.chars().count() == width));
+    assert!(rows.join("\n").contains("[p] play/pause"));
+    assert!(!rows.join("\n").contains("lyrics"));
+}
+
+#[test]
 fn loop_mode_cycles_off_all_one() {
     assert!(LoopMode::Off.cycle() == LoopMode::All);
     assert!(LoopMode::All.cycle() == LoopMode::One);
     assert!(LoopMode::One.cycle() == LoopMode::Off);
+}
+
+#[test]
+fn saved_volume_defaults_and_stays_bounded() {
+    assert_eq!(parse_volume_settings("volume=1.25\n"), 1.25);
+    assert_eq!(parse_volume_settings("volume=9\n"), 1.5);
+    assert_eq!(parse_volume_settings("invalid\n"), 0.8);
 }
 
 #[test]
@@ -116,6 +134,38 @@ fn local_playlist_round_trips_paths_and_searches() {
         search_local_tracks(&parsed[0].local_tracks, "first"),
         vec![0]
     );
+}
+
+#[test]
+fn toggle_all_selects_then_deselects_only_matches() {
+    let mut selected = HashSet::from([9]);
+    toggle_all(&mut selected, [1, 2]);
+    assert_eq!(selected, HashSet::from([1, 2, 9]));
+
+    toggle_all(&mut selected, [1, 2]);
+    assert_eq!(selected, HashSet::from([9]));
+}
+
+#[test]
+fn removing_queue_items_keeps_current_track_index() {
+    let mut queue = vec!["a", "b", "c", "d"];
+    let current = remove_queue_item(&mut queue, 2, 0);
+    assert_eq!(queue, vec!["b", "c", "d"]);
+    assert_eq!(current, 1);
+
+    let current = remove_queue_item(&mut queue, current, current);
+    assert_eq!(queue, vec!["b", "d"]);
+    assert_eq!(current, 1);
+}
+
+#[test]
+fn added_queue_songs_play_next_then_resume_original_list() {
+    let mut queue = vec!["a", "b", "c", "d"];
+    let mut play_next = 0;
+    insert_queue_next(&mut queue, 1, &mut play_next, vec!["x", "y"]);
+    insert_queue_next(&mut queue, 1, &mut play_next, vec!["z"]);
+    assert_eq!(queue, vec!["a", "b", "x", "y", "z", "c", "d"]);
+    assert_eq!(play_next, 3);
 }
 
 #[test]

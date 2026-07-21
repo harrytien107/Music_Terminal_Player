@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::fs;
+use std::hash::Hash;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,8 +10,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
 
-pub(crate) const SEEK_SECONDS: u64 = 10;
-pub(crate) const LIBRARY_FILE: &str = ".music-terminal-library";
+pub(crate) const DATA_DIR: &str = ".music-terminal";
+pub(crate) const LIBRARY_FILE: &str = ".music-terminal/library.txt";
+pub(crate) const PLAYLIST_FILE: &str = ".music-terminal/playlists.txt";
+pub(crate) const SETTINGS_FILE: &str = ".music-terminal/settings.txt";
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "alac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "webm",
 ];
@@ -17,6 +22,13 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 pub(crate) enum PlayerExit {
     Back,
     Quit,
+}
+
+pub(crate) struct QueueEdit {
+    pub(crate) index: usize,
+    pub(crate) changed: bool,
+    pub(crate) restart: bool,
+    pub(crate) finished: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +54,81 @@ impl LoopMode {
             Self::One => "one",
         }
     }
+}
+
+pub(crate) fn prepare_data_dir() -> Result<()> {
+    fs::create_dir_all(Path::new(DATA_DIR).join("catalogs"))?;
+    migrate_file(".music-terminal-library", LIBRARY_FILE)?;
+    migrate_file(".music-terminal-playlists", PLAYLIST_FILE)?;
+    migrate_file(
+        ".telegram.credentials",
+        Path::new(DATA_DIR).join("telegram.credentials"),
+    )?;
+    migrate_file(
+        ".telegram-cache",
+        Path::new(DATA_DIR).join("telegram-cache"),
+    )?;
+
+    for entry in fs::read_dir(".")? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(".telegram.session") {
+            migrate_file(
+                entry.path(),
+                Path::new(DATA_DIR).join(name.trim_start_matches('.')),
+            )?;
+        } else if let Some(channel) = name
+            .strip_prefix(".telegram-")
+            .and_then(|name| name.strip_suffix(".tracks.txt"))
+        {
+            migrate_file(
+                entry.path(),
+                Path::new(DATA_DIR)
+                    .join("catalogs")
+                    .join(format!("{channel}.tracks.txt")),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn migrate_file(old: impl AsRef<Path>, new: impl AsRef<Path>) -> Result<()> {
+    let old = old.as_ref();
+    let new = new.as_ref();
+    if !old.exists() || new.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = new.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(old, new)?;
+    Ok(())
+}
+
+pub(crate) fn load_volume() -> f32 {
+    fs::read_to_string(SETTINGS_FILE)
+        .ok()
+        .map(|text| parse_volume_settings(&text))
+        .unwrap_or(0.8)
+}
+
+pub(crate) fn parse_volume_settings(text: &str) -> f32 {
+    text.lines()
+        .find_map(|line| line.strip_prefix("volume="))
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|volume| volume.is_finite())
+        .unwrap_or(0.8)
+        .clamp(0.0, 1.5)
+}
+
+pub(crate) fn save_volume(volume: f32) -> Result<()> {
+    fs::create_dir_all(DATA_DIR)?;
+    fs::write(
+        SETTINGS_FILE,
+        format!("volume={:.2}\n", volume.clamp(0.0, 1.5)),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn normalize_channel(channel: &str) -> String {
@@ -123,11 +210,375 @@ pub(crate) fn select_menu(title: &str, items: &[String]) -> Result<Option<usize>
         match key.code {
             KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(items.len() - 1),
             KeyCode::Down => selected = (selected + 1) % items.len(),
-            KeyCode::Enter => return Ok(Some(selected)),
-            KeyCode::Esc => return Ok(None),
+            KeyCode::Enter => {
+                drop(_raw);
+                clear_screen()?;
+                return Ok(Some(selected));
+            }
+            KeyCode::Esc => {
+                drop(_raw);
+                clear_screen()?;
+                return Ok(None);
+            }
             _ => {}
         }
     }
+}
+
+pub(crate) fn toggle_all<T: Eq + Hash>(
+    selected: &mut HashSet<T>,
+    matches: impl IntoIterator<Item = T>,
+) {
+    let matches: Vec<T> = matches.into_iter().collect();
+    if matches.iter().all(|item| selected.contains(item)) {
+        for item in matches {
+            selected.remove(&item);
+        }
+    } else {
+        selected.extend(matches);
+    }
+}
+
+pub(crate) fn manage_queue<T, Label, Matches, Finished>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    available: &[T],
+    label: Label,
+    matches_query: Matches,
+    mut playback_finished: Finished,
+) -> Result<QueueEdit>
+where
+    T: Clone + Eq + Hash,
+    Label: Fn(&T) -> String,
+    Matches: Fn(&T, &str) -> bool,
+    Finished: FnMut() -> bool,
+{
+    let mut current = current.min(queue.len().saturating_sub(1));
+    let current_item = queue[current].clone();
+    let mut selected = current;
+    let mut changed = false;
+    let mut stdout = io::stdout();
+    loop {
+        if playback_finished() {
+            return Ok(QueueEdit {
+                index: current,
+                changed,
+                restart: false,
+                finished: true,
+            });
+        }
+        draw_frame(
+            &mut stdout,
+            &queue_table(queue, current, *play_next, selected, &label),
+        )?;
+
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => {
+                selected = if selected <= current {
+                    queue.len() - 1
+                } else {
+                    selected - 1
+                }
+            }
+            KeyCode::Down => {
+                selected = if selected + 1 >= queue.len() {
+                    current
+                } else {
+                    selected + 1
+                }
+            }
+            KeyCode::Enter => {
+                if selected != current {
+                    *play_next = 0;
+                }
+                return Ok(QueueEdit {
+                    index: selected,
+                    changed,
+                    restart: queue[selected] != current_item,
+                    finished: false,
+                });
+            }
+            KeyCode::Delete if queue.len() > 1 && selected != current => {
+                let queued_end = current.saturating_add(*play_next);
+                if selected > current && selected <= queued_end {
+                    *play_next -= 1;
+                }
+                current = remove_queue_item(queue, current, selected);
+                selected = selected.min(queue.len() - 1);
+                changed = true;
+            }
+            KeyCode::Char('a') => {
+                changed |= append_to_queue(
+                    queue,
+                    current,
+                    play_next,
+                    available,
+                    &label,
+                    &matches_query,
+                    &mut playback_finished,
+                )?;
+                selected = selected.min(queue.len() - 1);
+            }
+            KeyCode::Esc => {
+                return Ok(QueueEdit {
+                    index: current,
+                    changed,
+                    restart: queue[current] != current_item,
+                    finished: false,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn queue_table<T, Label>(
+    queue: &[T],
+    current: usize,
+    play_next: usize,
+    selected: usize,
+    label: &Label,
+) -> String
+where
+    Label: Fn(&T) -> String,
+{
+    const WIDTH: usize = 34;
+    let queued_start = current.saturating_add(1).min(queue.len());
+    let queued_end = queued_start.saturating_add(play_next).min(queue.len());
+    let queued = &queue[queued_start..queued_end];
+    let remaining = &queue[queued_end..];
+    let rows = queued.len().max(remaining.len()).max(1).min(12);
+    let cell = |index: Option<usize>, item: Option<&T>| {
+        item.map(|item| {
+            fit_text(
+                &format!(
+                    "{} {}",
+                    if index == Some(selected) { ">" } else { " " },
+                    label(item)
+                ),
+                WIDTH,
+            )
+        })
+        .unwrap_or_else(|| " ".repeat(WIDTH))
+    };
+    let mut frame = format!(
+        "Playback queue | {} songs\r\n\r\n┌{}┬{}┬{}┐\r\n│{}│{}│{}│\r\n├{}┼{}┼{}┤\r\n",
+        queue.len(),
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+        fit_text("Now playing", WIDTH),
+        fit_text("Next in queue", WIDTH),
+        fit_text("Next from track list", WIDTH),
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+    );
+    for row in 0..rows {
+        frame.push_str(&format!(
+            "│{}│{}│{}│\r\n",
+            cell(
+                (row == 0).then_some(current),
+                (row == 0).then_some(&queue[current])
+            ),
+            cell(
+                (row < queued.len()).then_some(current + 1 + row),
+                queued.get(row),
+            ),
+            cell(
+                (row < remaining.len()).then_some(queued_end + row),
+                remaining.get(row),
+            ),
+        ));
+    }
+    frame.push_str(&format!(
+        "└{}┴{}┴{}┘\r\n\r\n[Up/Down] select | [Enter] play | [Delete] remove | [a] add next | [Esc] close",
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+        "─".repeat(WIDTH),
+    ));
+    frame
+}
+
+pub(crate) fn remove_queue_item<T>(queue: &mut Vec<T>, current: usize, remove: usize) -> usize {
+    queue.remove(remove);
+    if remove < current {
+        current - 1
+    } else {
+        current.min(queue.len() - 1)
+    }
+}
+
+pub(crate) fn insert_queue_next<T>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    additions: Vec<T>,
+) {
+    let insert_at = current
+        .saturating_add(1)
+        .saturating_add(*play_next)
+        .min(queue.len());
+    *play_next += additions.len();
+    queue.splice(insert_at..insert_at, additions);
+}
+
+fn append_to_queue<T, Label, Matches, Finished>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    available: &[T],
+    label: &Label,
+    matches_query: &Matches,
+    playback_finished: &mut Finished,
+) -> Result<bool>
+where
+    T: Clone + Eq + Hash,
+    Label: Fn(&T) -> String,
+    Matches: Fn(&T, &str) -> bool,
+    Finished: FnMut() -> bool,
+{
+    let mut query = String::new();
+    let mut matches: Vec<_> = (0..available.len()).collect();
+    let mut row = 0usize;
+    let mut selected = HashSet::new();
+    let mut stdout = io::stdout();
+    loop {
+        row = row.min(matches.len().saturating_sub(1));
+        let start = row.saturating_sub(6).min(matches.len().saturating_sub(12));
+        let end = (start + 12).min(matches.len());
+        let mut frame = format!(
+            "Add songs to queue\r\nSearch: {query}_ | {} selected | {} matches\r\n\r\n",
+            selected.len(),
+            matches.len()
+        );
+        for (offset, &index) in matches[start..end].iter().enumerate() {
+            frame.push_str(&format!(
+                "{} [{}] {}\r\n",
+                if start + offset == row { ">" } else { " " },
+                if selected.contains(&available[index]) {
+                    "x"
+                } else {
+                    " "
+                },
+                label(&available[index])
+            ));
+        }
+        if matches.is_empty() {
+            frame.push_str("No matching tracks.\r\n");
+        }
+        frame.push_str(
+            "\r\nType to search | [Space] toggle | [Ctrl+A] all matches | [Enter] append | [Esc] cancel",
+        );
+        draw_frame(&mut stdout, &frame)?;
+
+        if playback_finished() {
+            return Ok(false);
+        }
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up if !matches.is_empty() => {
+                row = row.checked_sub(1).unwrap_or(matches.len() - 1)
+            }
+            KeyCode::Down if !matches.is_empty() => row = (row + 1) % matches.len(),
+            KeyCode::Char(' ') if !matches.is_empty() => {
+                let item = &available[matches[row]];
+                if !selected.remove(item) {
+                    selected.insert(item.clone());
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                toggle_all(
+                    &mut selected,
+                    matches.iter().map(|&index| available[index].clone()),
+                )
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                matches = available
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| matches_query(item, &query).then_some(index))
+                    .collect();
+                row = 0;
+            }
+            KeyCode::Char(character) if !character.is_control() => {
+                query.push(character);
+                matches = available
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| matches_query(item, &query).then_some(index))
+                    .collect();
+                row = 0;
+            }
+            KeyCode::Enter => {
+                let additions: Vec<_> = available
+                    .iter()
+                    .filter(|item| selected.contains(*item))
+                    .cloned()
+                    .collect();
+                let changed = !additions.is_empty();
+                insert_queue_next(queue, current, play_next, additions);
+                return Ok(changed);
+            }
+            KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn playback_controls() -> Vec<String> {
+    const CELL_WIDTH: usize = 14;
+    const CONTROLS: [[&str; 3]; 3] = [
+        ["[p] play/pause", "[v] previous", "[n] next"],
+        ["[r] shuffle", "[l] loop", "[u] queue"],
+        ["[↑/↓] volume", "[b] menu", "[q] quit"],
+    ];
+
+    let border = |left, middle, right| {
+        format!(
+            "{left}{}{middle}{}{middle}{}{right}",
+            "─".repeat(CELL_WIDTH + 2),
+            "─".repeat(CELL_WIDTH + 2),
+            "─".repeat(CELL_WIDTH + 2),
+        )
+    };
+    let row = |cells: [&str; 3]| {
+        format!(
+            "│ {} │ {} │ {} │",
+            fit_text(cells[0], CELL_WIDTH),
+            fit_text(cells[1], CELL_WIDTH),
+            fit_text(cells[2], CELL_WIDTH),
+        )
+    };
+
+    vec![
+        border('┌', '┬', '┐'),
+        row(CONTROLS[0]),
+        border('├', '┼', '┤'),
+        row(CONTROLS[1]),
+        border('├', '┼', '┤'),
+        row(CONTROLS[2]),
+        border('└', '┴', '┘'),
+    ]
 }
 
 pub(crate) fn progress_bar(elapsed: Duration, total: Option<Duration>, width: usize) -> String {
@@ -174,9 +625,15 @@ pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
 }
 
 pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) -> Result<()> {
-    let width = usize::from(terminal::size().map(|size| size.0).unwrap_or(80))
-        .saturating_sub(4)
-        .clamp(28, 84);
+    let available =
+        usize::from(terminal::size().map(|size| size.0).unwrap_or(80)).saturating_sub(4);
+    let content = rows
+        .iter()
+        .map(|row| row.chars().count())
+        .chain([title.chars().count()])
+        .max()
+        .unwrap_or(28);
+    let width = content.clamp(28, 52).min(available.max(28));
     let mut frame = String::new();
     frame.push_str(&format!("┌{}┐\r\n", "─".repeat(width + 2)));
     frame.push_str(&format!("│ {} │\r\n", fit_text(title, width)));
@@ -206,10 +663,6 @@ pub(crate) fn format_elapsed(duration: Duration) -> String {
 pub(crate) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     format!("{}:{:02}", seconds / 60, seconds % 60)
-}
-
-pub(crate) fn min_duration(a: Duration, b: Duration) -> Duration {
-    if a <= b { a } else { b }
 }
 
 pub(crate) fn shuffle_slice<T>(items: &mut [T]) {

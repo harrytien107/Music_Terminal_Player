@@ -6,14 +6,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 
 use crate::util::{
-    LoopMode, PlayerExit, RawMode, SEEK_SECONDS, draw_frame, draw_panel, format_duration,
-    is_supported_audio_path, min_duration, progress_bar, shuffle_slice,
+    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
+    is_supported_audio_path, load_volume, manage_queue, playback_controls, progress_bar,
+    save_volume, shuffle_slice, toggle_all,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -41,9 +42,11 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
 
     let stream = OutputStreamBuilder::open_default_stream()
         .context("failed to open default audio output")?;
+    let available_tracks = tracks.clone();
     let original_tracks = tracks.clone();
     let mut index = 0usize;
-    let mut volume = 0.8f32;
+    let mut play_next = 0usize;
+    let mut volume = load_volume();
     let mut shuffle = false;
     let mut loop_mode = LoopMode::Off;
     let mut duration;
@@ -63,6 +66,9 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
         )?;
 
         if sink.empty() {
+            if play_next > 0 && loop_mode != LoopMode::One {
+                play_next -= 1;
+            }
             match loop_mode {
                 LoopMode::One => {}
                 LoopMode::All => index = (index + 1) % tracks.len(),
@@ -83,11 +89,14 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(PlayerExit::Quit);
+        }
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(PlayerExit::Quit),
             KeyCode::Char('b') => return Ok(PlayerExit::Back),
-            KeyCode::Char('p') => {
+            KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if sink.is_paused() {
                     sink.play();
                 } else {
@@ -95,6 +104,9 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
                 }
             }
             KeyCode::Char('n') => {
+                if play_next > 0 {
+                    play_next -= 1;
+                }
                 index = (index + 1) % tracks.len();
                 (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
             }
@@ -107,18 +119,14 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
                 (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
             }
             KeyCode::Left => {
-                let target = sink
-                    .get_pos()
-                    .saturating_sub(Duration::from_secs(SEEK_SECONDS));
-                let _ = sink.try_seek(target);
+                volume = (volume - 0.01).max(0.0);
+                sink.set_volume(volume);
+                save_volume(volume)?;
             }
             KeyCode::Right => {
-                let now = sink.get_pos();
-                let mut target = now + Duration::from_secs(SEEK_SECONDS);
-                if let Some(total) = duration {
-                    target = min_duration(target, total);
-                }
-                let _ = sink.try_seek(target);
+                volume = (volume + 0.01).min(1.5);
+                sink.set_volume(volume);
+                save_volume(volume)?;
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
             KeyCode::Char('r') => {
@@ -136,13 +144,50 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
                     .position(|track| track == &current)
                     .unwrap_or(0);
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                volume = (volume + 0.05).min(1.5);
-                sink.set_volume(volume);
+            KeyCode::Char('u') => {
+                let edit = manage_queue(
+                    &mut tracks,
+                    index,
+                    &mut play_next,
+                    &available_tracks,
+                    |track| track.display().to_string(),
+                    |track, query| {
+                        track
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&query.trim().to_lowercase())
+                    },
+                    || sink.empty(),
+                )?;
+                index = edit.index;
+                if edit.finished {
+                    if play_next > 0 && loop_mode != LoopMode::One {
+                        play_next -= 1;
+                    }
+                    match loop_mode {
+                        LoopMode::One => {}
+                        LoopMode::All => index = (index + 1) % tracks.len(),
+                        LoopMode::Off if index + 1 < tracks.len() => index += 1,
+                        LoopMode::Off => return Ok(PlayerExit::Back),
+                    }
+                    (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                } else if edit.restart {
+                    play_next = 0;
+                    (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                }
+                if edit.changed {
+                    shuffle = false;
+                }
             }
-            KeyCode::Char('-') => {
-                volume = (volume - 0.05).max(0.0);
+            KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
+                volume = (volume + 0.10).min(1.5);
                 sink.set_volume(volume);
+                save_volume(volume)?;
+            }
+            KeyCode::Down | KeyCode::Char('-') => {
+                volume = (volume - 0.10).max(0.0);
+                sink.set_volume(volume);
+                save_volume(volume)?;
             }
             _ => {}
         }
@@ -187,7 +232,7 @@ fn draw_player(
     let total = duration
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
-    let rows = vec![
+    let mut rows = vec![
         format!(
             "Track {}/{} | {}",
             index + 1,
@@ -202,16 +247,15 @@ fn draw_player(
             total
         ),
         format!(
-            "{} | volume {:.0}% | shuffle {} | loop {}",
+            "{} · {:.0}% · shuffle {} · loop {}",
             state,
             volume * 100.0,
             if shuffle { "on" } else { "off" },
             loop_mode.label()
         ),
         String::new(),
-        "[p] play/pause | [v] previous | [n] next | [r] shuffle | [l] loop".to_string(),
-        "[Left/Right] seek | [+/-] volume | [b] menu | [q] quit".to_string(),
     ];
+    rows.extend(playback_controls());
     draw_panel(stdout, "Music Terminal Player · Local", &rows)
 }
 
@@ -273,7 +317,7 @@ pub(crate) fn choose_local_tracks(
             frame.push_str("No matching tracks.\r\n");
         }
         frame.push_str(
-            "\r\nType to search | [Space] toggle | Up/Down select | [Enter] save | [Esc] cancel",
+            "\r\nType to search | [Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -296,6 +340,10 @@ pub(crate) fn choose_local_tracks(
                     selected.insert(path.clone());
                 }
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => toggle_all(
+                &mut selected,
+                matches.iter().map(|&index| tracks[index].clone()),
+            ),
             KeyCode::Backspace => {
                 query.pop();
                 matches = search_local_tracks(tracks, &query);

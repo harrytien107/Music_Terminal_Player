@@ -11,8 +11,9 @@ use crate::telegram::{
     choose_catalog_tracks, download_channel, play_catalog_entries, stream_channel, sync_catalog,
     telegram_client,
 };
-use crate::util::{LIBRARY_FILE, PlayerExit, clear_screen, normalize_channel, prompt, select_menu};
-const PLAYLIST_FILE: &str = ".music-terminal-playlists";
+use crate::util::{
+    LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, clear_screen, normalize_channel, prompt, select_menu,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Playlist {
@@ -45,24 +46,33 @@ struct SavedLibrary {
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
     let items = vec![
-        "Play shuffle (Telegram)".to_string(),
-        "Play local folder".to_string(),
-        "Stream Telegram channel".to_string(),
-        "Update Telegram song list".to_string(),
-        "Download Telegram channel to .\\music".to_string(),
-        "Playlists".to_string(),
-        "Login to Telegram".to_string(),
-        "Quit".to_string(),
+        "▶  Shuffle Telegram library".to_string(),
+        "♫  Play local folder".to_string(),
+        "☁  Stream Telegram channel".to_string(),
+        "↻  Update Telegram song list".to_string(),
+        "↓  Download Telegram channel to .\\music".to_string(),
+        "≡  Open playlists".to_string(),
+        "●  Login to Telegram".to_string(),
+        "×  Quit".to_string(),
     ];
     loop {
         let title = format!(
-            "Music Terminal Player\nTelegram: {}",
+            "╭──────────────────────────────────────╮\n\
+             │        MUSIC TERMINAL PLAYER         │\n\
+             ╰──────────────────────────────────────╯\n\
+             Telegram · {}",
             telegram_login_status()
         );
         match select_menu(&title, &items)? {
             Some(0) => {
                 if let Some(channel) = choose_channel(&mut library)? {
-                    let catalog = channel_catalog(&channel)?;
+                    let catalog = match channel_catalog(&channel) {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            show_menu_error(&error)?;
+                            continue;
+                        }
+                    };
                     let exit = runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()?
@@ -81,12 +91,14 @@ pub(crate) fn launch_menu() -> Result<()> {
             }
             Some(2) => {
                 if let Some(channel) = choose_channel(&mut library)? {
-                    let exit = runtime::Builder::new_multi_thread()
+                    let result = runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()?
-                        .block_on(stream_channel(&channel))?;
-                    if exit == PlayerExit::Quit {
-                        return Ok(());
+                        .block_on(stream_channel(&channel));
+                    match result {
+                        Ok(PlayerExit::Quit) => return Ok(()),
+                        Ok(PlayerExit::Back) => {}
+                        Err(error) => show_menu_error(&error)?,
                     }
                 }
             }
@@ -112,14 +124,27 @@ pub(crate) fn launch_menu() -> Result<()> {
                     return Ok(());
                 }
             }
-            Some(6) => runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(async {
-                    telegram_client().await?;
-                    println!("Telegram account ready.");
-                    Ok::<(), anyhow::Error>(())
-                })?,
+            Some(6) => loop {
+                clear_screen()?;
+                let result = runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(telegram_client());
+                match result {
+                    Ok(_) => {
+                        println!("Telegram account ready.");
+                        prompt("Press Enter to return to the menu...")?;
+                        break;
+                    }
+                    Err(error) => {
+                        println!("Telegram login failed: {error:#}");
+                        let action = prompt("Press Enter to retry, or type 'back': ")?;
+                        if action.trim().eq_ignore_ascii_case("back") {
+                            break;
+                        }
+                    }
+                }
+            },
             Some(7) | None => return Ok(()),
             _ => unreachable!(),
         }
@@ -387,7 +412,13 @@ fn edit_telegram_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -
     let Some(channel) = choose_channel(library)? else {
         return Ok(());
     };
-    let catalog = channel_catalog(&channel)?;
+    let catalog = match channel_catalog(&channel) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            show_menu_error(&error)?;
+            return Ok(());
+        }
+    };
     let selected_ids: Vec<_> = if channel == playlist.channel {
         playlist
             .tracks
@@ -415,6 +446,13 @@ fn edit_local_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> R
         playlist.tracks.clear();
         playlist.local_tracks = selected;
     }
+    Ok(())
+}
+
+fn show_menu_error(error: &anyhow::Error) -> Result<()> {
+    clear_screen()?;
+    println!("{error:#}");
+    prompt("Press Enter to go back...")?;
     Ok(())
 }
 
@@ -518,16 +556,17 @@ pub(crate) fn print_usage() {
     println!("music-terminal-player");
     println!();
     println!("Usage:");
-    println!("  music-terminal-player play <file-or-folder>");
+    println!("  music-terminal-player [--borderless]");
+    println!("  music-terminal-player [--borderless] play <file-or-folder>");
     println!("  music-terminal-player login");
     println!("  music-terminal-player stream <public-channel>");
     println!("  music-terminal-player sync <public-channel>");
     println!("  music-terminal-player download <public-channel> [folder]");
     println!();
     println!("Controls while playing:");
-    println!(
-        "  p play/pause | n next | v previous | l loop mode | Left/Right seek | +/- volume | q quit"
-    );
+    println!("  p/Space play/pause | n next | v previous | r shuffle | l loop mode");
+    println!("  u queue | Up/Down and +/- volume 10% | Left/Right volume 1%");
+    println!("  b menu | q/Ctrl+C quit");
     println!();
     println!("Telegram login and streaming need TG_ID and TG_HASH from https://my.telegram.org");
 }
