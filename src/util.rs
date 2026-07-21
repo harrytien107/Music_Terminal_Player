@@ -5,6 +5,8 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, ClearType};
@@ -246,12 +248,75 @@ pub(crate) fn manage_queue<T, Label, Matches, Finished>(
     available: &[T],
     label: Label,
     matches_query: Matches,
-    mut playback_finished: Finished,
+    playback_finished: Finished,
 ) -> Result<QueueEdit>
 where
     T: Clone + Eq + Hash,
     Label: Fn(&T) -> String,
     Matches: Fn(&T, &str) -> bool,
+    Finished: FnMut() -> bool,
+{
+    manage_queue_inner(
+        queue,
+        current,
+        play_next,
+        &label,
+        |queue, current, play_next, playback_finished| {
+            append_to_queue(
+                queue,
+                current,
+                play_next,
+                available,
+                &label,
+                &matches_query,
+                playback_finished,
+            )
+        },
+        playback_finished,
+    )
+}
+
+pub(crate) fn manage_queue_with_adder<T, Label, Add, Finished>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    label: Label,
+    mut add: Add,
+    playback_finished: Finished,
+) -> Result<QueueEdit>
+where
+    T: Clone + Eq + Hash,
+    Label: Fn(&T) -> String,
+    Add: FnMut() -> Result<Vec<T>>,
+    Finished: FnMut() -> bool,
+{
+    manage_queue_inner(
+        queue,
+        current,
+        play_next,
+        &label,
+        |queue, current, play_next, _| {
+            let additions = add()?;
+            let changed = !additions.is_empty();
+            insert_queue_next(queue, current, play_next, additions);
+            Ok(changed)
+        },
+        playback_finished,
+    )
+}
+
+fn manage_queue_inner<T, Label, Add, Finished>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    label: &Label,
+    mut add: Add,
+    mut playback_finished: Finished,
+) -> Result<QueueEdit>
+where
+    T: Clone + Eq + Hash,
+    Label: Fn(&T) -> String,
+    Add: FnMut(&mut Vec<T>, usize, &mut usize, &mut Finished) -> Result<bool>,
     Finished: FnMut() -> bool,
 {
     let mut current = current.min(queue.len().saturating_sub(1));
@@ -270,7 +335,7 @@ where
         }
         draw_frame(
             &mut stdout,
-            &queue_table(queue, current, *play_next, selected, &label),
+            &queue_table(queue, current, *play_next, selected, label),
         )?;
 
         if !event::poll(Duration::from_millis(200))? {
@@ -318,15 +383,7 @@ where
                 changed = true;
             }
             KeyCode::Char('a') => {
-                changed |= append_to_queue(
-                    queue,
-                    current,
-                    play_next,
-                    available,
-                    &label,
-                    &matches_query,
-                    &mut playback_finished,
-                )?;
+                changed |= add(queue, current, play_next, &mut playback_finished)?;
                 selected = selected.min(queue.len() - 1);
             }
             KeyCode::Esc => {
@@ -353,11 +410,18 @@ where
     Label: Fn(&T) -> String,
 {
     const WIDTH: usize = 34;
+    const PAGE_SIZE: usize = 12;
     let queued_start = current.saturating_add(1).min(queue.len());
     let queued_end = queued_start.saturating_add(play_next).min(queue.len());
-    let queued = &queue[queued_start..queued_end];
-    let remaining = &queue[queued_end..];
-    let rows = queued.len().max(remaining.len()).max(1).min(12);
+    let remaining_start = queued_end;
+    let queued_offset = queue_window_start(selected, queued_start, queued_end, PAGE_SIZE);
+    let remaining_offset = queue_window_start(selected, remaining_start, queue.len(), PAGE_SIZE);
+    let queued_visible_start = queued_start + queued_offset;
+    let remaining_visible_start = remaining_start + remaining_offset;
+    let queued = &queue[queued_visible_start..queued_end.min(queued_visible_start + PAGE_SIZE)];
+    let remaining =
+        &queue[remaining_visible_start..queue.len().min(remaining_visible_start + PAGE_SIZE)];
+    let rows = queued.len().max(remaining.len()).max(1);
     let cell = |index: Option<usize>, item: Option<&T>| {
         item.map(|item| {
             fit_text(
@@ -392,11 +456,11 @@ where
                 (row == 0).then_some(&queue[current])
             ),
             cell(
-                (row < queued.len()).then_some(current + 1 + row),
+                (row < queued.len()).then_some(queued_visible_start + row),
                 queued.get(row),
             ),
             cell(
-                (row < remaining.len()).then_some(queued_end + row),
+                (row < remaining.len()).then_some(remaining_visible_start + row),
                 remaining.get(row),
             ),
         ));
@@ -408,6 +472,21 @@ where
         "─".repeat(WIDTH),
     ));
     frame
+}
+
+pub(crate) fn queue_window_start(
+    selected: usize,
+    segment_start: usize,
+    segment_end: usize,
+    page_size: usize,
+) -> usize {
+    let length = segment_end.saturating_sub(segment_start);
+    if selected < segment_start || selected >= segment_end {
+        return 0;
+    }
+    (selected - segment_start)
+        .saturating_sub(page_size / 2)
+        .min(length.saturating_sub(page_size))
 }
 
 pub(crate) fn remove_queue_item<T>(queue: &mut Vec<T>, current: usize, remove: usize) -> usize {
@@ -594,13 +673,26 @@ pub(crate) fn progress_bar(elapsed: Duration, total: Option<Duration>, width: us
 }
 
 pub(crate) fn fit_text(text: &str, width: usize) -> String {
-    let mut value: String = text.chars().take(width).collect();
-    let used = value.chars().count();
-    if text.chars().count() > width && width > 0 {
-        value.pop();
-        value.push('…');
+    if width == 0 {
+        return String::new();
     }
-    value.push_str(&" ".repeat(width.saturating_sub(used)));
+    if UnicodeWidthStr::width(text) <= width {
+        return format!("{text}{}", " ".repeat(width - UnicodeWidthStr::width(text)));
+    }
+
+    let content_width = width.saturating_sub(1);
+    let mut value = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        value.push(character);
+        used += character_width;
+    }
+    value.push('…');
+    value.push_str(&" ".repeat(width.saturating_sub(used + 1)));
     value
 }
 
@@ -629,8 +721,8 @@ pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) 
         usize::from(terminal::size().map(|size| size.0).unwrap_or(80)).saturating_sub(4);
     let content = rows
         .iter()
-        .map(|row| row.chars().count())
-        .chain([title.chars().count()])
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .chain([UnicodeWidthStr::width(title)])
         .max()
         .unwrap_or(28);
     let width = content.clamp(28, 52).min(available.max(28));

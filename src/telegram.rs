@@ -40,6 +40,7 @@ struct TelegramTrack {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TelegramCatalogEntry {
+    pub(crate) channel: String,
     pub(crate) message_id: i32,
     pub(crate) name: String,
 }
@@ -279,30 +280,43 @@ pub(crate) async fn stream_channel(channel: &str) -> Result<PlayerExit> {
     delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
     let username = normalize_channel(channel);
     let catalog_path = telegram_catalog_path(&username);
-    let catalog = load_telegram_catalog(&catalog_path).with_context(|| {
-        format!("no usable song list for @{username}; run Sync Telegram channel first")
+    let mut catalog = load_telegram_catalog(&catalog_path).with_context(|| {
+        format!("no usable song list for @{username}; run Sync and update Telegram channel first")
     })?;
+    for entry in &mut catalog {
+        entry.channel = username.clone();
+    }
     if catalog.is_empty() {
         bail!("song list for @{username} is empty; run synchronization again");
     }
 
+    let title = format!(
+        "Telegram channel: @{username}\n{} tracks | {}",
+        catalog.len(),
+        catalog_path.display()
+    );
+    stream_catalog_entries(&title, catalog).await
+}
+
+pub(crate) async fn stream_catalog_entries(
+    title: &str,
+    catalog: Vec<TelegramCatalogEntry>,
+) -> Result<PlayerExit> {
+    if catalog.is_empty() {
+        bail!("selected Telegram channels contain no tracks");
+    }
     let menu = vec![
         "Play in order".to_string(),
         "Shuffle".to_string(),
         "Search and choose a track".to_string(),
         "Back".to_string(),
     ];
-    let menu_title = format!(
-        "Telegram channel: @{username}\n{} tracks | {}",
-        catalog.len(),
-        catalog_path.display()
-    );
     let (catalog_index, shuffle) = loop {
-        match select_menu(&menu_title, &menu)? {
+        match select_menu(title, &menu)? {
             Some(0) => break (0, false),
             Some(1) => break (0, true),
             Some(2) => {
-                if let Some(index) = choose_catalog_track(&catalog, &catalog_path)? {
+                if let Some(index) = choose_catalog_track(&catalog, title)? {
                     break (index, false);
                 }
             }
@@ -310,40 +324,50 @@ pub(crate) async fn stream_channel(channel: &str) -> Result<PlayerExit> {
             _ => unreachable!(),
         }
     };
-    play_catalog_entries(&username, catalog, catalog_index, shuffle).await
+    play_catalog_entries("", catalog, catalog_index, shuffle).await
 }
 
 pub(crate) fn channel_catalog(channel: &str) -> Result<Vec<TelegramCatalogEntry>> {
     let username = normalize_channel(channel);
     let path = telegram_catalog_path(&username);
-    load_telegram_catalog(&path).with_context(|| {
-        format!("no song list for @{username}; update the Telegram song list first")
-    })
+    let mut catalog = load_telegram_catalog(&path).with_context(|| {
+        format!("no song list for @{username}; sync and update the Telegram channel first")
+    })?;
+    for entry in &mut catalog {
+        entry.channel = username.clone();
+    }
+    Ok(catalog)
 }
 
 pub(crate) async fn play_catalog_entries(
     channel: &str,
-    catalog: Vec<TelegramCatalogEntry>,
+    mut catalog: Vec<TelegramCatalogEntry>,
     catalog_index: usize,
     shuffle: bool,
 ) -> Result<PlayerExit> {
     if catalog.is_empty() {
         bail!("playlist has no songs");
     }
+    let fallback_channel = normalize_channel(channel);
+    for entry in &mut catalog {
+        if entry.channel.is_empty() {
+            entry.channel = fallback_channel.clone();
+        }
+    }
+    if catalog.iter().any(|entry| entry.channel.is_empty()) {
+        bail!("a Telegram playlist track has no source channel");
+    }
     delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
-    let username = normalize_channel(channel);
     clear_screen()?;
-    println!("Loading selected Telegram track from @{username}...");
+    println!("Loading selected Telegram track...");
     let client = telegram_client().await?;
-    let cache_dir = Path::new(TELEGRAM_CACHE_DIR).join(safe_file_name(&username));
-    fs::create_dir_all(&cache_dir)?;
     let catalog_index = catalog_index.min(catalog.len() - 1);
-    play_telegram_tracks(client, username, cache_dir, catalog, catalog_index, shuffle).await
+    play_telegram_tracks(client, catalog, catalog_index, shuffle).await
 }
 
 fn choose_catalog_track(
     catalog: &[TelegramCatalogEntry],
-    catalog_path: &Path,
+    list_label: &str,
 ) -> Result<Option<usize>> {
     let _raw = RawMode::new()?;
     let mut stdout = io::stdout();
@@ -362,8 +386,7 @@ fn choose_catalog_track(
             .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
         let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
         let mut frame = format!(
-            "Search songs\r\nList: {}\r\nSearch: {query}_\r\n{} match(es)\r\n\r\n",
-            catalog_path.display(),
+            "Search songs\r\nList: {list_label}\r\nSearch: {query}_\r\n{} match(es)\r\n\r\n",
             matches.len()
         );
         for (match_index, &catalog_index) in matches[start..end].iter().enumerate() {
@@ -514,7 +537,12 @@ pub(crate) fn search_catalog(catalog: &[TelegramCatalogEntry], query: &str) -> V
     catalog
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| entry.name.to_lowercase().contains(&query).then_some(index))
+        .filter_map(|(index, entry)| {
+            format!("{} {}", entry.channel, entry.name)
+                .to_lowercase()
+                .contains(&query)
+                .then_some(index)
+        })
         .collect()
 }
 
@@ -539,8 +567,6 @@ impl ActiveTelegramTrack {
 
 async fn play_telegram_tracks(
     client: Client,
-    username: String,
-    cache_dir: PathBuf,
     mut tracks: Vec<TelegramCatalogEntry>,
     mut index: usize,
     mut shuffle: bool,
@@ -558,15 +584,7 @@ async fn play_telegram_tracks(
     let mut volume = load_volume();
     let mut play_next = 0usize;
     let mut loop_mode = LoopMode::Off;
-    let mut active = start_catalog_track(
-        &client,
-        &username,
-        &cache_dir,
-        &stream,
-        &tracks[index],
-        volume,
-    )
-    .await?;
+    let mut active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
 
     loop {
         draw_telegram_player(
@@ -598,15 +616,7 @@ async fn play_telegram_tracks(
                     return Ok(PlayerExit::Back);
                 }
             }
-            active = start_catalog_track(
-                &client,
-                &username,
-                &cache_dir,
-                &stream,
-                &tracks[index],
-                volume,
-            )
-            .await?;
+            active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
             continue;
         }
         if !event::poll(Duration::from_millis(200))? {
@@ -650,15 +660,7 @@ async fn play_telegram_tracks(
                     play_next -= 1;
                 }
                 index = (index + 1) % tracks.len();
-                active = start_catalog_track(
-                    &client,
-                    &username,
-                    &cache_dir,
-                    &stream,
-                    &tracks[index],
-                    volume,
-                )
-                .await?;
+                active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
             }
             KeyCode::Char('v') => {
                 let old_cache = active.cache_path.clone();
@@ -669,15 +671,7 @@ async fn play_telegram_tracks(
                 } else {
                     index - 1
                 };
-                active = start_catalog_track(
-                    &client,
-                    &username,
-                    &cache_dir,
-                    &stream,
-                    &tracks[index],
-                    volume,
-                )
-                .await?;
+                active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
             }
             KeyCode::Left => {
                 volume = (volume - 0.01).max(0.0);
@@ -691,7 +685,7 @@ async fn play_telegram_tracks(
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
             KeyCode::Char('r') => {
-                let current_message_id = tracks[index].message_id;
+                let current = tracks[index].clone();
                 shuffle = !shuffle;
                 tracks = if shuffle {
                     let mut shuffled = original_tracks.clone();
@@ -702,7 +696,7 @@ async fn play_telegram_tracks(
                 };
                 index = tracks
                     .iter()
-                    .position(|track| track.message_id == current_message_id)
+                    .position(|track| track == &current)
                     .unwrap_or(0);
             }
             KeyCode::Char('u') => {
@@ -713,8 +707,7 @@ async fn play_telegram_tracks(
                     &available_tracks,
                     |track| track.name.clone(),
                     |track, query| {
-                        track
-                            .name
+                        format!("{} {}", track.channel, track.name)
                             .to_lowercase()
                             .contains(&query.trim().to_lowercase())
                     },
@@ -745,29 +738,13 @@ async fn play_telegram_tracks(
                             return Ok(PlayerExit::Back);
                         }
                     }
-                    active = start_catalog_track(
-                        &client,
-                        &username,
-                        &cache_dir,
-                        &stream,
-                        &tracks[index],
-                        volume,
-                    )
-                    .await?;
+                    active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
                 } else if edit.restart {
                     play_next = 0;
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
                     delete_cache_file(&old_cache)?;
-                    active = start_catalog_track(
-                        &client,
-                        &username,
-                        &cache_dir,
-                        &stream,
-                        &tracks[index],
-                        volume,
-                    )
-                    .await?;
+                    active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
                 }
                 if edit.changed {
                     shuffle = false;
@@ -820,12 +797,13 @@ pub(crate) fn delete_cache_directory(path: &Path) -> Result<()> {
 
 async fn start_catalog_track(
     client: &Client,
-    username: &str,
-    cache_dir: &Path,
     stream: &OutputStream,
     entry: &TelegramCatalogEntry,
     volume: f32,
 ) -> Result<ActiveTelegramTrack> {
+    let username = &entry.channel;
+    let cache_dir = Path::new(TELEGRAM_CACHE_DIR).join(safe_file_name(username));
+    fs::create_dir_all(&cache_dir)?;
     let peer = client
         .resolve_username(username)
         .await?
@@ -1134,6 +1112,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
         let name =
             media_file_name(&media).unwrap_or_else(|| format!("telegram-{}.bin", message.id()));
         catalog.push(TelegramCatalogEntry {
+            channel: username.to_string(),
             message_id: message.id(),
             name: name.clone(),
         });
@@ -1237,6 +1216,7 @@ pub(crate) fn load_telegram_catalog(path: &Path) -> Result<Vec<TelegramCatalogEn
                 )
             })?;
             Ok(TelegramCatalogEntry {
+                channel: String::new(),
                 message_id: message_id.parse().with_context(|| {
                     format!("invalid message ID at {}:{}", path.display(), index + 1)
                 })?,

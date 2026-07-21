@@ -10,9 +10,13 @@ use crate::telegram::{
 };
 use crate::util::{
     LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
-    parse_volume_settings, playback_controls, progress_bar, remove_queue_item, safe_file_name,
-    shuffle_slice, toggle_all,
+    parse_volume_settings, playback_controls, progress_bar, queue_window_start, remove_queue_item,
+    safe_file_name, shuffle_slice, toggle_all,
 };
+use crate::youtube::{
+    YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
+};
+
 #[test]
 fn safe_file_name_removes_windows_forbidden_chars() {
     assert_eq!(
@@ -41,6 +45,41 @@ fn saved_channel_input_accepts_username_and_url() {
         normalize_channel("https://t.me/music_channel/"),
         "music_channel"
     );
+}
+
+#[test]
+fn youtube_input_accepts_videos_playlists_and_multiple_urls() {
+    let urls = parse_youtube_urls("https://youtu.be/abc https://www.youtube.com/playlist?list=xyz")
+        .unwrap();
+    assert_eq!(urls.len(), 2);
+    assert!(parse_youtube_urls("https://example.com/video").is_err());
+}
+
+#[test]
+fn youtube_tool_paths_round_trip_without_touching_volume_settings() {
+    let tools = YouTubeTools {
+        yt_dlp: r"D:\Portable Apps\yt-dlp.exe".to_string(),
+        ffmpeg: r"D:\Portable Apps\ffmpeg.exe".to_string(),
+    };
+    assert_eq!(
+        parse_youtube_tools(&serialize_youtube_tools(&tools)),
+        Some(tools)
+    );
+    assert!(parse_youtube_tools("yt_dlp=yt-dlp\n").is_none());
+}
+
+#[test]
+fn wide_song_names_fit_inside_terminal_cells() {
+    let fitted = fit_text("巨大なものが来る song title", 12);
+    assert_eq!(unicode_width::UnicodeWidthStr::width(fitted.as_str()), 12);
+    assert!(fitted.trim_end().ends_with('…'));
+}
+
+#[test]
+fn queue_window_follows_selected_track() {
+    assert_eq!(queue_window_start(27, 10, 40, 12), 11);
+    assert_eq!(queue_window_start(39, 10, 40, 12), 18);
+    assert_eq!(queue_window_start(4, 10, 40, 12), 0);
 }
 
 #[test]
@@ -87,16 +126,18 @@ fn saved_volume_defaults_and_stays_bounded() {
 }
 
 #[test]
-fn playlist_round_trips_channel_tracks_and_order() {
+fn playlist_round_trips_multi_channel_tracks_and_order() {
     let playlist = Playlist {
         name: "Road\tTrip".to_string(),
         channel: "music_channel".to_string(),
         tracks: vec![
             TelegramCatalogEntry {
+                channel: "music_channel".to_string(),
                 message_id: 7,
                 name: "First song.mp3".to_string(),
             },
             TelegramCatalogEntry {
+                channel: "other_channel".to_string(),
                 message_id: 9,
                 name: "Second song.flac".to_string(),
             },
@@ -108,8 +149,20 @@ fn playlist_round_trips_channel_tracks_and_order() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].name, "Road Trip");
     assert_eq!(parsed[0].channel, "music_channel");
+    assert_eq!(parsed[0].tracks[0].channel, "music_channel");
     assert_eq!(parsed[0].tracks[0].message_id, 7);
+    assert_eq!(parsed[0].tracks[1].channel, "other_channel");
     assert_eq!(parsed[0].tracks[1].name, "Second song.flac");
+}
+
+#[test]
+fn old_single_channel_playlist_assigns_channel_to_tracks() {
+    let parsed =
+        parse_playlists("playlist\tLegacy mix\tlegacy_channel\ntrack\t42\tLegacy song.mp3\n");
+
+    assert_eq!(parsed[0].tracks[0].channel, "legacy_channel");
+    assert_eq!(parsed[0].tracks[0].message_id, 42);
+    assert_eq!(parsed[0].tracks[0].name, "Legacy song.mp3");
 }
 
 #[test]
@@ -181,10 +234,12 @@ fn telegram_catalog_round_trips_track_ids_and_names() {
     let path = PathBuf::from("target/test-telegram-catalog.txt");
     let catalog = vec![
         TelegramCatalogEntry {
+            channel: String::new(),
             message_id: 12,
             name: "First song.mp3".to_string(),
         },
         TelegramCatalogEntry {
+            channel: String::new(),
             message_id: 34,
             name: "Second\ttrack\n.flac".to_string(),
         },
@@ -203,20 +258,24 @@ fn telegram_catalog_round_trips_track_ids_and_names() {
 fn telegram_catalog_search_is_case_insensitive_and_keeps_original_indexes() {
     let catalog = vec![
         TelegramCatalogEntry {
+            channel: "first_channel".to_string(),
             message_id: 1,
             name: "First Song.mp3".to_string(),
         },
         TelegramCatalogEntry {
+            channel: "other_channel".to_string(),
             message_id: 2,
             name: "Another track.flac".to_string(),
         },
         TelegramCatalogEntry {
+            channel: "second_channel".to_string(),
             message_id: 3,
             name: "Second SONG.ogg".to_string(),
         },
     ];
 
     assert_eq!(search_catalog(&catalog, " song "), vec![0, 2]);
+    assert_eq!(search_catalog(&catalog, "other_channel"), vec![1]);
     assert_eq!(search_catalog(&catalog, "missing"), Vec::<usize>::new());
 }
 

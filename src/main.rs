@@ -10,6 +10,7 @@ mod telegram;
 #[cfg(test)]
 mod tests;
 mod util;
+mod youtube;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -131,6 +132,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 .build()?
                 .block_on(telegram::download_channel(&channel, Path::new(&folder)))
         }
+        Some("youtube") => youtube::play_youtube().map(|_| ()),
         Some("help") | Some("--help") | Some("-h") => {
             app::print_usage();
             Ok(())

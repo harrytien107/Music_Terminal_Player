@@ -12,7 +12,7 @@ use crossterm::terminal::{self, ClearType};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 
 use crate::util::{
-    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
+    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration, insert_queue_next,
     is_supported_audio_path, load_volume, manage_queue, playback_controls, progress_bar,
     save_volume, shuffle_slice, toggle_all,
 };
@@ -26,13 +26,21 @@ pub(crate) fn play_path(path: &Path) -> Result<PlayerExit> {
     play_tracks(tracks)
 }
 
-pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
+pub(crate) fn play_tracks(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
+    play_tracks_inner(tracks, "Local", None)
+}
+
+fn play_tracks_inner(
+    mut tracks: Vec<PathBuf>,
+    title: &str,
+    mut add_tracks: Option<&mut dyn FnMut() -> Result<Vec<PathBuf>>>,
+) -> Result<PlayerExit> {
     tracks.retain(|track| track.is_file() && is_supported_audio_path(track));
     if tracks.is_empty() {
         bail!("playlist has no available local songs");
     }
 
-    let _raw = RawMode::new()?;
+    let mut raw = Some(RawMode::new()?);
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -42,8 +50,8 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
 
     let stream = OutputStreamBuilder::open_default_stream()
         .context("failed to open default audio output")?;
-    let available_tracks = tracks.clone();
-    let original_tracks = tracks.clone();
+    let mut available_tracks = tracks.clone();
+    let mut original_tracks = tracks.clone();
     let mut index = 0usize;
     let mut play_next = 0usize;
     let mut volume = load_volume();
@@ -56,6 +64,7 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
     loop {
         draw_player(
             &mut stdout,
+            title,
             &tracks,
             index,
             duration,
@@ -63,6 +72,7 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
             volume,
             shuffle,
             loop_mode,
+            add_tracks.is_some(),
         )?;
 
         if sink.empty() {
@@ -144,6 +154,24 @@ pub(crate) fn play_tracks(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
                     .position(|track| track == &current)
                     .unwrap_or(0);
             }
+            KeyCode::Char('a') if add_tracks.is_some() => {
+                let was_playing = !sink.is_paused();
+                sink.pause();
+                drop(raw.take());
+                let additions = add_tracks.as_mut().expect("checked above")();
+                raw = Some(RawMode::new()?);
+                let mut additions = additions?;
+                additions.retain(|track| track.is_file() && is_supported_audio_path(track));
+                if !additions.is_empty() {
+                    insert_queue_next(&mut tracks, index, &mut play_next, additions.clone());
+                    available_tracks.extend(additions.iter().cloned());
+                    original_tracks.extend(additions);
+                    shuffle = false;
+                }
+                if was_playing {
+                    sink.play();
+                }
+            }
             KeyCode::Char('u') => {
                 let edit = manage_queue(
                     &mut tracks,
@@ -215,6 +243,7 @@ fn start_track(
 
 fn draw_player(
     stdout: &mut io::Stdout,
+    title: &str,
     tracks: &[PathBuf],
     index: usize,
     duration: Option<Duration>,
@@ -222,6 +251,7 @@ fn draw_player(
     volume: f32,
     shuffle: bool,
     loop_mode: LoopMode,
+    can_add_tracks: bool,
 ) -> Result<()> {
     let state = if sink.is_paused() {
         "paused"
@@ -255,8 +285,11 @@ fn draw_player(
         ),
         String::new(),
     ];
+    if can_add_tracks {
+        rows.push("[a] add YouTube URL or playlist".to_string());
+    }
     rows.extend(playback_controls());
-    draw_panel(stdout, "Music Terminal Player · Local", &rows)
+    draw_panel(stdout, &format!("Music Terminal Player · {title}"), &rows)
 }
 
 pub(crate) fn collect_tracks(path: &Path) -> Result<Vec<PathBuf>> {
