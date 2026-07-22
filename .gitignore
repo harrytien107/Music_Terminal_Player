@@ -1,10 +1,2 @@
 /target
-/music
-/.music-terminal
-# Legacy files retained here so an older build cannot expose them before migration.
-/.telegram.session*
-/.telegram.credentials
-/.telegram-cache
-/.telegram-*.tracks.txt
-/.music-terminal-library
-/.music-terminal-playlists
+Music_Terminal_Player.code-workspace
