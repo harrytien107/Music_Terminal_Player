@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::app::{Playlist, parse_playlists, serialize_playlists};
+use crate::app::{Playlist, collect_library_tracks, parse_playlists, serialize_playlists};
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, load_telegram_catalog,
@@ -227,6 +227,24 @@ fn shuffle_preserves_every_item() {
     shuffle_slice(&mut items);
     items.sort_unstable();
     assert_eq!(items, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn local_library_collection_combines_folders_without_duplicates() {
+    let root = PathBuf::from("target/test-quick-play-local-library");
+    let nested = root.join("album");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("first.mp3"), b"").unwrap();
+    fs::write(nested.join("second.flac"), b"").unwrap();
+    fs::write(nested.join("cover.png"), b"").unwrap();
+
+    let tracks = collect_library_tracks(&[root.clone(), nested]).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert_eq!(tracks.len(), 2);
+    assert!(tracks.iter().any(|track| track.ends_with("first.mp3")));
+    assert!(tracks.iter().any(|track| track.ends_with("second.flac")));
 }
 
 #[test]

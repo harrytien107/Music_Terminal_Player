@@ -128,7 +128,7 @@ Press `a` during playback or in the YouTube queue to add another URL or playlist
 
 The launcher can create, play, edit, rename, and delete persistent playlists. Telegram playlists may combine tracks from multiple synchronized channels. Local and Telegram tracks remain separate playlist sources because they use different playback engines.
 
-Search updates while typing. Use `Backspace` to edit, `Up` / `Down` to select, `Space` to toggle a track, `Ctrl+A` to toggle all matches, `Enter` to save, and `Esc` to cancel. Missing local files are skipped during playback.
+Search updates while typing. Use `Backspace` to edit, `Up` / `Down` to select, `Ctrl+Space` to toggle a track, `Ctrl+A` to toggle all matches, `Enter` to save, and `Esc` to cancel. Plain `Space` remains available in search text. Missing local files are skipped during playback.
 
 Playlists are stored in `.music-terminal/playlists.txt`.
 

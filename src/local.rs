@@ -27,13 +27,18 @@ pub(crate) fn play_path(path: &Path) -> Result<PlayerExit> {
 }
 
 pub(crate) fn play_tracks(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
-    play_tracks_inner(tracks, "Local", None)
+    play_tracks_inner(tracks, "Local", None, false)
+}
+
+pub(crate) fn play_tracks_shuffled(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
+    play_tracks_inner(tracks, "Local library", None, true)
 }
 
 fn play_tracks_inner(
     mut tracks: Vec<PathBuf>,
     title: &str,
     mut add_tracks: Option<&mut dyn FnMut() -> Result<Vec<PathBuf>>>,
+    initially_shuffled: bool,
 ) -> Result<PlayerExit> {
     tracks.retain(|track| track.is_file() && is_supported_audio_path(track));
     if tracks.is_empty() {
@@ -52,10 +57,13 @@ fn play_tracks_inner(
         .context("failed to open default audio output")?;
     let mut available_tracks = tracks.clone();
     let mut original_tracks = tracks.clone();
+    if initially_shuffled {
+        shuffle_slice(&mut tracks);
+    }
     let mut index = 0usize;
     let mut play_next = 0usize;
     let mut volume = load_volume();
-    let mut shuffle = false;
+    let mut shuffle = initially_shuffled;
     let mut loop_mode = LoopMode::Off;
     let mut duration;
     let mut sink;
@@ -350,7 +358,7 @@ pub(crate) fn choose_local_tracks(
             frame.push_str("No matching tracks.\r\n");
         }
         frame.push_str(
-            "\r\nType to search | [Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -367,10 +375,12 @@ pub(crate) fn choose_local_tracks(
             KeyCode::Down if !matches.is_empty() => {
                 selected_row = (selected_row + 1) % matches.len();
             }
-            KeyCode::Char(' ') if !matches.is_empty() => {
-                let path = &tracks[matches[selected_row]];
-                if !selected.remove(path) {
-                    selected.insert(path.clone());
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !matches.is_empty() {
+                    let path = &tracks[matches[selected_row]];
+                    if !selected.remove(path) {
+                        selected.insert(path.clone());
+                    }
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => toggle_all(
@@ -382,7 +392,9 @@ pub(crate) fn choose_local_tracks(
                 matches = search_local_tracks(tracks, &query);
                 selected_row = 0;
             }
-            KeyCode::Char(character) if !character.is_control() => {
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
                 query.push(character);
                 matches = search_local_tracks(tracks, &query);
                 selected_row = 0;

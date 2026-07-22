@@ -480,7 +480,7 @@ pub(crate) fn choose_catalog_tracks(
             frame.push_str("No matching tracks.\r\n");
         }
         frame.push_str(
-            "\r\nType to search | [Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -497,10 +497,12 @@ pub(crate) fn choose_catalog_tracks(
             KeyCode::Down if !matches.is_empty() => {
                 selected_row = (selected_row + 1) % matches.len();
             }
-            KeyCode::Char(' ') if !matches.is_empty() => {
-                let id = catalog[matches[selected_row]].message_id;
-                if !selected.remove(&id) {
-                    selected.insert(id);
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !matches.is_empty() {
+                    let id = catalog[matches[selected_row]].message_id;
+                    if !selected.remove(&id) {
+                        selected.insert(id);
+                    }
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => toggle_all(
@@ -512,7 +514,9 @@ pub(crate) fn choose_catalog_tracks(
                 matches = search_catalog(catalog, &query);
                 selected_row = 0;
             }
-            KeyCode::Char(character) if !character.is_control() => {
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
                 query.push(character);
                 matches = search_catalog(catalog, &query);
                 selected_row = 0;

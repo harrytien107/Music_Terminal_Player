@@ -557,7 +557,7 @@ where
             frame.push_str("No matching tracks.\r\n");
         }
         frame.push_str(
-            "\r\nType to search | [Space] toggle | [Ctrl+A] all matches | [Enter] append | [Esc] cancel",
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | [Enter] append | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -578,10 +578,12 @@ where
                 row = row.checked_sub(1).unwrap_or(matches.len() - 1)
             }
             KeyCode::Down if !matches.is_empty() => row = (row + 1) % matches.len(),
-            KeyCode::Char(' ') if !matches.is_empty() => {
-                let item = &available[matches[row]];
-                if !selected.remove(item) {
-                    selected.insert(item.clone());
+            KeyCode::Char(' ') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                if !matches.is_empty() {
+                    let item = &available[matches[row]];
+                    if !selected.remove(item) {
+                        selected.insert(item.clone());
+                    }
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
@@ -599,7 +601,10 @@ where
                     .collect();
                 row = 0;
             }
-            KeyCode::Char(character) if !character.is_control() => {
+            KeyCode::Char(character)
+                if !key.modifiers.contains(event::KeyModifiers::CONTROL)
+                    && !character.is_control() =>
+            {
                 query.push(character);
                 matches = available
                     .iter()

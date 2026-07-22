@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use tokio::runtime;
 
-use crate::local::{choose_local_tracks, collect_tracks, play_path, play_tracks};
+use crate::local::{
+    choose_local_tracks, collect_tracks, play_path, play_tracks, play_tracks_shuffled,
+};
 use crate::telegram::{
     SESSION_FILE, TELEGRAM_CREDENTIALS_FILE, TelegramCatalogEntry, channel_catalog,
     choose_catalog_tracks, download_channel, play_catalog_entries, stream_catalog_entries,
@@ -55,7 +57,7 @@ struct SavedLibrary {
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
     let items = vec![
-        "▶  Shuffle Telegram library".to_string(),
+        "▶  Quick play".to_string(),
         "♫  Play local folder".to_string(),
         "☁  Stream Telegram channel".to_string(),
         "↻  Sync and update Telegram channel".to_string(),
@@ -75,16 +77,8 @@ pub(crate) fn launch_menu() -> Result<()> {
         );
         match select_menu(&title, &items)? {
             Some(0) => {
-                if let Some((_label, catalog)) =
-                    choose_telegram_catalog(&library, "Shuffle Telegram library")?
-                {
-                    let exit = runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(play_catalog_entries("", catalog, 0, true))?;
-                    if exit == PlayerExit::Quit {
-                        return Ok(());
-                    }
+                if quick_play_menu(&library)? == PlayerExit::Quit {
+                    return Ok(());
                 }
             }
             Some(1) => {
@@ -169,6 +163,40 @@ pub(crate) fn launch_menu() -> Result<()> {
                 }
             },
             Some(8) | None => return Ok(()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
+    let items = vec![
+        "▶  Shuffle Telegram library".to_string(),
+        "♫  Shuffle Local library".to_string(),
+        "←  Back".to_string(),
+    ];
+    loop {
+        match select_menu("Quick play", &items)? {
+            Some(0) => {
+                let result = all_channel_tracks(library).and_then(|catalog| {
+                    runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(play_catalog_entries("", catalog, 0, true))
+                });
+                match result {
+                    Ok(PlayerExit::Quit) => return Ok(PlayerExit::Quit),
+                    Ok(PlayerExit::Back) => {}
+                    Err(error) => show_menu_error(&error)?,
+                }
+            }
+            Some(1) => {
+                match collect_library_tracks(&library.folders).and_then(play_tracks_shuffled) {
+                    Ok(PlayerExit::Quit) => return Ok(PlayerExit::Quit),
+                    Ok(PlayerExit::Back) => {}
+                    Err(error) => show_menu_error(&error)?,
+                }
+            }
+            Some(2) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
         }
     }
@@ -290,6 +318,25 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<(String, 
             Some(_) | None => return Ok(None),
         }
     }
+}
+
+pub(crate) fn collect_library_tracks(folders: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if folders.is_empty() {
+        bail!("no saved local folders; add one from Play local folder");
+    }
+    let mut seen = HashSet::new();
+    let mut tracks = Vec::new();
+    for folder in folders {
+        for track in collect_tracks(folder)? {
+            if seen.insert(track.clone()) {
+                tracks.push(track);
+            }
+        }
+    }
+    if tracks.is_empty() {
+        bail!("saved local folders contain no supported audio files");
+    }
+    Ok(tracks)
 }
 
 fn all_channel_tracks(library: &SavedLibrary) -> Result<Vec<TelegramCatalogEntry>> {
