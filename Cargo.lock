@@ -1065,6 +1065,8 @@ dependencies = [
  "grammers-session",
  "rodio",
  "rpassword",
+ "symphonia",
+ "symphonia-adapter-libopus",
  "tokio",
  "unicode-width",
 ]
@@ -1393,6 +1395,16 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opusic-sys"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f43c183739dc81651487e7c9f3e4330fe4a3fd26c0fa961c788ce5fb21fa75b"
+dependencies = [
+ "cmake",
+ "libc",
+]
 
 [[package]]
 name = "os_info"
@@ -1791,6 +1803,17 @@ dependencies = [
  "symphonia-format-ogg",
  "symphonia-format-riff",
  "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-adapter-libopus"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2ff6183333aef9c50e1add75857c488346c933fa24de1a68c539faf4a13f9a4"
+dependencies = [
+ "log",
+ "opusic-sys",
+ "symphonia-core",
 ]
 
 [[package]]

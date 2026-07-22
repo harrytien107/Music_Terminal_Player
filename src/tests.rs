@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::app::{Playlist, collect_library_tracks, parse_playlists, serialize_playlists};
 use crate::local::search_local_tracks;
 use crate::telegram::{
-    TelegramCatalogEntry, checked_position, delete_cache_directory, load_telegram_catalog,
-    save_telegram_catalog, search_catalog,
+    TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
+    load_telegram_catalog, save_telegram_catalog, search_catalog,
 };
 use crate::util::{
     LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
@@ -30,6 +30,12 @@ fn safe_file_name_removes_windows_forbidden_chars() {
 fn supported_audio_extensions_are_case_insensitive() {
     assert!(is_supported_audio_path(Path::new("Song.MP3")));
     assert!(!is_supported_audio_path(Path::new("cover.png")));
+}
+
+#[test]
+fn telegram_opus_backend_matches_extension_case_insensitively() {
+    assert!(is_opus_path(Path::new("voice.OPUS")));
+    assert!(!is_opus_path(Path::new("voice.ogg")));
 }
 
 #[test]

@@ -15,6 +15,15 @@ use grammers_session::storages::SqliteSession;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
+use symphonia::core::codecs::{CodecRegistry, Decoder as SymphoniaDecoder, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::units;
+use symphonia_adapter_libopus::OpusDecoder;
 use tokio::task::JoinHandle;
 
 use crate::util::{
@@ -135,6 +144,139 @@ impl Seek for ProgressiveReader {
         self.position = position;
         Ok(position)
     }
+}
+
+impl MediaSource for ProgressiveReader {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.shared.state.lock().ok()?.total
+    }
+}
+
+struct OpusSource {
+    decoder: Box<dyn SymphoniaDecoder>,
+    format: Box<dyn FormatReader>,
+    track_id: u32,
+    buffer: SampleBuffer<f32>,
+    offset: usize,
+    spec: SignalSpec,
+    duration: Option<Duration>,
+}
+
+impl OpusSource {
+    fn new(reader: ProgressiveReader) -> Result<Self> {
+        let stream = MediaSourceStream::new(Box::new(reader), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("opus");
+        let mut probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                stream,
+                &FormatOptions {
+                    enable_gapless: true,
+                    ..FormatOptions::default()
+                },
+                &MetadataOptions::default(),
+            )
+            .context("failed to read Opus container")?;
+        let track = probed
+            .format
+            .default_track()
+            .context("Opus file contains no audio track")?;
+        let track_id = track.id;
+        let duration = track
+            .codec_params
+            .time_base
+            .zip(track.codec_params.n_frames)
+            .map(|(base, frames)| Duration::from(base.calc_time(frames)));
+        let mut codecs = CodecRegistry::new();
+        codecs.register_all::<OpusDecoder>();
+        let mut decoder = codecs
+            .make(&track.codec_params, &DecoderOptions::default())
+            .context("failed to initialize Opus decoder")?;
+        let (buffer, spec) = next_decoded_packet(&mut *probed.format, &mut *decoder, track_id)
+            .context("Opus file contains no decodable audio")?;
+        Ok(Self {
+            decoder,
+            format: probed.format,
+            track_id,
+            buffer,
+            offset: 0,
+            spec,
+            duration,
+        })
+    }
+}
+
+fn next_decoded_packet(
+    format: &mut dyn FormatReader,
+    decoder: &mut dyn SymphoniaDecoder,
+    track_id: u32,
+) -> Option<(SampleBuffer<f32>, SignalSpec)> {
+    loop {
+        let packet = format.next_packet().ok()?;
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                return Some((sample_buffer(decoded, &spec), spec));
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+fn sample_buffer(decoded: AudioBufferRef<'_>, spec: &SignalSpec) -> SampleBuffer<f32> {
+    let mut buffer = SampleBuffer::new(units::Duration::from(decoded.capacity() as u64), *spec);
+    buffer.copy_interleaved_ref(decoded);
+    buffer
+}
+
+impl Iterator for OpusSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.buffer.len() {
+            let (buffer, spec) =
+                next_decoded_packet(&mut *self.format, &mut *self.decoder, self.track_id)?;
+            self.spec = spec;
+            self.buffer = buffer;
+            self.offset = 0;
+        }
+        let sample = *self.buffer.samples().get(self.offset)?;
+        self.offset += 1;
+        Some(sample)
+    }
+}
+
+impl Source for OpusSource {
+    fn current_span_len(&self) -> Option<usize> {
+        Some(self.buffer.len().saturating_sub(self.offset))
+    }
+
+    fn channels(&self) -> u16 {
+        self.spec.channels.count() as u16
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.spec.rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+}
+
+pub(crate) fn is_opus_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("opus"))
 }
 
 pub(crate) fn checked_position(base: u64, offset: i64) -> io::Result<u64> {
@@ -916,12 +1058,21 @@ async fn start_telegram_track(
         position: 0,
         shared: Arc::clone(&shared),
     };
-    let decoder = Decoder::try_from(BufReader::new(reader))
-        .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
-    let duration = decoder.total_duration();
     let sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
-    sink.append(decoder);
+    let duration = if is_opus_path(&track.cache_path) {
+        let source = OpusSource::new(reader)
+            .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
+        let duration = source.total_duration();
+        sink.append(source);
+        duration
+    } else {
+        let decoder = Decoder::try_from(BufReader::new(reader))
+            .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
+        let duration = decoder.total_duration();
+        sink.append(decoder);
+        duration
+    };
     Ok(ActiveTelegramTrack {
         sink,
         duration,
