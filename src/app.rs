@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::runtime;
 
 use crate::local::{
@@ -11,11 +12,13 @@ use crate::local::{
 };
 use crate::telegram::{
     SESSION_FILE, TELEGRAM_CREDENTIALS_FILE, TelegramCatalogEntry, channel_catalog,
-    choose_catalog_tracks, download_channel, play_catalog_entries, stream_catalog_entries,
-    sync_catalog, telegram_client,
+    choose_catalog_tracks, choose_private_channel, download_channel, normalize_channel_identity,
+    play_catalog_entries, private_channel_from_link, stream_catalog_entries, sync_catalog,
+    telegram_channel_label, telegram_client,
 };
 use crate::util::{
-    LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, clear_screen, normalize_channel, prompt, select_menu,
+    LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, clear_screen, draw_frame, normalize_channel,
+    prompt, select_menu, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,21 +107,36 @@ pub(crate) fn launch_menu() -> Result<()> {
                 }
             }
             Some(3) => {
-                while let Some((channel, save_after_sync)) = choose_channel_to_sync(&mut library)? {
-                    let result = runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(sync_catalog(&channel));
-                    match result {
-                        Ok(()) => {
-                            if save_after_sync && !library.channels.contains(&channel) {
-                                library.channels.push(channel);
-                                save_library(&library)?;
-                            }
-                            prompt("Synchronization complete. Press Enter to continue...")?;
+                while let Some(channels) = choose_channel_to_sync(&mut library)? {
+                    let total = channels.len();
+                    let mut summary = Vec::with_capacity(total);
+                    clear_screen()?;
+                    for (index, (channel, save_after_sync)) in channels.into_iter().enumerate() {
+                        let label = telegram_channel_label(&channel);
+                        if index > 0 {
+                            println!();
                         }
-                        Err(error) => show_menu_error(&error)?,
+                        println!("Synchronizing channel {}/{}: {label}", index + 1, total);
+                        let result = runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .build()?
+                            .block_on(sync_catalog(&channel));
+                        match result {
+                            Ok(()) => {
+                                if save_after_sync && !library.channels.contains(&channel) {
+                                    library.channels.push(channel);
+                                    save_library(&library)?;
+                                }
+                                summary.push(format!("[OK] {label}"));
+                            }
+                            Err(error) => summary.push(format!("[FAILED] {label}: {error:#}")),
+                        }
                     }
+                    println!("\nSynchronization batch complete ({total} channels):");
+                    for result in summary {
+                        println!("  {result}");
+                    }
+                    prompt("\nPress Enter to continue...")?;
                 }
             }
             Some(4) => {
@@ -211,7 +229,7 @@ fn load_library() -> Result<SavedLibrary> {
     };
     for line in text.lines() {
         if let Some(channel) = line.strip_prefix("channel\t") {
-            library.channels.push(channel.to_string());
+            library.channels.push(normalize_channel_identity(channel));
         } else if let Some(folder) = line.strip_prefix("folder\t") {
             library.folders.push(PathBuf::from(folder));
         }
@@ -242,7 +260,12 @@ fn choose_telegram_catalog(
         return Ok(None);
     }
     let mut items = vec!["All synchronized channels".to_string()];
-    items.extend(library.channels.iter().map(|channel| format!("@{channel}")));
+    items.extend(
+        library
+            .channels
+            .iter()
+            .map(|channel| telegram_channel_label(channel)),
+    );
     items.push("Back".to_string());
     let Some(index) = select_menu(title, &items)? else {
         return Ok(None);
@@ -261,7 +284,11 @@ fn choose_telegram_catalog(
         let channel = &library.channels[index - 1];
         let tracks = channel_catalog(channel)?;
         return Ok(Some((
-            format!("Telegram channel: @{channel}\n{} tracks", tracks.len()),
+            format!(
+                "Telegram channel: {}\n{} tracks",
+                telegram_channel_label(channel),
+                tracks.len()
+            ),
             tracks,
         )));
     }
@@ -278,7 +305,7 @@ fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<St
     let mut items: Vec<_> = library
         .channels
         .iter()
-        .map(|channel| format!("@{channel}"))
+        .map(|channel| telegram_channel_label(channel))
         .collect();
     let channel_count = items.len();
     items.push("Back".to_string());
@@ -286,35 +313,88 @@ fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<St
         .and_then(|index| (index < channel_count).then(|| library.channels[index].clone())))
 }
 
-fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<(String, bool)>> {
+fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(String, bool)>>> {
     loop {
         let mut items: Vec<_> = library
             .channels
             .iter()
-            .map(|channel| format!("Sync and update @{channel}"))
+            .map(|channel| format!("Sync and update {}", telegram_channel_label(channel)))
             .collect();
         let channel_count = items.len();
+        if let Some(last_channel) = items.last_mut() {
+            last_channel.push_str("\r\n\r\n  ────────── ADD OR MANAGE ──────────");
+        }
         items.extend([
-            "Add and synchronize channel".to_string(),
+            "Add public channel by username".to_string(),
+            "Choose private channel from this account".to_string(),
+            "Add joined private channel by invite link".to_string(),
             "Forget channel".to_string(),
             "Back".to_string(),
         ]);
-        let title = "Sync and update Telegram channel\nAdd and synchronize public channels here before streaming.";
-        match select_menu(title, &items)? {
+        let section = if channel_count == 0 {
+            "────────── ADD OR MANAGE ──────────"
+        } else {
+            "──────── SAVED CHANNELS ────────"
+        };
+        let title = format!(
+            "Sync and update Telegram channel\nChoose an accessible channel or paste an invite link for one already joined.\n\n{section}"
+        );
+        match select_menu(&title, &items)? {
             Some(index) if index < channel_count => {
-                return Ok(Some((library.channels[index].clone(), false)));
+                return Ok(Some(vec![(library.channels[index].clone(), false)]));
             }
             Some(index) if index == channel_count => {
                 clear_screen()?;
                 let channel = normalize_channel(&prompt("Public channel: ")?);
                 if !channel.is_empty() {
-                    return Ok(Some((
+                    return Ok(Some(vec![(
                         channel.clone(),
                         !library.channels.contains(&channel),
-                    )));
+                    )]));
                 }
             }
-            Some(index) if index == channel_count + 1 => forget_channel(library)?,
+            Some(index) if index == channel_count + 1 => {
+                let channel = runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(choose_private_channel(&library.channels));
+                match channel {
+                    Ok(Some(channels)) => {
+                        return Ok(Some(
+                            channels
+                                .into_iter()
+                                .map(|channel| {
+                                    let save_after_sync = !library.channels.contains(&channel);
+                                    (channel, save_after_sync)
+                                })
+                                .collect(),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => show_menu_error(&error)?,
+                }
+            }
+            Some(index) if index == channel_count + 2 => {
+                clear_screen()?;
+                let link = prompt("Private channel invite link (or type 'back'): ")?;
+                if link.trim().eq_ignore_ascii_case("back") || link.trim().is_empty() {
+                    continue;
+                }
+                let channel = runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(private_channel_from_link(&link));
+                match channel {
+                    Ok(channel) => {
+                        return Ok(Some(vec![(
+                            channel.clone(),
+                            !library.channels.contains(&channel),
+                        )]));
+                    }
+                    Err(error) => show_menu_error(&error)?,
+                }
+            }
+            Some(index) if index == channel_count + 3 => forget_channel(library)?,
             Some(_) | None => return Ok(None),
         }
     }
@@ -354,20 +434,92 @@ fn all_channel_tracks(library: &SavedLibrary) -> Result<Vec<TelegramCatalogEntry
 }
 
 fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
-    let mut items: Vec<_> = library
-        .channels
-        .iter()
-        .map(|channel| format!("@{channel}"))
-        .collect();
-    let channel_count = items.len();
-    items.push("Cancel".to_string());
-    if let Some(index) = select_menu("Forget which channel?", &items)?
-        && index < channel_count
-    {
-        library.channels.remove(index);
-        save_library(library)?;
+    const PAGE_SIZE: usize = 20;
+    if library.channels.is_empty() {
+        clear_screen()?;
+        prompt("No saved Telegram channels. Press Enter to return...")?;
+        return Ok(());
     }
-    Ok(())
+
+    let _raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut selected_row = 0usize;
+    let mut selected = HashSet::new();
+    loop {
+        let start = selected_row
+            .saturating_sub(PAGE_SIZE / 2)
+            .min(library.channels.len().saturating_sub(PAGE_SIZE));
+        let end = (start + PAGE_SIZE).min(library.channels.len());
+        let mut frame = format!(
+            "Forget Telegram channels\r\n{} selected | {} saved\r\n\r\n",
+            selected.len(),
+            library.channels.len()
+        );
+        for (index, channel) in library.channels[start..end].iter().enumerate() {
+            let channel_index = start + index;
+            frame.push_str(&format!(
+                "{} [{}] {}\r\n",
+                if channel_index == selected_row {
+                    ">"
+                } else {
+                    " "
+                },
+                if selected.contains(&channel_index) {
+                    "x"
+                } else {
+                    " "
+                },
+                telegram_channel_label(channel)
+            ));
+        }
+        frame.push_str(
+            "\r\n[Ctrl+Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] forget | [Esc] cancel",
+        );
+        draw_frame(&mut stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => {
+                selected_row = selected_row
+                    .checked_sub(1)
+                    .unwrap_or(library.channels.len() - 1);
+            }
+            KeyCode::Down => selected_row = (selected_row + 1) % library.channels.len(),
+            KeyCode::PageUp => selected_row = selected_row.saturating_sub(PAGE_SIZE),
+            KeyCode::PageDown => {
+                selected_row = (selected_row + PAGE_SIZE).min(library.channels.len() - 1);
+            }
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !selected.remove(&selected_row) {
+                    selected.insert(selected_row);
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                toggle_all(&mut selected, 0..library.channels.len());
+            }
+            KeyCode::Enter => {
+                if selected.is_empty() {
+                    selected.insert(selected_row);
+                }
+                library.channels = library
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !selected.contains(index))
+                    .map(|(_, channel)| channel.clone())
+                    .collect();
+                save_library(library)?;
+                return Ok(());
+            }
+            KeyCode::Esc => return Ok(()),
+            _ => {}
+        }
+    }
 }
 
 fn choose_local_folder(library: &mut SavedLibrary) -> Result<Option<PathBuf>> {
@@ -632,7 +784,7 @@ pub(crate) fn parse_playlists(text: &str) -> Vec<Playlist> {
         match (fields.next(), fields.next(), fields.next(), fields.next()) {
             (Some("playlist"), Some(name), Some(channel), _) => playlists.push(Playlist {
                 name: name.to_string(),
-                channel: channel.to_string(),
+                channel: normalize_channel_identity(channel),
                 tracks: Vec::new(),
                 local_tracks: Vec::new(),
             }),
@@ -641,7 +793,7 @@ pub(crate) fn parse_playlists(text: &str) -> Vec<Playlist> {
                     && let Ok(message_id) = message_id.parse()
                 {
                     playlist.tracks.push(TelegramCatalogEntry {
-                        channel: normalize_channel(channel),
+                        channel: normalize_channel_identity(channel),
                         message_id,
                         name: name.to_string(),
                     });
@@ -680,12 +832,12 @@ pub(crate) fn serialize_playlists(playlists: &[Playlist]) -> String {
         text.push_str(&format!(
             "playlist\t{}\t{}\n",
             clean_playlist_name(&playlist.name),
-            playlist.channel
+            normalize_channel_identity(&playlist.channel)
         ));
         for track in &playlist.tracks {
             text.push_str(&format!(
                 "track\t{}\t{}\t{}\n",
-                normalize_channel(&track.channel),
+                normalize_channel_identity(&track.channel),
                 track.message_id,
                 track.name.replace(['\t', '\r', '\n'], " ")
             ));

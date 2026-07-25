@@ -9,9 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use grammers_client::media::Media;
+use grammers_client::peer::Peer;
+use grammers_client::tl;
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::{InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
+use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -39,6 +42,9 @@ const TELEGRAM_CACHE_DIR: &str = ".music-terminal/telegram-cache";
 const DOWNLOAD_CHUNK_BYTES: u64 = 512 * 1024;
 const INITIAL_BUFFER_BYTES: u64 = 1024 * 1024;
 const TRACK_LIST_PAGE_SIZE: usize = 25;
+const PRIVATE_CHANNEL_PAGE_SIZE: usize = 20;
+const PRIVATE_CHANNEL_PREFIX: &str = "private:";
+
 #[derive(Clone)]
 struct TelegramTrack {
     name: String,
@@ -420,20 +426,21 @@ fn telegram_credentials() -> Result<(i32, String)> {
 
 pub(crate) async fn stream_channel(channel: &str) -> Result<PlayerExit> {
     delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
-    let username = normalize_channel(channel);
-    let catalog_path = telegram_catalog_path(&username);
+    let channel = normalize_channel_identity(channel);
+    let label = telegram_channel_label(&channel);
+    let catalog_path = telegram_catalog_path(&channel);
     let mut catalog = load_telegram_catalog(&catalog_path).with_context(|| {
-        format!("no usable song list for @{username}; run Sync and update Telegram channel first")
+        format!("no usable song list for {label}; run Sync and update Telegram channel first")
     })?;
     for entry in &mut catalog {
-        entry.channel = username.clone();
+        entry.channel = channel.clone();
     }
     if catalog.is_empty() {
-        bail!("song list for @{username} is empty; run synchronization again");
+        bail!("song list for {label} is empty; run synchronization again");
     }
 
     let title = format!(
-        "Telegram channel: @{username}\n{} tracks | {}",
+        "Telegram channel: {label}\n{} tracks | {}",
         catalog.len(),
         catalog_path.display()
     );
@@ -470,13 +477,14 @@ pub(crate) async fn stream_catalog_entries(
 }
 
 pub(crate) fn channel_catalog(channel: &str) -> Result<Vec<TelegramCatalogEntry>> {
-    let username = normalize_channel(channel);
-    let path = telegram_catalog_path(&username);
+    let channel = normalize_channel_identity(channel);
+    let label = telegram_channel_label(&channel);
+    let path = telegram_catalog_path(&channel);
     let mut catalog = load_telegram_catalog(&path).with_context(|| {
-        format!("no song list for @{username}; sync and update the Telegram channel first")
+        format!("no song list for {label}; sync and update the Telegram channel first")
     })?;
     for entry in &mut catalog {
-        entry.channel = username.clone();
+        entry.channel = channel.clone();
     }
     Ok(catalog)
 }
@@ -490,7 +498,7 @@ pub(crate) async fn play_catalog_entries(
     if catalog.is_empty() {
         bail!("playlist has no songs");
     }
-    let fallback_channel = normalize_channel(channel);
+    let fallback_channel = normalize_channel_identity(channel);
     for entry in &mut catalog {
         if entry.channel.is_empty() {
             entry.channel = fallback_channel.clone();
@@ -947,17 +955,10 @@ async fn start_catalog_track(
     entry: &TelegramCatalogEntry,
     volume: f32,
 ) -> Result<ActiveTelegramTrack> {
-    let username = &entry.channel;
-    let cache_dir = Path::new(TELEGRAM_CACHE_DIR).join(safe_file_name(username));
+    let channel = &entry.channel;
+    let cache_dir = Path::new(TELEGRAM_CACHE_DIR).join(channel_storage_key(channel));
     fs::create_dir_all(&cache_dir)?;
-    let peer = client
-        .resolve_username(username)
-        .await?
-        .with_context(|| format!("public channel not found: {username}"))?
-        .to_ref()
-        .await
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?
-        .with_context(|| format!("cannot access channel: {username}"))?;
+    let peer = resolve_channel(client, channel).await?;
     let message = client
         .get_messages_by_id(peer, &[entry.message_id])
         .await?
@@ -1238,28 +1239,255 @@ pub(crate) async fn download_channel(channel: &str, folder: &Path) -> Result<()>
     scan_channel(channel, Some(folder)).await
 }
 
+pub(crate) async fn choose_private_channel(
+    saved_channels: &[String],
+) -> Result<Option<Vec<String>>> {
+    clear_screen()?;
+    println!("Scanning Telegram account dialogs...");
+    let client = telegram_client().await?;
+    let mut dialogs = client.iter_dialogs();
+    let mut channels = Vec::new();
+    let mut dialog_count = 0usize;
+    while let Some(dialog) = dialogs.next().await? {
+        dialog_count += 1;
+        if let Peer::Channel(channel) = dialog.peer()
+            && channel.username().is_none()
+        {
+            let label = channel.title().to_string();
+            let id = dialog.peer_id().bare_id_unchecked();
+            channels.push((
+                label.clone(),
+                id,
+                private_channel_identity(dialog.peer_ref(), &label),
+            ));
+        }
+        print!(
+            "\rScanned {dialog_count} dialogs | found {} private broadcast channels",
+            channels.len()
+        );
+        io::stdout().flush()?;
+    }
+    println!();
+    channels.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    if channels.is_empty() {
+        bail!("the logged-in account has no private broadcast channels");
+    }
+
+    let saved: HashSet<_> = channels
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, identity))| private_channel_is_saved(identity, saved_channels))
+        .map(|(index, _)| index)
+        .collect();
+    let _raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut query = String::new();
+    let mut matches: Vec<_> = (0..channels.len()).collect();
+    let mut selected_row = 0usize;
+    let mut selected = HashSet::new();
+    loop {
+        selected_row = if matches.is_empty() {
+            0
+        } else {
+            selected_row.min(matches.len() - 1)
+        };
+        let start = selected_row
+            .saturating_sub(PRIVATE_CHANNEL_PAGE_SIZE / 2)
+            .min(matches.len().saturating_sub(PRIVATE_CHANNEL_PAGE_SIZE));
+        let end = (start + PRIVATE_CHANNEL_PAGE_SIZE).min(matches.len());
+        let mut frame = format!(
+            "Choose private Telegram channels\r\nSearch: {query}_ | {} selected | {} matches | {} scanned\r\n\r\n",
+            selected.len(),
+            matches.len(),
+            dialog_count
+        );
+        for (offset, &channel_index) in matches[start..end].iter().enumerate() {
+            let (title, id, _) = &channels[channel_index];
+            frame.push_str(&format!(
+                "{} [{}] 🔒 {}  [channel {}]\r\n",
+                if start + offset == selected_row {
+                    ">"
+                } else {
+                    " "
+                },
+                if saved.contains(&channel_index) || selected.contains(&channel_index) {
+                    "x"
+                } else {
+                    " "
+                },
+                title,
+                id
+            ));
+        }
+        if matches.is_empty() {
+            frame.push_str("No matching private channels.\r\n");
+        }
+        frame.push_str(
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down/Page Up/Page Down scroll | [Enter] sync | [Esc] cancel",
+        );
+        draw_frame(&mut stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up if !matches.is_empty() => {
+                selected_row = selected_row.checked_sub(1).unwrap_or(matches.len() - 1);
+            }
+            KeyCode::Down if !matches.is_empty() => {
+                selected_row = (selected_row + 1) % matches.len();
+            }
+            KeyCode::PageUp if !matches.is_empty() => {
+                selected_row = selected_row.saturating_sub(PRIVATE_CHANNEL_PAGE_SIZE);
+            }
+            KeyCode::PageDown if !matches.is_empty() => {
+                selected_row = (selected_row + PRIVATE_CHANNEL_PAGE_SIZE).min(matches.len() - 1);
+            }
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !matches.is_empty() {
+                    let index = matches[selected_row];
+                    if !saved.contains(&index) && !selected.remove(&index) {
+                        selected.insert(index);
+                    }
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                toggle_all(
+                    &mut selected,
+                    selectable_private_channel_matches(&matches, &saved),
+                );
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                matches = search_private_channels(&channels, &query);
+                selected_row = 0;
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
+                query.push(character);
+                matches = search_private_channels(&channels, &query);
+                selected_row = 0;
+            }
+            KeyCode::Enter => {
+                if selected.is_empty() {
+                    if matches.is_empty() || saved.contains(&matches[selected_row]) {
+                        continue;
+                    }
+                    selected.insert(matches[selected_row]);
+                }
+                return Ok(Some(
+                    channels
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| selected.contains(index))
+                        .map(|(_, (_, _, identity))| identity.clone())
+                        .collect(),
+                ));
+            }
+            KeyCode::Esc => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn selectable_private_channel_matches(
+    matches: &[usize],
+    saved: &HashSet<usize>,
+) -> Vec<usize> {
+    matches
+        .iter()
+        .copied()
+        .filter(|index| !saved.contains(index))
+        .collect()
+}
+
+pub(crate) fn private_channel_is_saved(channel: &str, saved_channels: &[String]) -> bool {
+    let Some((peer, _)) = parse_private_channel(channel) else {
+        return false;
+    };
+    saved_channels.iter().any(|saved| {
+        parse_private_channel(saved)
+            .map(|(saved_peer, _)| saved_peer.id == peer.id)
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn search_private_channels(
+    channels: &[(String, i64, String)],
+    query: &str,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    channels
+        .iter()
+        .enumerate()
+        .filter(|(_, (title, id, _))| {
+            query.is_empty()
+                || title.to_lowercase().contains(&query)
+                || id.to_string().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+pub(crate) async fn private_channel_from_link(link: &str) -> Result<String> {
+    let hash = private_invite_hash(link).context("invalid private Telegram invite link")?;
+    let client = telegram_client().await?;
+    let invite = client
+        .invoke(&tl::functions::messages::CheckChatInvite { hash })
+        .await?;
+    let tl::enums::ChatInvite::Already(invite) = invite else {
+        bail!("this Telegram account has not joined that private channel");
+    };
+    let peer = Peer::from_raw(&client, invite.chat);
+    let Peer::Channel(channel) = peer else {
+        bail!("the invite link is not a broadcast channel");
+    };
+    let label = channel.title().to_string();
+    let peer = channel
+        .to_ref()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .context("cannot access the private channel")?;
+    Ok(private_channel_identity(peer, &label))
+}
+
+pub(crate) fn private_invite_hash(link: &str) -> Option<String> {
+    let link = link.trim().trim_end_matches('/');
+    let path = ["https://t.me/", "http://t.me/", "https://telegram.me/"]
+        .into_iter()
+        .find_map(|prefix| link.strip_prefix(prefix))?;
+    let hash = path
+        .strip_prefix("+")
+        .or_else(|| path.strip_prefix("joinchat/"))?;
+    (!hash.is_empty() && !hash.contains('/')).then(|| hash.to_string())
+}
+
 async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<()> {
     let started = Instant::now();
     let client = telegram_client().await?;
-    let username = channel.trim_start_matches('@');
-    let peer = client
-        .resolve_username(username)
-        .await?
-        .with_context(|| format!("public channel not found: {username}"))?
-        .to_ref()
-        .await
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?
-        .with_context(|| format!("cannot access channel: {username}"))?;
+    let channel = normalize_channel_identity(channel);
+    let label = telegram_channel_label(&channel);
+    let peer = resolve_channel(&client, &channel).await?;
 
     let mut catalog = Vec::new();
     let mut pending = Vec::new();
+    let mut message_count = 0usize;
+    let mut document_count = 0usize;
     let mut messages = client.iter_messages(peer);
 
-    println!("Scanning all songs in @{username}...");
+    println!("Scanning all songs in {label}...");
     while let Some(message) = messages.next().await? {
+        message_count += 1;
         let Some(media) = message.media() else {
             continue;
         };
+        if matches!(media, Media::Document(_)) {
+            document_count += 1;
+        }
         if !is_audio_media(&media) {
             continue;
         }
@@ -1267,7 +1495,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
         let name =
             media_file_name(&media).unwrap_or_else(|| format!("telegram-{}.bin", message.id()));
         catalog.push(TelegramCatalogEntry {
-            channel: username.to_string(),
+            channel: channel.clone(),
             message_id: message.id(),
             name: name.clone(),
         });
@@ -1282,7 +1510,12 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
 
     catalog.reverse();
     let total_songs = catalog.len();
-    let catalog_path = telegram_catalog_path(username);
+    let catalog_path = telegram_catalog_path(&channel);
+    if total_songs == 0 {
+        bail!(
+            "no supported audio found in {label}: Telegram returned {message_count} messages and {document_count} documents; the existing song list was not overwritten"
+        );
+    }
     save_telegram_catalog(&catalog_path, &catalog)?;
     let scan_time = started.elapsed();
     println!(
@@ -1340,11 +1573,92 @@ fn media_file_name(media: &Media) -> Option<String> {
     }
 }
 
-fn telegram_catalog_path(username: &str) -> PathBuf {
-    Path::new(DATA_DIR).join("catalogs").join(format!(
-        "{}.tracks.txt",
-        safe_file_name(&normalize_channel(username))
-    ))
+pub(crate) fn normalize_channel_identity(channel: &str) -> String {
+    let channel = channel.trim();
+    if channel.starts_with(PRIVATE_CHANNEL_PREFIX) {
+        channel.to_string()
+    } else {
+        normalize_channel(channel)
+    }
+}
+
+pub(crate) fn telegram_channel_label(channel: &str) -> String {
+    parse_private_channel(channel)
+        .map(|(_, label)| format!("🔒 {label}"))
+        .unwrap_or_else(|| format!("@{}", normalize_channel(channel)))
+}
+
+pub(crate) fn private_channel_identity(peer: PeerRef, label: &str) -> String {
+    let id = peer.id.bot_api_dialog_id_unchecked();
+    let label = label
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{PRIVATE_CHANNEL_PREFIX}{id}:{}:{label}", peer.auth.hash())
+}
+
+fn parse_private_channel(channel: &str) -> Option<(PeerRef, String)> {
+    let value = channel.strip_prefix(PRIVATE_CHANNEL_PREFIX)?;
+    let mut fields = value.splitn(3, ':');
+    let id = PeerId::from_bot_api_dialog_id(fields.next()?.parse().ok()?)?;
+    let auth = PeerAuth::from_hash(fields.next()?.parse().ok()?);
+    let encoded = fields.next()?;
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let label = String::from_utf8(bytes).ok()?;
+    Some((PeerRef { id, auth }, label))
+}
+
+async fn resolve_channel(client: &Client, channel: &str) -> Result<PeerRef> {
+    if channel.starts_with(PRIVATE_CHANNEL_PREFIX) {
+        return parse_private_channel(channel)
+            .map(|(peer, _)| peer)
+            .context("invalid saved private channel; forget it and add it again");
+    }
+    let username = normalize_channel(channel);
+    client
+        .resolve_username(&username)
+        .await?
+        .with_context(|| format!("public channel not found: {username}"))?
+        .to_ref()
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .with_context(|| format!("cannot access channel: {username}"))
+}
+
+fn channel_storage_key(channel: &str) -> String {
+    parse_private_channel(channel)
+        .and_then(|(peer, _)| peer.id.bare_id())
+        .map(|id| format!("private-{id}"))
+        .unwrap_or_else(|| safe_file_name(&normalize_channel(channel)))
+}
+
+fn telegram_catalog_path(channel: &str) -> PathBuf {
+    let directory = Path::new(DATA_DIR).join("catalogs");
+    let path = directory.join(format!("{}.tracks.txt", channel_storage_key(channel)));
+    if path.exists() {
+        return path;
+    }
+    let Some((peer, _)) = parse_private_channel(channel) else {
+        return path;
+    };
+    let legacy = directory.join(format!(
+        "private-{}.tracks.txt",
+        peer.id.bot_api_dialog_id_unchecked()
+    ));
+    if legacy.exists() {
+        if fs::rename(&legacy, &path).is_ok() {
+            return path;
+        }
+        return legacy;
+    }
+    path
 }
 
 pub(crate) fn save_telegram_catalog(path: &Path, catalog: &[TelegramCatalogEntry]) -> Result<()> {

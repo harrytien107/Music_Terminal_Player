@@ -6,7 +6,9 @@ use crate::app::{Playlist, collect_library_tracks, parse_playlists, serialize_pl
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
-    load_telegram_catalog, save_telegram_catalog, search_catalog,
+    load_telegram_catalog, normalize_channel_identity, private_channel_identity,
+    private_channel_is_saved, private_invite_hash, save_telegram_catalog, search_catalog,
+    search_private_channels, selectable_private_channel_matches, telegram_channel_label,
 };
 use crate::util::{
     LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
@@ -16,6 +18,7 @@ use crate::util::{
 use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
 };
+use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 
 #[test]
 fn safe_file_name_removes_windows_forbidden_chars() {
@@ -51,6 +54,85 @@ fn saved_channel_input_accepts_username_and_url() {
         normalize_channel("https://t.me/music_channel/"),
         "music_channel"
     );
+}
+
+#[test]
+fn private_channel_identity_round_trips_through_library_and_playlist_formats() {
+    let channel = private_channel_identity(
+        PeerRef {
+            id: PeerId::channel(123456).unwrap(),
+            auth: PeerAuth::from_hash(987654321),
+        },
+        "My private 音楽",
+    );
+    assert_eq!(normalize_channel_identity(&channel), channel);
+    assert_eq!(telegram_channel_label(&channel), "🔒 My private 音楽");
+
+    let playlist = Playlist {
+        name: "Private mix".to_string(),
+        channel: channel.clone(),
+        tracks: vec![TelegramCatalogEntry {
+            channel: channel.clone(),
+            message_id: 42,
+            name: "Private song.opus".to_string(),
+        }],
+        local_tracks: Vec::new(),
+    };
+    let parsed = parse_playlists(&serialize_playlists(&[playlist]));
+    assert_eq!(parsed[0].channel, channel);
+    assert_eq!(parsed[0].tracks[0].channel, channel);
+}
+
+#[test]
+fn private_saved_marker_matches_peer_id_after_title_changes() {
+    let peer = PeerRef {
+        id: PeerId::channel(123456).unwrap(),
+        auth: PeerAuth::from_hash(987654321),
+    };
+    let saved = private_channel_identity(peer, "Old title");
+    let discovered = private_channel_identity(peer, "Renamed channel");
+    let other = private_channel_identity(
+        PeerRef {
+            id: PeerId::channel(654321).unwrap(),
+            auth: PeerAuth::from_hash(123456789),
+        },
+        "Other channel",
+    );
+    assert!(private_channel_is_saved(&discovered, &[saved]));
+    assert!(!private_channel_is_saved(&other, &[]));
+}
+
+#[test]
+fn saved_private_channels_are_excluded_from_bulk_selection() {
+    let saved = HashSet::from([1, 3]);
+    assert_eq!(
+        selectable_private_channel_matches(&[0, 1, 2, 3], &saved),
+        vec![0, 2]
+    );
+}
+
+#[test]
+fn private_invite_links_extract_hash_without_accepting_the_invite() {
+    assert_eq!(
+        private_invite_hash("https://t.me/+AbCd_123"),
+        Some("AbCd_123".to_string())
+    );
+    assert_eq!(
+        private_invite_hash("https://t.me/joinchat/AbCd_123/"),
+        Some("AbCd_123".to_string())
+    );
+    assert_eq!(private_invite_hash("https://t.me/public_channel"), None);
+}
+
+#[test]
+fn private_channel_search_matches_title_and_channel_id() {
+    let channels = vec![
+        ("AdSecVN Bak".to_string(), 3714482295, "first".to_string()),
+        ("Music Vault".to_string(), 123456, "second".to_string()),
+    ];
+    assert_eq!(search_private_channels(&channels, "adsec"), vec![0]);
+    assert_eq!(search_private_channels(&channels, "123456"), vec![1]);
+    assert_eq!(search_private_channels(&channels, ""), vec![0, 1]);
 }
 
 #[test]
