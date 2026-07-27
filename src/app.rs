@@ -61,11 +61,11 @@ pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
     let items = vec![
         "▶  Quick play".to_string(),
+        "▶  Play YouTube audio".to_string(),
         "♫  Play local folder".to_string(),
         "☁  Stream Telegram channel".to_string(),
         "↻  Sync and update Telegram channel".to_string(),
         "↓  Download Telegram channel to .\\music".to_string(),
-        "▶  Play YouTube audio".to_string(),
         "≡  Open playlists".to_string(),
         "●  Login to Telegram".to_string(),
         "×  Quit".to_string(),
@@ -84,14 +84,19 @@ pub(crate) fn launch_menu() -> Result<()> {
                     return Ok(());
                 }
             }
-            Some(1) => {
+            Some(1) => match crate::youtube::play_youtube() {
+                Ok(PlayerExit::Quit) => return Ok(()),
+                Ok(PlayerExit::Back) => {}
+                Err(error) => show_menu_error(&error)?,
+            },
+            Some(2) => {
                 if let Some(path) = choose_local_folder(&mut library)?
                     && play_path(&path)? == PlayerExit::Quit
                 {
                     return Ok(());
                 }
             }
-            Some(2) => {
+            Some(3) => {
                 if let Some((label, catalog)) =
                     choose_telegram_catalog(&library, "Stream Telegram channel")?
                 {
@@ -106,7 +111,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                     }
                 }
             }
-            Some(3) => {
+            Some(4) => {
                 while let Some(channels) = choose_channel_to_sync(&mut library)? {
                     let total = channels.len();
                     let mut summary = Vec::with_capacity(total);
@@ -139,7 +144,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                     prompt("\nPress Enter to continue...")?;
                 }
             }
-            Some(4) => {
+            Some(5) => {
                 if let Some(channel) =
                     choose_saved_channel(&library, "Download saved Telegram channel")?
                 {
@@ -149,11 +154,6 @@ pub(crate) fn launch_menu() -> Result<()> {
                         .block_on(download_channel(&channel, Path::new("music")))?;
                 }
             }
-            Some(5) => match crate::youtube::play_youtube() {
-                Ok(PlayerExit::Quit) => return Ok(()),
-                Ok(PlayerExit::Back) => {}
-                Err(error) => show_menu_error(&error)?,
-            },
             Some(6) => {
                 if manage_playlists(&mut library)? == PlayerExit::Quit {
                     return Ok(());
@@ -259,14 +259,14 @@ fn choose_telegram_catalog(
         prompt("Use 'Sync and update Telegram channel' to add one. Press Enter to return...")?;
         return Ok(None);
     }
-    let mut items = vec!["All synchronized channels".to_string()];
+    let mut items = vec!["☁  All synchronized channels".to_string()];
     items.extend(
         library
             .channels
             .iter()
             .map(|channel| telegram_channel_label(channel)),
     );
-    items.push("Back".to_string());
+    items.push("←  Back".to_string());
     let Some(index) = select_menu(title, &items)? else {
         return Ok(None);
     };
@@ -308,7 +308,7 @@ fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<St
         .map(|channel| telegram_channel_label(channel))
         .collect();
     let channel_count = items.len();
-    items.push("Back".to_string());
+    items.push("←  Back".to_string());
     Ok(select_menu(title, &items)?
         .and_then(|index| (index < channel_count).then(|| library.channels[index].clone())))
 }
@@ -318,23 +318,25 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
         let mut items: Vec<_> = library
             .channels
             .iter()
-            .map(|channel| format!("Sync and update {}", telegram_channel_label(channel)))
+            .map(|channel| format!("↻  Sync and update {}", telegram_channel_label(channel)))
             .collect();
         let channel_count = items.len();
         if let Some(last_channel) = items.last_mut() {
-            last_channel.push_str("\r\n\r\n  ────────── ADD OR MANAGE ──────────");
+            last_channel.push_str(
+                "\r\n\r\n  ╭────────────────────────────╮\r\n  │       ADD OR MANAGE        │\r\n  ╰────────────────────────────╯",
+            );
         }
         items.extend([
-            "Add public channel by username".to_string(),
-            "Choose private channel from this account".to_string(),
-            "Add joined private channel by invite link".to_string(),
-            "Forget channel".to_string(),
-            "Back".to_string(),
+            "＋  Add public channel by username".to_string(),
+            "⌕  Choose private channel from this account".to_string(),
+            "🔗  Add joined private channel by invite link".to_string(),
+            "−  Forget channel".to_string(),
+            "←  Back".to_string(),
         ]);
         let section = if channel_count == 0 {
-            "────────── ADD OR MANAGE ──────────"
+            "╭────────────────────────────╮\n│       ADD OR MANAGE        │\n╰────────────────────────────╯"
         } else {
-            "──────── SAVED CHANNELS ────────"
+            "╭────────────────────────────╮\n│       SAVED CHANNELS       │\n╰────────────────────────────╯"
         };
         let title = format!(
             "Sync and update Telegram channel\nChoose an accessible channel or paste an invite link for one already joined.\n\n{section}"
@@ -527,13 +529,13 @@ fn choose_local_folder(library: &mut SavedLibrary) -> Result<Option<PathBuf>> {
         let mut items: Vec<_> = library
             .folders
             .iter()
-            .map(|folder| folder.display().to_string())
+            .map(|folder| format!("♫  {}", folder.display()))
             .collect();
         let folder_count = items.len();
         items.extend([
-            "Add folder".to_string(),
-            "Forget location".to_string(),
-            "Back".to_string(),
+            "＋  Add folder".to_string(),
+            "−  Forget location".to_string(),
+            "←  Back".to_string(),
         ]);
         match select_menu("Local folders", &items)? {
             Some(index) if index < folder_count => {
@@ -564,10 +566,10 @@ fn forget_folder(library: &mut SavedLibrary) -> Result<()> {
     let mut items: Vec<_> = library
         .folders
         .iter()
-        .map(|folder| folder.display().to_string())
+        .map(|folder| format!("♫  {}", folder.display()))
         .collect();
     let folder_count = items.len();
-    items.push("Cancel".to_string());
+    items.push("←  Cancel".to_string());
     if let Some(index) = select_menu("Forget which location?", &items)?
         && index < folder_count
     {
@@ -589,7 +591,7 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
                     format!("Telegram, {} channels", playlist.channel_count())
                 };
                 format!(
-                    "{} ({source}, {} songs)",
+                    "▶  {} ({source}, {} songs)",
                     playlist.name,
                     playlist.song_count()
                 )
@@ -597,11 +599,11 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
             .collect();
         let playlist_count = items.len();
         items.extend([
-            "Create playlist".to_string(),
-            "Edit playlist songs".to_string(),
-            "Rename playlist".to_string(),
-            "Delete playlist".to_string(),
-            "Back".to_string(),
+            "＋  Create playlist".to_string(),
+            "✎  Edit playlist songs".to_string(),
+            "✎  Rename playlist".to_string(),
+            "−  Delete playlist".to_string(),
+            "←  Back".to_string(),
         ]);
         match select_menu("Playlists", &items)? {
             Some(index) if index < playlist_count => {
@@ -661,7 +663,10 @@ fn create_playlist(library: &mut SavedLibrary, playlists: &mut Vec<Playlist>) ->
     }
     let Some(source) = select_menu(
         "Playlist source",
-        &["Telegram channel".to_string(), "Local folder".to_string()],
+        &[
+            "☁  Telegram channel".to_string(),
+            "♫  Local folder".to_string(),
+        ],
     )?
     else {
         return Ok(());
@@ -688,7 +693,10 @@ fn create_playlist(library: &mut SavedLibrary, playlists: &mut Vec<Playlist>) ->
 fn edit_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> Result<()> {
     let Some(source) = select_menu(
         "Playlist source",
-        &["Telegram channel".to_string(), "Local folder".to_string()],
+        &[
+            "☁  Telegram channel".to_string(),
+            "♫  Local folder".to_string(),
+        ],
     )?
     else {
         return Ok(());
@@ -760,7 +768,7 @@ fn choose_playlist(title: &str, playlists: &[Playlist]) -> Result<Option<usize>>
         .map(|playlist| playlist.name.clone())
         .collect();
     let count = items.len();
-    items.push("Cancel".to_string());
+    items.push("←  Cancel".to_string());
     Ok(select_menu(title, &items)?.filter(|index| *index < count))
 }
 

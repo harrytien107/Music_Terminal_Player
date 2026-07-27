@@ -16,7 +16,7 @@ Run it:
 .\target\release\music-terminal-player.exe
 ```
 
-Running or double-clicking the executable opens the launcher. Use `Up` / `Down` to select, `Enter` to confirm, and `Esc` to return. Add `--borderless` to remove the classic Windows Console Host border and size its window to 1200×500 pixels:
+Running or double-clicking the executable opens the launcher. `Play YouTube audio` is the second row for quick access. Use `Up` / `Down` to select, `Enter` to confirm, and `Esc` to return. Add `--borderless` to remove the classic Windows Console Host border and size its window to 1200×500 pixels:
 
 ```powershell
 .\target\release\music-terminal-player.exe --borderless
@@ -80,7 +80,7 @@ Use `Sync and update Telegram channel` in the launcher to add or update either s
 - `Choose private channel from this account` shows live dialog and private-channel counts while scanning the logged-in account, then lists every accessible private broadcast channel.
 - `Add joined private channel by invite link` accepts `t.me/+...` and `t.me/joinchat/...` links only when the account is already a member. It never joins or requests access automatically. Submit an empty value or type `back` to return to the synchronization menu.
 
-In the private-channel picker, type to search by title or numeric channel ID. The existing checkbox displays `[x]` for channels already added to the library or selected for the current synchronization. Already-saved channels remain visible but are locked: `Ctrl+Space`, `Ctrl+A`, and `Enter` cannot select them again. Use `Up` / `Down` or `Page Up` / `Page Down` to scroll, `Ctrl+Space` to toggle one unsaved channel, `Ctrl+A` to toggle all unsaved current matches, `Enter` to synchronize the selected channels, and `Esc` to cancel. If no channels are toggled, `Enter` synchronizes the highlighted unsaved channel. Multiple selected channels synchronize sequentially without clearing earlier scan output, each successful new channel is saved independently, and the final batch summary reports every channel as successful or failed.
+The synchronization menu groups saved channels and add/manage actions inside rectangular section headers. In the private-channel picker, type to search by title or numeric channel ID. The existing checkbox displays `[x]` for channels already added to the library or selected for the current synchronization. Already-saved channels remain visible but are locked: `Ctrl+Space`, `Ctrl+A`, and `Enter` cannot select them again. Use `Up` / `Down` or `Page Up` / `Page Down` to scroll, `Ctrl+Space` to toggle one unsaved channel, `Ctrl+A` to toggle all unsaved current matches, `Enter` to synchronize the selected channels, and `Esc` to cancel. If no channels are toggled, `Enter` synchronizes the highlighted unsaved channel. Multiple selected channels synchronize sequentially without clearing earlier scan output, each successful new channel is saved independently, and the final batch summary reports every channel as successful or failed.
 
 `Forget channel` supports one or many saved channels. Use `Ctrl+Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to forget, and `Esc` to cancel. With no toggled channels, `Enter` forgets only the highlighted channel.
 
@@ -121,7 +121,7 @@ The download action updates the catalog, skips existing files, and reports progr
 
 On first use, choose one setup option:
 
-- `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
+- `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable and automatically saves both executable locations in `.music-terminal/youtube-tools.txt`. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
 - `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH`.
 
 Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`.

@@ -135,9 +135,9 @@ fn load_or_prompt_tools() -> Result<YouTubeTools> {
     }
 
     let items = vec![
-        "Download portable yt-dlp and FFmpeg".to_string(),
-        "Use existing yt-dlp and FFmpeg installations".to_string(),
-        "Back".to_string(),
+        "↓  Download portable yt-dlp and FFmpeg".to_string(),
+        "⌕  Use existing yt-dlp and FFmpeg installations".to_string(),
+        "←  Back".to_string(),
     ];
     let tools = match select_menu("YouTube direct-stream setup", &items)? {
         Some(0) => download_portable_tools()?,
@@ -149,6 +149,10 @@ fn load_or_prompt_tools() -> Result<YouTubeTools> {
     validate_tool(&tools.ffmpeg, "-version").context("FFmpeg validation failed")?;
     fs::create_dir_all(DATA_DIR)?;
     fs::write(TOOLS_FILE, serialize_youtube_tools(&tools))?;
+    println!(
+        "Saved yt-dlp and FFmpeg locations to {TOOLS_FILE}.\nyt-dlp: {}\nFFmpeg: {}",
+        tools.yt_dlp, tools.ffmpeg
+    );
     Ok(tools)
 }
 
@@ -281,7 +285,9 @@ pub(crate) fn serialize_youtube_tools(tools: &YouTubeTools) -> String {
 
 fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> {
     clear_screen()?;
-    println!("YouTube audio\nPaste one URL, multiple space-separated URLs, or a playlist URL.");
+    println!(
+        "YouTube audio\nTutor: Paste one URL, multiple space-separated URLs (https://... https://), or a playlist URL."
+    );
     let input = prompt("URL(s): ")?;
     let urls = parse_youtube_urls(&input)?;
     if urls.is_empty() {
