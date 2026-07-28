@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::app::{Playlist, collect_library_tracks, parse_playlists, serialize_playlists};
+use crate::app::{
+    Playlist, collect_library_tracks, parse_playlists, selected_or_highlighted_channel_indexes,
+    serialize_playlists,
+};
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
@@ -133,6 +136,18 @@ fn private_channel_search_matches_title_and_channel_id() {
     assert_eq!(search_private_channels(&channels, "adsec"), vec![0]);
     assert_eq!(search_private_channels(&channels, "123456"), vec![1]);
     assert_eq!(search_private_channels(&channels, ""), vec![0, 1]);
+}
+
+#[test]
+fn telegram_stream_uses_highlighted_or_sorted_selected_channels() {
+    assert_eq!(
+        selected_or_highlighted_channel_indexes(&HashSet::new(), 2),
+        vec![2]
+    );
+    assert_eq!(
+        selected_or_highlighted_channel_indexes(&HashSet::from([3, 0, 2]), 1),
+        vec![0, 2, 3]
+    );
 }
 
 #[test]

@@ -253,46 +253,114 @@ fn choose_telegram_catalog(
     library: &SavedLibrary,
     title: &str,
 ) -> Result<Option<(String, Vec<TelegramCatalogEntry>)>> {
+    const PAGE_SIZE: usize = 20;
     if library.channels.is_empty() {
         clear_screen()?;
         println!("No synchronized Telegram channels.");
         prompt("Use 'Sync and update Telegram channel' to add one. Press Enter to return...")?;
         return Ok(None);
     }
-    let mut items = vec!["☁  All synchronized channels".to_string()];
-    items.extend(
-        library
-            .channels
-            .iter()
-            .map(|channel| telegram_channel_label(channel)),
-    );
-    items.push("←  Back".to_string());
-    let Some(index) = select_menu(title, &items)? else {
-        return Ok(None);
-    };
-    if index == 0 {
-        let tracks = all_channel_tracks(library)?;
-        return Ok(Some((
-            format!(
-                "All synchronized Telegram channels\n{} tracks",
-                tracks.len()
-            ),
-            tracks,
-        )));
+
+    let raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut selected_row = 0usize;
+    let mut selected = HashSet::new();
+    loop {
+        let start = selected_row
+            .saturating_sub(PAGE_SIZE / 2)
+            .min(library.channels.len().saturating_sub(PAGE_SIZE));
+        let end = (start + PAGE_SIZE).min(library.channels.len());
+        let mut frame = format!(
+            "{title}\r\n{} selected | {} synchronized\r\n\r\n",
+            selected.len(),
+            library.channels.len()
+        );
+        for (offset, channel) in library.channels[start..end].iter().enumerate() {
+            let channel_index = start + offset;
+            frame.push_str(&format!(
+                "{} [{}] {}\r\n",
+                if channel_index == selected_row {
+                    ">"
+                } else {
+                    " "
+                },
+                if selected.contains(&channel_index) {
+                    "x"
+                } else {
+                    " "
+                },
+                telegram_channel_label(channel)
+            ));
+        }
+        frame.push_str(
+            "\r\n[Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] play | [Esc] back",
+        );
+        draw_frame(&mut stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => {
+                selected_row = selected_row
+                    .checked_sub(1)
+                    .unwrap_or(library.channels.len() - 1);
+            }
+            KeyCode::Down => selected_row = (selected_row + 1) % library.channels.len(),
+            KeyCode::PageUp => selected_row = selected_row.saturating_sub(PAGE_SIZE),
+            KeyCode::PageDown => {
+                selected_row = (selected_row + PAGE_SIZE).min(library.channels.len() - 1);
+            }
+            KeyCode::Char(' ') => {
+                if !selected.remove(&selected_row) {
+                    selected.insert(selected_row);
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                toggle_all(&mut selected, 0..library.channels.len());
+            }
+            KeyCode::Enter => {
+                let indexes = selected_or_highlighted_channel_indexes(&selected, selected_row);
+                drop(raw);
+                clear_screen()?;
+                let mut tracks = Vec::new();
+                for index in &indexes {
+                    tracks.extend(channel_catalog(&library.channels[*index])?);
+                }
+                let label = if indexes.len() == 1 {
+                    format!(
+                        "Telegram channel: {}\n{} tracks",
+                        telegram_channel_label(&library.channels[indexes[0]]),
+                        tracks.len()
+                    )
+                } else {
+                    format!(
+                        "{} selected Telegram channels\n{} tracks",
+                        indexes.len(),
+                        tracks.len()
+                    )
+                };
+                return Ok(Some((label, tracks)));
+            }
+            KeyCode::Esc => return Ok(None),
+            _ => {}
+        }
     }
-    if index <= library.channels.len() {
-        let channel = &library.channels[index - 1];
-        let tracks = channel_catalog(channel)?;
-        return Ok(Some((
-            format!(
-                "Telegram channel: {}\n{} tracks",
-                telegram_channel_label(channel),
-                tracks.len()
-            ),
-            tracks,
-        )));
+}
+
+pub(crate) fn selected_or_highlighted_channel_indexes(
+    selected: &HashSet<usize>,
+    highlighted: usize,
+) -> Vec<usize> {
+    if selected.is_empty() {
+        return vec![highlighted];
     }
-    Ok(None)
+    let mut indexes: Vec<_> = selected.iter().copied().collect();
+    indexes.sort_unstable();
+    indexes
 }
 
 fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<String>> {
@@ -315,21 +383,24 @@ fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<St
 
 fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(String, bool)>>> {
     loop {
-        let mut items: Vec<_> = library
-            .channels
-            .iter()
-            .map(|channel| format!("↻  Sync and update {}", telegram_channel_label(channel)))
-            .collect();
-        let channel_count = items.len();
-        if let Some(last_channel) = items.last_mut() {
-            last_channel.push_str(
-                "\r\n\r\n  ╭────────────────────────────╮\r\n  │       ADD OR MANAGE        │\r\n  ╰────────────────────────────╯",
+        let channel_count = library.channels.len();
+        let mut items = Vec::new();
+        if channel_count > 0 {
+            items.push("↻  Sync and update All channels".to_string());
+            items.extend(
+                library.channels.iter().map(|channel| {
+                    format!("↻  Sync and update {}", telegram_channel_label(channel))
+                }),
+            );
+            items.last_mut().unwrap().push_str(
+                "\r\n\r\n╭────────────────────────────╮\r\n│       ADD OR MANAGE        │\r\n╰────────────────────────────╯",
             );
         }
+        let saved_item_count = items.len();
         items.extend([
             "＋  Add public channel by username".to_string(),
-            "⌕  Choose private channel from this account".to_string(),
-            "🔗  Add joined private channel by invite link".to_string(),
+            "＋  Add private channel from this account".to_string(),
+            "＋  Add joined private channel by invite link".to_string(),
             "−  Forget channel".to_string(),
             "←  Back".to_string(),
         ]);
@@ -339,13 +410,23 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
             "╭────────────────────────────╮\n│       SAVED CHANNELS       │\n╰────────────────────────────╯"
         };
         let title = format!(
-            "Sync and update Telegram channel\nChoose an accessible channel or paste an invite link for one already joined.\n\n{section}"
+            "Sync and update Telegram channel\nAdd an accessible channel or paste an invite link for one already joined.\n\n{section}"
         );
         match select_menu(&title, &items)? {
-            Some(index) if index < channel_count => {
-                return Ok(Some(vec![(library.channels[index].clone(), false)]));
+            Some(0) if channel_count > 0 => {
+                return Ok(Some(
+                    library
+                        .channels
+                        .iter()
+                        .cloned()
+                        .map(|channel| (channel, false))
+                        .collect(),
+                ));
             }
-            Some(index) if index == channel_count => {
+            Some(index) if channel_count > 0 && index < saved_item_count => {
+                return Ok(Some(vec![(library.channels[index - 1].clone(), false)]));
+            }
+            Some(index) if index == saved_item_count => {
                 clear_screen()?;
                 let channel = normalize_channel(&prompt("Public channel: ")?);
                 if !channel.is_empty() {
@@ -355,7 +436,7 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
                     )]));
                 }
             }
-            Some(index) if index == channel_count + 1 => {
+            Some(index) if index == saved_item_count + 1 => {
                 let channel = runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?
@@ -376,7 +457,7 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
                     Err(error) => show_menu_error(&error)?,
                 }
             }
-            Some(index) if index == channel_count + 2 => {
+            Some(index) if index == saved_item_count + 2 => {
                 clear_screen()?;
                 let link = prompt("Private channel invite link (or type 'back'): ")?;
                 if link.trim().eq_ignore_ascii_case("back") || link.trim().is_empty() {
@@ -396,7 +477,7 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
                     Err(error) => show_menu_error(&error)?,
                 }
             }
-            Some(index) if index == channel_count + 3 => forget_channel(library)?,
+            Some(index) if index == saved_item_count + 3 => forget_channel(library)?,
             Some(_) | None => return Ok(None),
         }
     }
@@ -475,7 +556,7 @@ fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
             ));
         }
         frame.push_str(
-            "\r\n[Ctrl+Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] forget | [Esc] cancel",
+            "\r\n[Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] forget | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -496,7 +577,7 @@ fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
             KeyCode::PageDown => {
                 selected_row = (selected_row + PAGE_SIZE).min(library.channels.len() - 1);
             }
-            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(' ') => {
                 if !selected.remove(&selected_row) {
                     selected.insert(selected_row);
                 }

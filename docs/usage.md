@@ -77,12 +77,12 @@ Environment variables override saved API credentials.
 Use `Sync and update Telegram channel` in the launcher to add or update either source:
 
 - `Add public channel by username` accepts an existing public username or `t.me` URL.
-- `Choose private channel from this account` shows live dialog and private-channel counts while scanning the logged-in account, then lists every accessible private broadcast channel.
+- `Add private channel from this account` shows live dialog and private-channel counts while scanning the logged-in account, then lists every accessible private broadcast channel.
 - `Add joined private channel by invite link` accepts `t.me/+...` and `t.me/joinchat/...` links only when the account is already a member. It never joins or requests access automatically. Submit an empty value or type `back` to return to the synchronization menu.
 
-The synchronization menu groups saved channels and add/manage actions inside rectangular section headers. In the private-channel picker, type to search by title or numeric channel ID. The existing checkbox displays `[x]` for channels already added to the library or selected for the current synchronization. Already-saved channels remain visible but are locked: `Ctrl+Space`, `Ctrl+A`, and `Enter` cannot select them again. Use `Up` / `Down` or `Page Up` / `Page Down` to scroll, `Ctrl+Space` to toggle one unsaved channel, `Ctrl+A` to toggle all unsaved current matches, `Enter` to synchronize the selected channels, and `Esc` to cancel. If no channels are toggled, `Enter` synchronizes the highlighted unsaved channel. Multiple selected channels synchronize sequentially without clearing earlier scan output, each successful new channel is saved independently, and the final batch summary reports every channel as successful or failed.
+The synchronization menu groups saved channels and add/manage actions inside aligned rectangular section headers. `Sync and update All channels` synchronizes every saved channel sequentially. In the private-channel picker, type to search by title or numeric channel ID. The existing checkbox displays `[x]` for channels already added to the library or selected for the current synchronization. Already-saved channels remain visible but are locked: `Ctrl+Space`, `Ctrl+A`, and `Enter` cannot select them again. Use `Up` / `Down` or `Page Up` / `Page Down` to scroll, `Ctrl+Space` to toggle one unsaved channel, `Ctrl+A` to toggle all unsaved current matches, `Enter` to synchronize the selected channels, and `Esc` to cancel. If no channels are toggled, `Enter` synchronizes the highlighted unsaved channel. Multiple selected channels synchronize sequentially without clearing earlier scan output, each successful new channel is saved independently, and the final batch summary reports every channel as successful or failed.
 
-`Forget channel` supports one or many saved channels. Use `Ctrl+Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to forget, and `Esc` to cancel. With no toggled channels, `Enter` forgets only the highlighted channel.
+`Forget channel` supports one or many saved channels. Use `Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to forget, and `Esc` to cancel. With no toggled channels, `Enter` forgets only the highlighted channel.
 
 The scan stores audio message IDs and song names under `.music-terminal/catalogs` without downloading music. An empty scan reports Telegram's message and document counts and does not overwrite an existing catalog. Saved private-channel access is tied to the Telegram session; after changing accounts or deleting the session, forget and add that private channel again.
 
@@ -92,7 +92,9 @@ CLI synchronization:
 cargo run -- sync public_channel_username
 ```
 
-Stream a synchronized channel:
+From `Stream Telegram channel`, choose one or multiple saved channels. Use `Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to play, and `Esc` to return. With no toggled channels, `Enter` plays only the highlighted channel. Multiple selected catalogs are combined into one playback queue while each track keeps its original channel identity. This menu alone uses plain `Space`; searchable selection screens continue to use `Ctrl+Space` so spaces can be typed into search text.
+
+Stream a synchronized public channel from the CLI:
 
 ```powershell
 cargo run -- stream public_channel_username
