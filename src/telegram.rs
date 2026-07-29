@@ -279,10 +279,15 @@ impl Source for OpusSource {
     }
 }
 
-pub(crate) fn is_opus_path(path: &Path) -> bool {
+pub(crate) fn telegram_format_hint(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("opus"))
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+pub(crate) fn is_opus_path(path: &Path) -> bool {
+    telegram_format_hint(path).as_deref() == Some("opus")
 }
 
 pub(crate) fn checked_position(base: u64, offset: i64) -> io::Result<u64> {
@@ -1068,7 +1073,16 @@ async fn start_telegram_track(
         sink.append(source);
         duration
     } else {
-        let decoder = Decoder::try_from(BufReader::new(reader))
+        let mut builder = Decoder::builder().with_data(BufReader::new(reader));
+        if let Some(size) = track.size {
+            builder = builder.with_byte_len(size);
+        }
+        let hint = telegram_format_hint(&track.cache_path);
+        if let Some(hint) = hint.as_deref() {
+            builder = builder.with_hint(hint);
+        }
+        let decoder = builder
+            .build()
             .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
         let duration = decoder.total_duration();
         sink.append(decoder);

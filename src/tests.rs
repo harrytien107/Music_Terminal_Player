@@ -12,6 +12,7 @@ use crate::telegram::{
     load_telegram_catalog, normalize_channel_identity, private_channel_identity,
     private_channel_is_saved, private_invite_hash, save_telegram_catalog, search_catalog,
     search_private_channels, selectable_private_channel_matches, telegram_channel_label,
+    telegram_format_hint,
 };
 use crate::util::{
     LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
@@ -42,6 +43,19 @@ fn supported_audio_extensions_are_case_insensitive() {
 fn telegram_opus_backend_matches_extension_case_insensitively() {
     assert!(is_opus_path(Path::new("voice.OPUS")));
     assert!(!is_opus_path(Path::new("voice.ogg")));
+}
+
+#[test]
+fn telegram_decoder_hints_match_track_extensions_case_insensitively() {
+    assert_eq!(
+        telegram_format_hint(Path::new("Bonobo - From You.m4a")).as_deref(),
+        Some("m4a")
+    );
+    assert_eq!(
+        telegram_format_hint(Path::new("Bonobo - From You.M4A")).as_deref(),
+        Some("m4a")
+    );
+    assert_eq!(telegram_format_hint(Path::new("unknown")), None);
 }
 
 #[test]

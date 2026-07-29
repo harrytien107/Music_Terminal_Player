@@ -29,7 +29,9 @@ Windows Terminal owns its shared top-level window, so `--borderless` does not al
 - `p` / `Space`: play or pause
 - `Up` / `Down`: volume up or down 10%
 - `+` / `-`: volume up or down 10%
-- `Right` / `Left`: volume up or down 1%
+- `Right` / `Left`: volume up or down 1% during local/Telegram playback; seek forward/backward 10 seconds during YouTube playback
+- `,` / `.`: decrease or increase YouTube speed by 0.25x from 0.5x through 2.0x
+- `s`: toggle YouTube SponsorBlock skipping for the current queue session
 - `n`: next track
 - `v`: previous track
 - `r`: toggle shuffle
@@ -126,7 +128,7 @@ On first use, choose one setup option:
 - `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable and automatically saves both executable locations in `.music-terminal/youtube-tools.txt`. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
 - `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH`.
 
-Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`.
+Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`. `YouTube tools and updater` displays installed versions. Its manual stable-channel updater is enabled only for the player-managed `tools/yt-dlp.exe` beside the application. External paths and `PATH` commands remain usable but are never updated by the player. No background update checks or startup notices run.
 
 Start YouTube playback from the launcher or CLI:
 
@@ -134,7 +136,11 @@ Start YouTube playback from the launcher or CLI:
 cargo run -- youtube
 ```
 
-Paste one video URL, multiple space-separated URLs, or a playlist URL. yt-dlp expands metadata and resolves a fresh audio URL before each track. FFmpeg pipes decoded 48 kHz stereo PCM directly to the player. No complete YouTube media file or YouTube cache is created.
+Paste one video URL, multiple space-separated URLs, or a playlist URL. yt-dlp expands metadata and resolves one signed stream URL before each track. The player prefers progressive MP4 because FFmpeg can seek it reliably, then falls back to the best available audio stream. FFmpeg pipes decoded 48 kHz stereo PCM directly to the player. No complete YouTube media file or YouTube cache is created.
+
+Use `Left` / `Right` to seek backward or forward 10 seconds. Use `,` / `.` to change speed by 0.25x from 0.5x through 2.0x. Both operations reuse the current signed URL and restart FFmpeg at the logical playback position while retaining volume and pause state.
+
+SponsorBlock is enabled by default for each YouTube queue session and skips only `sponsor` segments. Press `s` to toggle it. Sponsor timestamps are cached per queue track. Missing, unavailable, or malformed SponsorBlock metadata is ignored and playback continues normally.
 
 Press `a` during playback or in the YouTube queue to add another URL or playlist to `Next in queue`. Current audio continues while metadata resolves.
 
