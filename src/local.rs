@@ -9,8 +9,10 @@ use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{Decoder, OutputStream, Sink, Source};
 
+use crate::audio_output::{AudioOutput, device_unavailable_error};
+use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration, insert_queue_next,
     is_supported_audio_path, load_volume, manage_queue, playback_controls, progress_bar,
@@ -53,8 +55,8 @@ fn play_tracks_inner(
         cursor::MoveTo(0, 0)
     )?;
 
-    let stream = OutputStreamBuilder::open_default_stream()
-        .context("failed to open default audio output")?;
+    let output = AudioOutput::open()?;
+    let media_controls = MediaControls::new();
     let mut available_tracks = tracks.clone();
     let mut original_tracks = tracks.clone();
     if initially_shuffled {
@@ -67,9 +69,61 @@ fn play_tracks_inner(
     let mut loop_mode = LoopMode::Off;
     let mut duration;
     let mut sink;
-    (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+    (sink, duration) = start_track(
+        output.stream(),
+        &media_controls,
+        &tracks[index],
+        volume,
+        false,
+    )?;
 
     loop {
+        if output.is_lost() {
+            sink.stop();
+            return Err(device_unavailable_error());
+        }
+
+        if let Some(command) = media_controls.command() {
+            match command {
+                MediaCommand::Play => {
+                    sink.play();
+                    media_controls.set_playing(true);
+                }
+                MediaCommand::Pause => {
+                    sink.pause();
+                    media_controls.set_playing(false);
+                }
+                MediaCommand::Next => {
+                    if play_next > 0 {
+                        play_next -= 1;
+                    }
+                    index = (index + 1) % tracks.len();
+                    (sink, duration) = start_track(
+                        output.stream(),
+                        &media_controls,
+                        &tracks[index],
+                        volume,
+                        false,
+                    )?;
+                }
+                MediaCommand::Previous => {
+                    index = if index == 0 {
+                        tracks.len() - 1
+                    } else {
+                        index - 1
+                    };
+                    (sink, duration) = start_track(
+                        output.stream(),
+                        &media_controls,
+                        &tracks[index],
+                        volume,
+                        false,
+                    )?;
+                }
+            }
+            continue;
+        }
+
         draw_player(
             &mut stdout,
             title,
@@ -93,7 +147,13 @@ fn play_tracks_inner(
                 LoopMode::Off if index + 1 < tracks.len() => index += 1,
                 LoopMode::Off => return Ok(PlayerExit::Back),
             }
-            (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+            (sink, duration) = start_track(
+                output.stream(),
+                &media_controls,
+                &tracks[index],
+                volume,
+                false,
+            )?;
             continue;
         }
 
@@ -117,8 +177,10 @@ fn play_tracks_inner(
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if sink.is_paused() {
                     sink.play();
+                    media_controls.set_playing(true);
                 } else {
                     sink.pause();
+                    media_controls.set_playing(false);
                 }
             }
             KeyCode::Char('n') => {
@@ -126,7 +188,13 @@ fn play_tracks_inner(
                     play_next -= 1;
                 }
                 index = (index + 1) % tracks.len();
-                (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                (sink, duration) = start_track(
+                    output.stream(),
+                    &media_controls,
+                    &tracks[index],
+                    volume,
+                    false,
+                )?;
             }
             KeyCode::Char('v') => {
                 index = if index == 0 {
@@ -134,7 +202,13 @@ fn play_tracks_inner(
                 } else {
                     index - 1
                 };
-                (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                (sink, duration) = start_track(
+                    output.stream(),
+                    &media_controls,
+                    &tracks[index],
+                    volume,
+                    false,
+                )?;
             }
             KeyCode::Left => {
                 volume = (volume - 0.01).max(0.0);
@@ -206,10 +280,22 @@ fn play_tracks_inner(
                         LoopMode::Off if index + 1 < tracks.len() => index += 1,
                         LoopMode::Off => return Ok(PlayerExit::Back),
                     }
-                    (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                    (sink, duration) = start_track(
+                        output.stream(),
+                        &media_controls,
+                        &tracks[index],
+                        volume,
+                        false,
+                    )?;
                 } else if edit.restart {
                     play_next = 0;
-                    (sink, duration) = start_track(&stream, &tracks[index], volume, false)?;
+                    (sink, duration) = start_track(
+                        output.stream(),
+                        &media_controls,
+                        &tracks[index],
+                        volume,
+                        false,
+                    )?;
                 }
                 if edit.changed {
                     shuffle = false;
@@ -232,6 +318,7 @@ fn play_tracks_inner(
 
 fn start_track(
     stream: &OutputStream,
+    media_controls: &MediaControls,
     path: &Path,
     volume: f32,
     paused: bool,
@@ -242,6 +329,14 @@ fn start_track(
     let duration = decoder.total_duration();
     let sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
+    let title = path.file_stem().unwrap_or_default().to_string_lossy();
+    let artist = path
+        .parent()
+        .and_then(Path::file_name)
+        .unwrap_or_default()
+        .to_string_lossy();
+    media_controls.set_track(&title, &artist);
+    media_controls.set_playing(!paused);
     sink.append(decoder);
     if paused {
         sink.pause();

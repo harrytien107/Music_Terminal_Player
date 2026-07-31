@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use tokio::runtime;
 
 mod app;
+mod audio_output;
 mod local;
+mod media_controls;
 mod telegram;
 #[cfg(test)]
 mod tests;

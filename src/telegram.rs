@@ -15,7 +15,7 @@ use grammers_client::{Client, SignInError};
 use grammers_mtsender::{InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{Decoder, OutputStream, Sink, Source};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
@@ -29,6 +29,8 @@ use symphonia::core::units;
 use symphonia_adapter_libopus::OpusDecoder;
 use tokio::task::JoinHandle;
 
+use crate::audio_output::{AudioOutput, device_unavailable_error};
+use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel, format_duration,
     format_elapsed, is_supported_audio_path, load_volume, manage_queue, normalize_channel,
@@ -738,14 +740,55 @@ async fn play_telegram_tracks(
         shuffle_slice(&mut tracks);
         index = 0;
     }
-    let stream = OutputStreamBuilder::open_default_stream()
-        .context("failed to open default audio output")?;
+    let output = AudioOutput::open()?;
+    let media_controls = MediaControls::new();
     let mut volume = load_volume();
     let mut play_next = 0usize;
     let mut loop_mode = LoopMode::Off;
-    let mut active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+    let mut active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+    update_telegram_media(&media_controls, &tracks[index], &active);
 
     loop {
+        if output.is_lost() {
+            active.stop().await;
+            delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
+            return Err(device_unavailable_error());
+        }
+
+        if let Some(command) = media_controls.command() {
+            match command {
+                MediaCommand::Play => {
+                    active.sink.play();
+                    media_controls.set_playing(true);
+                }
+                MediaCommand::Pause => {
+                    active.sink.pause();
+                    media_controls.set_playing(false);
+                }
+                MediaCommand::Next | MediaCommand::Previous => {
+                    let old_cache = active.cache_path.clone();
+                    active.stop().await;
+                    delete_cache_file(&old_cache)?;
+                    if command == MediaCommand::Next {
+                        if play_next > 0 {
+                            play_next -= 1;
+                        }
+                        index = (index + 1) % tracks.len();
+                    } else {
+                        index = if index == 0 {
+                            tracks.len() - 1
+                        } else {
+                            index - 1
+                        };
+                    }
+                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
+                        .await?;
+                    update_telegram_media(&media_controls, &tracks[index], &active);
+                }
+            }
+            continue;
+        }
+
         draw_telegram_player(
             &mut stdout,
             &tracks,
@@ -775,7 +818,8 @@ async fn play_telegram_tracks(
                     return Ok(PlayerExit::Back);
                 }
             }
-            active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+            active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+            update_telegram_media(&media_controls, &tracks[index], &active);
             continue;
         }
         if !event::poll(Duration::from_millis(200))? {
@@ -807,8 +851,10 @@ async fn play_telegram_tracks(
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if active.sink.is_paused() {
                     active.sink.play();
+                    media_controls.set_playing(true);
                 } else {
                     active.sink.pause();
+                    media_controls.set_playing(false);
                 }
             }
             KeyCode::Char('n') => {
@@ -819,7 +865,9 @@ async fn play_telegram_tracks(
                     play_next -= 1;
                 }
                 index = (index + 1) % tracks.len();
-                active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+                active =
+                    start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+                update_telegram_media(&media_controls, &tracks[index], &active);
             }
             KeyCode::Char('v') => {
                 let old_cache = active.cache_path.clone();
@@ -830,7 +878,9 @@ async fn play_telegram_tracks(
                 } else {
                     index - 1
                 };
-                active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+                active =
+                    start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+                update_telegram_media(&media_controls, &tracks[index], &active);
             }
             KeyCode::Left => {
                 volume = (volume - 0.01).max(0.0);
@@ -897,13 +947,17 @@ async fn play_telegram_tracks(
                             return Ok(PlayerExit::Back);
                         }
                     }
-                    active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
+                        .await?;
+                    update_telegram_media(&media_controls, &tracks[index], &active);
                 } else if edit.restart {
                     play_next = 0;
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
                     delete_cache_file(&old_cache)?;
-                    active = start_catalog_track(&client, &stream, &tracks[index], volume).await?;
+                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
+                        .await?;
+                    update_telegram_media(&media_controls, &tracks[index], &active);
                 }
                 if edit.changed {
                     shuffle = false;
@@ -922,6 +976,15 @@ async fn play_telegram_tracks(
             _ => {}
         }
     }
+}
+
+fn update_telegram_media(
+    media_controls: &MediaControls,
+    track: &TelegramCatalogEntry,
+    active: &ActiveTelegramTrack,
+) {
+    media_controls.set_track(&track.name, &track.channel);
+    media_controls.set_playing(!active.sink.is_paused());
 }
 
 fn delete_cache_file(path: &Path) -> Result<()> {

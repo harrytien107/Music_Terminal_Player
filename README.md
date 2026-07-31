@@ -14,7 +14,9 @@ A small terminal player for local libraries and online sources without the overh
 - Telegram public- and private-channel synchronization, streaming, and offline download
 - Combined multi-channel Telegram queues
 - YouTube video and playlist audio streaming without saving complete media files
-- YouTube seeking, 0.5x–2.0x speed control, and default-on sponsor skipping through SponsorBlock
+- YouTube seeking, 0.5x–2.0x speed control, and persistent per-category SponsorBlock auto-skip settings
+- Windows media controls with track metadata and Play, Pause, Next, and Previous actions
+- Automatic YouTube recovery when the default audio output changes
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
 - Unicode-aware terminal panels and queue columns
 - Portable or existing yt-dlp and FFmpeg setup with manual stable portable yt-dlp updates
@@ -38,12 +40,14 @@ See the [usage guide](docs/usage.md) for setup and command details.
 - `Up` / `Down` or `+` / `-`: volume up or down 10%
 - `Right` / `Left`: volume up or down 1% for local/Telegram; seek forward/backward 10 seconds for YouTube
 - `,` / `.`: decrease or increase YouTube speed by 0.25x (0.5x–2.0x)
-- `s`: toggle YouTube SponsorBlock skipping for the current queue session
+- `s`: toggle all configured YouTube SponsorBlock categories for the current queue session
 - `r`: toggle shuffle
 - `l`: cycle loop mode
 - `u`: open the queue
 - `b`: return to the launcher
 - `q` / `Ctrl+C`: quit
+
+Windows System Media Transport Controls publish the current title, source, and play state. Play, Pause, Next, and Previous work from supported keyboards and Windows media surfaces. If an output device disconnects, YouTube waits for the current default device and resumes near its previous position. Local and Telegram playback stop with a device-unavailable message; Telegram also cancels the active download and clears its temporary cache.
 
 ## Supported extensions
 

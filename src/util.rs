@@ -185,11 +185,19 @@ pub(crate) fn prompt(message: &str) -> Result<String> {
 }
 
 pub(crate) fn select_menu(title: &str, items: &[String]) -> Result<Option<usize>> {
+    select_menu_from(title, items, 0)
+}
+
+pub(crate) fn select_menu_from(
+    title: &str,
+    items: &[String],
+    initial_selection: usize,
+) -> Result<Option<usize>> {
     if items.is_empty() {
         return Ok(None);
     }
     let _raw = RawMode::new()?;
-    let mut selected = 0usize;
+    let mut selected = initial_selection.min(items.len() - 1);
     let mut stdout = io::stdout();
     loop {
         let mut frame = format!("{title}\r\n\r\n");

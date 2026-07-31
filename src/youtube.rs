@@ -11,27 +11,68 @@ use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
-use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, Sink, Source};
 use serde_json::Value;
 
+use crate::audio_output::AudioOutput;
+use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_panel, format_duration,
     insert_queue_next, load_volume, manage_queue_with_adder, playback_controls, progress_bar,
-    prompt, save_volume, select_menu, shuffle_slice,
+    prompt, save_volume, select_menu, select_menu_from, shuffle_slice,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
+const SPONSORBLOCK_SETTINGS_FILE: &str = ".music-terminal/youtube-sponsorblock.txt";
 const AUDIO_CHANNELS: u16 = 2;
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const SEEK_STEP: Duration = Duration::from_secs(10);
 const MIN_PLAYBACK_RATE: f32 = 0.5;
 const MAX_PLAYBACK_RATE: f32 = 2.0;
 const PLAYBACK_RATE_STEP: f32 = 0.25;
-const SPONSOR_CHAPTER_TITLE: &str = "__MTP_SPONSOR__";
+const SPONSORBLOCK_API: &str = "https://sponsor.ajay.app/api/skipSegments";
+const SPONSORBLOCK_CATEGORIES: [SponsorBlockCategory; 6] = [
+    SponsorBlockCategory::new("sponsor", "Sponsor", true),
+    SponsorBlockCategory::new("music_offtopic", "Non-music section", true),
+    SponsorBlockCategory::new("interaction", "Interaction Reminder", false),
+    SponsorBlockCategory::new("intro", "Intermission/Intro Animation", false),
+    SponsorBlockCategory::new("outro", "Endcards/Credits (Outro)", false),
+    SponsorBlockCategory::new("preview", "Preview/Recap", false),
+];
 const YT_DLP_DOWNLOAD_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const FFMPEG_DOWNLOAD_URL: &str =
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SponsorBlockCategory {
+    id: &'static str,
+    label: &'static str,
+    default_enabled: bool,
+}
+
+impl SponsorBlockCategory {
+    const fn new(id: &'static str, label: &'static str, default_enabled: bool) -> Self {
+        Self {
+            id,
+            label,
+            default_enabled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SponsorBlockSettings {
+    enabled: [bool; SPONSORBLOCK_CATEGORIES.len()],
+}
+
+impl Default for SponsorBlockSettings {
+    fn default() -> Self {
+        Self {
+            enabled: SPONSORBLOCK_CATEGORIES.map(|category| category.default_enabled),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SponsorSegment {
@@ -41,6 +82,7 @@ struct SponsorSegment {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct YouTubeTrack {
+    video_id: String,
     title: String,
     webpage_url: String,
     duration: Option<Duration>,
@@ -170,6 +212,7 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
     loop {
         let items = vec![
             "▶  Play YouTube URL or playlist".to_string(),
+            "✓  SponsorBlock categories".to_string(),
             "⚙  YouTube tools and updater".to_string(),
             "←  Back".to_string(),
         ];
@@ -180,13 +223,102 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
                 if tracks.is_empty() {
                     continue;
                 }
-                if play_youtube_tracks(tracks, &tools)? == PlayerExit::Quit {
+                let sponsor_settings = load_sponsorblock_settings();
+                if play_youtube_tracks(tracks, &tools, &sponsor_settings)? == PlayerExit::Quit {
                     return Ok(PlayerExit::Quit);
                 }
             }
-            Some(1) => manage_youtube_tools()?,
-            Some(2) | None => return Ok(PlayerExit::Back),
+            Some(1) => manage_sponsorblock_categories()?,
+            Some(2) => manage_youtube_tools()?,
+            Some(3) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
+        }
+    }
+}
+
+fn parse_sponsorblock_settings(text: &str) -> SponsorBlockSettings {
+    let mut settings = SponsorBlockSettings::default();
+    for line in text.lines() {
+        let Some((id, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let Some(index) = SPONSORBLOCK_CATEGORIES
+            .iter()
+            .position(|category| category.id == id.trim())
+        else {
+            continue;
+        };
+        match value.trim() {
+            "auto_skip" => settings.enabled[index] = true,
+            "no_skip" => settings.enabled[index] = false,
+            _ => {}
+        }
+    }
+    settings
+}
+
+fn serialize_sponsorblock_settings(settings: &SponsorBlockSettings) -> String {
+    SPONSORBLOCK_CATEGORIES
+        .iter()
+        .zip(settings.enabled)
+        .map(|(category, enabled)| {
+            format!(
+                "{}={}\n",
+                category.id,
+                if enabled { "auto_skip" } else { "no_skip" }
+            )
+        })
+        .collect()
+}
+
+fn sponsorblock_categories_json(settings: &SponsorBlockSettings) -> String {
+    let enabled: Vec<_> = SPONSORBLOCK_CATEGORIES
+        .iter()
+        .zip(settings.enabled)
+        .filter_map(|(category, enabled)| enabled.then_some(category.id))
+        .collect();
+    serde_json::to_string(&enabled).expect("static SponsorBlock categories serialize")
+}
+
+fn load_sponsorblock_settings() -> SponsorBlockSettings {
+    fs::read_to_string(SPONSORBLOCK_SETTINGS_FILE)
+        .map(|text| parse_sponsorblock_settings(&text))
+        .unwrap_or_default()
+}
+
+fn save_sponsorblock_settings(settings: &SponsorBlockSettings) -> Result<()> {
+    fs::create_dir_all(DATA_DIR)?;
+    fs::write(
+        SPONSORBLOCK_SETTINGS_FILE,
+        serialize_sponsorblock_settings(settings),
+    )?;
+    Ok(())
+}
+
+fn manage_sponsorblock_categories() -> Result<()> {
+    let mut settings = load_sponsorblock_settings();
+    let mut selected = 0;
+    loop {
+        let mut items: Vec<_> = SPONSORBLOCK_CATEGORIES
+            .iter()
+            .zip(settings.enabled)
+            .map(|(category, enabled)| {
+                format!(
+                    "{:<9}  {}",
+                    if enabled { "Auto skip" } else { "No skip" },
+                    category.label
+                )
+            })
+            .collect();
+        items.push("←  Back".to_string());
+
+        match select_menu_from("SponsorBlock categories", &items, selected)? {
+            Some(index) if index < SPONSORBLOCK_CATEGORIES.len() => {
+                settings.enabled[index] = !settings.enabled[index];
+                save_sponsorblock_settings(&settings)?;
+                selected = index;
+            }
+            Some(_) | None => return Ok(()),
         }
     }
 }
@@ -370,6 +502,35 @@ fn is_portable_yt_dlp(yt_dlp: &str, executable: &Path) -> bool {
     })
 }
 
+fn portable_yt_dlp_update_paths(yt_dlp: &Path) -> (PathBuf, PathBuf) {
+    (
+        yt_dlp.with_extension("exe.download"),
+        yt_dlp.with_extension("exe.backup"),
+    )
+}
+
+fn update_portable_yt_dlp(yt_dlp: &Path) -> Result<()> {
+    let (download, backup) = portable_yt_dlp_update_paths(yt_dlp);
+    let _ = fs::remove_file(&download);
+    let _ = fs::remove_file(&backup);
+    download_file(YT_DLP_DOWNLOAD_URL, &download)?;
+
+    let downloaded = download.to_string_lossy();
+    if let Err(error) = validate_tool(downloaded.as_ref(), "--version") {
+        let _ = fs::remove_file(&download);
+        return Err(error).context("downloaded yt-dlp failed validation");
+    }
+
+    fs::rename(yt_dlp, &backup).context("failed to back up portable yt-dlp")?;
+    if let Err(error) = fs::rename(&download, yt_dlp) {
+        let _ = fs::rename(&backup, yt_dlp);
+        let _ = fs::remove_file(&download);
+        return Err(error).context("failed to install portable yt-dlp update");
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
 fn manage_youtube_tools() -> Result<()> {
     let tools = load_or_prompt_tools()?;
     loop {
@@ -393,14 +554,9 @@ fn manage_youtube_tools() -> Result<()> {
         match select_menu(&title, &items)? {
             Some(0) if portable => {
                 clear_screen()?;
-                println!("Updating portable yt-dlp on the stable channel...");
-                let status = Command::new(&tools.yt_dlp)
-                    .args(["--update-to", "stable"])
-                    .status()
-                    .context("failed to start the yt-dlp updater")?;
-                if !status.success() {
-                    bail!("yt-dlp stable update failed");
-                }
+                println!("Downloading the latest stable portable yt-dlp...");
+                update_portable_yt_dlp(Path::new(&tools.yt_dlp))?;
+                println!("yt-dlp updated successfully.");
                 prompt("Press Enter to go back...")?;
             }
             Some(0) => {
@@ -490,7 +646,7 @@ fn resolve_tracks(tools: &YouTubeTools, urls: &[String]) -> Result<Vec<YouTubeTr
             "--yes-playlist",
             "--flat-playlist",
             "--print",
-            "%(webpage_url)s\t%(title)S\t%(duration)s",
+            "%(id)s\t%(webpage_url)s\t%(title)S\t%(duration)s",
         ])
         .args(urls)
         .stdin(Stdio::null())
@@ -511,7 +667,8 @@ fn resolve_tracks(tools: &YouTubeTools, urls: &[String]) -> Result<Vec<YouTubeTr
 }
 
 fn parse_youtube_track_line(line: &str) -> Option<YouTubeTrack> {
-    let mut fields = line.splitn(3, '\t');
+    let mut fields = line.splitn(4, '\t');
+    let video_id = fields.next()?.trim();
     let webpage_url = fields.next()?.trim();
     let title = fields.next()?.trim();
     let duration = fields
@@ -524,10 +681,11 @@ fn parse_youtube_track_line(line: &str) -> Option<YouTubeTrack> {
                 .is_finite()
                 .then(|| Duration::from_secs_f64(seconds.max(0.0)))
         });
-    if webpage_url.is_empty() || title.is_empty() {
+    if video_id.is_empty() || webpage_url.is_empty() || title.is_empty() {
         return None;
     }
     Some(YouTubeTrack {
+        video_id: video_id.to_string(),
         title: title.to_string(),
         webpage_url: webpage_url.to_string(),
         duration,
@@ -705,17 +863,15 @@ fn restart_playback(
 }
 
 fn parse_sponsor_segments(text: &str) -> Vec<SponsorSegment> {
-    let Ok(Value::Array(chapters)) = serde_json::from_str::<Value>(text.trim()) else {
+    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(text.trim()) else {
         return Vec::new();
     };
-    let mut segments: Vec<_> = chapters
+    let mut segments: Vec<_> = entries
         .into_iter()
-        .filter(|chapter| {
-            chapter.get("title").and_then(Value::as_str) == Some(SPONSOR_CHAPTER_TITLE)
-        })
-        .filter_map(|chapter| {
-            let start = chapter.get("start_time")?.as_f64()?;
-            let end = chapter.get("end_time")?.as_f64()?;
+        .filter_map(|entry| {
+            let segment = entry.get("segment")?.as_array()?;
+            let start = segment.first()?.as_f64()?;
+            let end = segment.get(1)?.as_f64()?;
             (start.is_finite() && end.is_finite() && start >= 0.0 && end > start).then(|| {
                 SponsorSegment {
                     start: Duration::from_secs_f64(start),
@@ -730,22 +886,24 @@ fn parse_sponsor_segments(text: &str) -> Vec<SponsorSegment> {
 }
 
 fn resolve_sponsor_segments(
-    tools: &YouTubeTools,
     track: &YouTubeTrack,
+    categories_json: &str,
 ) -> Result<Vec<SponsorSegment>> {
-    let output = Command::new(&tools.yt_dlp)
+    if categories_json == "[]" {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("curl.exe")
         .args([
-            "--no-warnings",
-            "--no-playlist",
-            "--skip-download",
-            "--sponsorblock-mark",
-            "sponsor",
-            "--sponsorblock-chapter-title",
-            SPONSOR_CHAPTER_TITLE,
-            "--print",
-            "%(chapters)j",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--get",
+            SPONSORBLOCK_API,
+            "--data-urlencode",
+            &format!("videoID={}", track.video_id),
+            "--data-urlencode",
+            &format!("categories={categories_json}"),
         ])
-        .arg(&track.webpage_url)
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("failed to query SponsorBlock for {}", track.title))?;
@@ -770,13 +928,18 @@ fn sponsor_skip_target(
         .cloned()
 }
 
-fn cache_sponsor_segments(tools: &YouTubeTools, track: &mut YouTubeTrack) {
+fn cache_sponsor_segments(track: &mut YouTubeTrack, categories_json: &str) {
     if track.sponsor_segments.is_none() {
-        track.sponsor_segments = Some(resolve_sponsor_segments(tools, track).unwrap_or_default());
+        track.sponsor_segments =
+            Some(resolve_sponsor_segments(track, categories_json).unwrap_or_default());
     }
 }
 
-fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> Result<PlayerExit> {
+fn play_youtube_tracks(
+    mut tracks: Vec<YouTubeTrack>,
+    tools: &YouTubeTools,
+    sponsor_settings: &SponsorBlockSettings,
+) -> Result<PlayerExit> {
     let mut raw = Some(RawMode::new()?);
     let mut stdout = io::stdout();
     execute!(
@@ -785,8 +948,8 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
         cursor::MoveTo(0, 0)
     )?;
 
-    let stream = OutputStreamBuilder::open_default_stream()
-        .context("failed to open default audio output")?;
+    let mut output = AudioOutput::open()?;
+    let media_controls = MediaControls::new();
     let mut original_tracks = tracks.clone();
     let mut index = 0usize;
     let mut play_next = 0usize;
@@ -794,12 +957,163 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
     let mut shuffle = false;
     let mut loop_mode = LoopMode::Off;
     let mut rate = 1.0;
-    let mut sponsor_enabled = true;
+    let categories_json = sponsorblock_categories_json(sponsor_settings);
+    let mut sponsor_enabled = categories_json != "[]";
     let mut last_skipped = None;
-    cache_sponsor_segments(tools, &mut tracks[index]);
-    let mut playback = start_track(&stream, tools, &tracks[index], volume, rate)?;
+    cache_sponsor_segments(&mut tracks[index], &categories_json);
+    let mut playback = start_track(output.stream(), tools, &tracks[index], volume, rate)?;
+    media_controls.set_track(&tracks[index].title, "YouTube");
+    media_controls.set_playing(true);
 
     loop {
+        if output.is_lost() {
+            let mut offset = playback.elapsed(tracks[index].duration);
+            let mut paused = playback.is_paused();
+            let mut changed_track = false;
+            playback.stop();
+            media_controls.set_playing(false);
+            loop {
+                if let Ok(replacement) = AudioOutput::open() {
+                    output = replacement;
+                    playback = if changed_track {
+                        let replacement =
+                            start_track(output.stream(), tools, &tracks[index], volume, rate)?;
+                        if paused {
+                            replacement.pause();
+                        }
+                        replacement
+                    } else {
+                        playback_from_url(
+                            output.stream(),
+                            tools,
+                            playback.media_url.clone(),
+                            volume,
+                            offset,
+                            rate,
+                            paused,
+                        )?
+                    };
+                    media_controls.set_track(&tracks[index].title, "YouTube");
+                    media_controls.set_playing(!paused);
+                    break;
+                }
+
+                if let Some(command) = media_controls.command() {
+                    match command {
+                        MediaCommand::Play => paused = false,
+                        MediaCommand::Pause => paused = true,
+                        MediaCommand::Next => {
+                            index = (index + 1) % tracks.len();
+                            changed_track = true;
+                            cache_sponsor_segments(&mut tracks[index], &categories_json);
+                            offset = Duration::ZERO;
+                            last_skipped = None;
+                            media_controls.set_track(&tracks[index].title, "YouTube");
+                        }
+                        MediaCommand::Previous => {
+                            index = if index == 0 {
+                                tracks.len() - 1
+                            } else {
+                                index - 1
+                            };
+                            changed_track = true;
+                            cache_sponsor_segments(&mut tracks[index], &categories_json);
+                            offset = Duration::ZERO;
+                            last_skipped = None;
+                            media_controls.set_track(&tracks[index].title, "YouTube");
+                        }
+                    }
+                }
+
+                if event::poll(Duration::from_millis(500))? {
+                    let Event::Key(key) = event::read()? else {
+                        continue;
+                    };
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(PlayerExit::Quit),
+                        KeyCode::Char('b') => return Ok(PlayerExit::Back),
+                        KeyCode::Char('p') | KeyCode::Char(' ') => paused = !paused,
+                        KeyCode::Char('n') => {
+                            index = (index + 1) % tracks.len();
+                            changed_track = true;
+                            cache_sponsor_segments(&mut tracks[index], &categories_json);
+                            offset = Duration::ZERO;
+                            last_skipped = None;
+                            media_controls.set_track(&tracks[index].title, "YouTube");
+                        }
+                        KeyCode::Char('v') => {
+                            index = if index == 0 {
+                                tracks.len() - 1
+                            } else {
+                                index - 1
+                            };
+                            changed_track = true;
+                            cache_sponsor_segments(&mut tracks[index], &categories_json);
+                            offset = Duration::ZERO;
+                            last_skipped = None;
+                            media_controls.set_track(&tracks[index].title, "YouTube");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(command) = media_controls.command() {
+            match command {
+                MediaCommand::Play => {
+                    playback.play();
+                    media_controls.set_playing(true);
+                }
+                MediaCommand::Pause => {
+                    playback.pause();
+                    media_controls.set_playing(false);
+                }
+                MediaCommand::Next => {
+                    if play_next > 0 {
+                        play_next -= 1;
+                    }
+                    index = (index + 1) % tracks.len();
+                    cache_sponsor_segments(&mut tracks[index], &categories_json);
+                    last_skipped = None;
+                    replace_track(
+                        &mut playback,
+                        output.stream(),
+                        tools,
+                        &tracks[index],
+                        volume,
+                        rate,
+                    )?;
+                    media_controls.set_track(&tracks[index].title, "YouTube");
+                    media_controls.set_playing(true);
+                }
+                MediaCommand::Previous => {
+                    index = if index == 0 {
+                        tracks.len() - 1
+                    } else {
+                        index - 1
+                    };
+                    cache_sponsor_segments(&mut tracks[index], &categories_json);
+                    last_skipped = None;
+                    replace_track(
+                        &mut playback,
+                        output.stream(),
+                        tools,
+                        &tracks[index],
+                        volume,
+                        rate,
+                    )?;
+                    media_controls.set_track(&tracks[index].title, "YouTube");
+                    media_controls.set_playing(true);
+                }
+            }
+            continue;
+        }
+
         if sponsor_enabled {
             let elapsed = playback.elapsed(tracks[index].duration);
             if let Some(segment) = sponsor_skip_target(
@@ -810,7 +1124,14 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                 elapsed,
                 last_skipped.as_ref(),
             ) {
-                restart_playback(&mut playback, &stream, tools, volume, segment.end, rate)?;
+                restart_playback(
+                    &mut playback,
+                    output.stream(),
+                    tools,
+                    volume,
+                    segment.end,
+                    rate,
+                )?;
                 last_skipped = Some(segment);
                 continue;
             }
@@ -837,9 +1158,18 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                 LoopMode::Off if index + 1 < tracks.len() => index += 1,
                 LoopMode::Off => return Ok(PlayerExit::Back),
             }
-            cache_sponsor_segments(tools, &mut tracks[index]);
+            cache_sponsor_segments(&mut tracks[index], &categories_json);
             last_skipped = None;
-            replace_track(&mut playback, &stream, tools, &tracks[index], volume, rate)?;
+            replace_track(
+                &mut playback,
+                output.stream(),
+                tools,
+                &tracks[index],
+                volume,
+                rate,
+            )?;
+            media_controls.set_track(&tracks[index].title, "YouTube");
+            media_controls.set_playing(true);
             continue;
         }
 
@@ -862,8 +1192,10 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if playback.is_paused() {
                     playback.play();
+                    media_controls.set_playing(true);
                 } else {
                     playback.pause();
+                    media_controls.set_playing(false);
                 }
             }
             KeyCode::Char('n') => {
@@ -871,9 +1203,18 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                     play_next -= 1;
                 }
                 index = (index + 1) % tracks.len();
-                cache_sponsor_segments(tools, &mut tracks[index]);
+                cache_sponsor_segments(&mut tracks[index], &categories_json);
                 last_skipped = None;
-                replace_track(&mut playback, &stream, tools, &tracks[index], volume, rate)?;
+                replace_track(
+                    &mut playback,
+                    output.stream(),
+                    tools,
+                    &tracks[index],
+                    volume,
+                    rate,
+                )?;
+                media_controls.set_track(&tracks[index].title, "YouTube");
+                media_controls.set_playing(true);
             }
             KeyCode::Char('v') => {
                 index = if index == 0 {
@@ -881,9 +1222,18 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                 } else {
                     index - 1
                 };
-                cache_sponsor_segments(tools, &mut tracks[index]);
+                cache_sponsor_segments(&mut tracks[index], &categories_json);
                 last_skipped = None;
-                replace_track(&mut playback, &stream, tools, &tracks[index], volume, rate)?;
+                replace_track(
+                    &mut playback,
+                    output.stream(),
+                    tools,
+                    &tracks[index],
+                    volume,
+                    rate,
+                )?;
+                media_controls.set_track(&tracks[index].title, "YouTube");
+                media_controls.set_playing(true);
             }
             KeyCode::Left | KeyCode::Right => {
                 let target = seek_target(
@@ -892,7 +1242,7 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                     key.code == KeyCode::Right,
                 );
                 last_skipped = None;
-                restart_playback(&mut playback, &stream, tools, volume, target, rate)?;
+                restart_playback(&mut playback, output.stream(), tools, volume, target, rate)?;
             }
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(1.5);
@@ -909,7 +1259,7 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                 if next_rate != rate {
                     let elapsed = playback.elapsed(tracks[index].duration);
                     rate = next_rate;
-                    restart_playback(&mut playback, &stream, tools, volume, elapsed, rate)?;
+                    restart_playback(&mut playback, output.stream(), tools, volume, elapsed, rate)?;
                 }
             }
             KeyCode::Char('s') => sponsor_enabled = !sponsor_enabled,
@@ -967,14 +1317,32 @@ fn play_youtube_tracks(mut tracks: Vec<YouTubeTrack>, tools: &YouTubeTools) -> R
                         LoopMode::Off if index + 1 < tracks.len() => index += 1,
                         LoopMode::Off => return Ok(PlayerExit::Back),
                     }
-                    cache_sponsor_segments(tools, &mut tracks[index]);
+                    cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
-                    replace_track(&mut playback, &stream, tools, &tracks[index], volume, rate)?;
+                    replace_track(
+                        &mut playback,
+                        output.stream(),
+                        tools,
+                        &tracks[index],
+                        volume,
+                        rate,
+                    )?;
+                    media_controls.set_track(&tracks[index].title, "YouTube");
+                    media_controls.set_playing(true);
                 } else if edit.restart {
                     play_next = 0;
-                    cache_sponsor_segments(tools, &mut tracks[index]);
+                    cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
-                    replace_track(&mut playback, &stream, tools, &tracks[index], volume, rate)?;
+                    replace_track(
+                        &mut playback,
+                        output.stream(),
+                        tools,
+                        &tracks[index],
+                        volume,
+                        rate,
+                    )?;
+                    media_controls.set_track(&tracks[index].title, "YouTube");
+                    media_controls.set_playing(true);
                 }
                 if edit.changed {
                     shuffle = false;
@@ -1053,18 +1421,23 @@ mod youtube_tests {
     use std::time::Duration;
 
     use super::{
-        SPONSOR_CHAPTER_TITLE, SponsorSegment, is_portable_yt_dlp, logical_elapsed,
-        parse_sponsor_segments, parse_youtube_track_line, seek_target, sponsor_skip_target,
+        SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment, is_portable_yt_dlp,
+        logical_elapsed, parse_sponsor_segments, parse_sponsorblock_settings,
+        parse_youtube_track_line, portable_yt_dlp_update_paths, seek_target,
+        serialize_sponsorblock_settings, sponsor_skip_target, sponsorblock_categories_json,
         stepped_rate, youtube_playback_controls, youtube_stream_format,
     };
 
     #[test]
     fn metadata_line_parses_duration_and_missing_duration() {
-        let track = parse_youtube_track_line("https://youtu.be/abc\tExample title\t123.5").unwrap();
+        let track =
+            parse_youtube_track_line("abc\thttps://youtu.be/abc\tExample title\t123.5").unwrap();
+        assert_eq!(track.video_id, "abc");
         assert_eq!(track.title, "Example title");
         assert_eq!(track.duration.unwrap().as_secs_f64(), 123.5);
 
-        let live = parse_youtube_track_line("https://youtu.be/live\tLive stream\tNA").unwrap();
+        let live =
+            parse_youtube_track_line("live\thttps://youtu.be/live\tLive stream\tNA").unwrap();
         assert_eq!(live.duration, None);
     }
 
@@ -1098,11 +1471,51 @@ mod youtube_tests {
     }
 
     #[test]
-    fn sponsor_segments_parse_and_do_not_repeat() {
-        let json = format!(
-            r#"[{{"title":"ignored","start_time":1,"end_time":2}},{{"title":"{SPONSOR_CHAPTER_TITLE}","start_time":10.5,"end_time":20}}]"#
+    fn sponsorblock_defaults_preserve_existing_categories() {
+        let settings = SponsorBlockSettings::default();
+        assert_eq!(
+            SPONSORBLOCK_CATEGORIES.map(|category| category.id),
+            [
+                "sponsor",
+                "music_offtopic",
+                "interaction",
+                "intro",
+                "outro",
+                "preview",
+            ]
         );
-        let segments = parse_sponsor_segments(&json);
+        assert_eq!(settings.enabled, [true, true, false, false, false, false]);
+        assert_eq!(
+            sponsorblock_categories_json(&settings),
+            r#"["sponsor","music_offtopic"]"#
+        );
+    }
+
+    #[test]
+    fn sponsorblock_settings_parse_serialize_and_select_categories() {
+        let settings = parse_sponsorblock_settings(
+            "sponsor=no_skip\nmusic_offtopic=auto_skip\ninteraction=auto_skip\nintro=auto_skip\noutro=auto_skip\npreview=auto_skip\nunknown=auto_skip\n",
+        );
+        assert_eq!(settings.enabled, [false, true, true, true, true, true]);
+        assert_eq!(
+            sponsorblock_categories_json(&settings),
+            r#"["music_offtopic","interaction","intro","outro","preview"]"#
+        );
+        assert_eq!(
+            parse_sponsorblock_settings(&serialize_sponsorblock_settings(&settings)),
+            settings
+        );
+
+        let disabled = SponsorBlockSettings {
+            enabled: [false; 6],
+        };
+        assert_eq!(sponsorblock_categories_json(&disabled), "[]");
+    }
+
+    #[test]
+    fn sponsor_segments_parse_and_do_not_repeat() {
+        let json = r#"[{"category":"music_offtopic","segment":[10.5,20]}]"#;
+        let segments = parse_sponsor_segments(json);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].start, Duration::from_secs_f64(10.5));
         assert_eq!(
@@ -1125,6 +1538,11 @@ mod youtube_tests {
         ));
         assert!(!is_portable_yt_dlp("yt-dlp", executable));
         assert!(!is_portable_yt_dlp(r"C:\Other\yt-dlp.exe", executable));
+
+        let (download, backup) =
+            portable_yt_dlp_update_paths(Path::new(r"C:\Player\tools\yt-dlp.exe"));
+        assert_eq!(download, Path::new(r"C:\Player\tools\yt-dlp.exe.download"));
+        assert_eq!(backup, Path::new(r"C:\Player\tools\yt-dlp.exe.backup"));
     }
 
     #[test]

@@ -31,7 +31,7 @@ Windows Terminal owns its shared top-level window, so `--borderless` does not al
 - `+` / `-`: volume up or down 10%
 - `Right` / `Left`: volume up or down 1% during local/Telegram playback; seek forward/backward 10 seconds during YouTube playback
 - `,` / `.`: decrease or increase YouTube speed by 0.25x from 0.5x through 2.0x
-- `s`: toggle YouTube SponsorBlock skipping for the current queue session
+- `s`: toggle all configured YouTube SponsorBlock categories for the current queue session
 - `n`: next track
 - `v`: previous track
 - `r`: toggle shuffle
@@ -41,6 +41,12 @@ Windows Terminal owns its shared top-level window, so `--borderless` does not al
 - `q` / `Ctrl+C`: quit
 
 The queue has `Now playing`, `Next in queue`, and `Next from track list` columns. Use `Up` / `Down` to select, `Enter` to play, `Delete` to remove, `a` to add next, and `Esc` to close. Local and Telegram queues use existing-track search. YouTube prompts for another URL or playlist. Audio continues while the queue is open.
+
+## Windows media controls and output devices
+
+Windows System Media Transport Controls publish the current track title, artist or source, and playing, paused, or stopped status. Play, Pause, Next, and Previous commands from supported keyboards, the Windows volume overlay, and other Windows media surfaces control local, Telegram, and YouTube playback. If Windows does not provide SMTC for the console window, playback continues without system controls. Timeline publication, system seeking, and artwork are not included.
+
+If the active audio output disappears, YouTube stops the old stream, waits for a default output device, and resumes near the previous logical position with its volume, speed, and pause state preserved. Play, Pause, Next, Previous, return, and quit remain available while waiting. Local playback stops and returns to the launcher with a device-unavailable message. Telegram playback also cancels its progressive download and deletes the temporary stream cache before returning the same message.
 
 ## Local playback
 
@@ -128,7 +134,7 @@ On first use, choose one setup option:
 - `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable and automatically saves both executable locations in `.music-terminal/youtube-tools.txt`. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
 - `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH`.
 
-Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`. `YouTube tools and updater` displays installed versions. Its manual stable-channel updater is enabled only for the player-managed `tools/yt-dlp.exe` beside the application. External paths and `PATH` commands remain usable but are never updated by the player. No background update checks or startup notices run.
+Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`. `YouTube tools and updater` displays installed versions. Its manual stable-channel updater downloads and validates GitHub's fixed latest-release asset only for the player-managed `tools/yt-dlp.exe` beside the application. External paths and `PATH` commands remain usable but are never updated by the player. No background update checks or startup notices run.
 
 Start YouTube playback from the launcher or CLI:
 
@@ -140,7 +146,9 @@ Paste one video URL, multiple space-separated URLs, or a playlist URL. yt-dlp ex
 
 Use `Left` / `Right` to seek backward or forward 10 seconds. Use `,` / `.` to change speed by 0.25x from 0.5x through 2.0x. Both operations reuse the current signed URL and restart FFmpeg at the logical playback position while retaining volume and pause state.
 
-SponsorBlock is enabled by default for each YouTube queue session and skips only `sponsor` segments. Press `s` to toggle it. Sponsor timestamps are cached per queue track. Missing, unavailable, or malformed SponsorBlock metadata is ignored and playback continues normally.
+Open `SponsorBlock categories` in the YouTube audio menu to toggle each category between `Auto skip` and `No skip`. Available categories are Sponsor (`sponsor`), Non-music section (`music_offtopic`), Interaction Reminder (`interaction`), Intermission/Intro Animation (`intro`), Endcards/Credits (Outro) (`outro`), and Preview/Recap (`preview`). Sponsor and Non-music section default to `Auto skip`; new categories default to `No skip`, preserving earlier behavior. Choices persist in `.music-terminal/youtube-sponsorblock.txt`.
+
+Only configured `Auto skip` categories are requested from SponsorBlock. Press `s` during playback to temporarily toggle all configured categories for the current queue session. Timestamps are cached per queue track, and a segment is skipped only when the SponsorBlock community has submitted timestamps for that video. Missing, unavailable, or malformed metadata is ignored and playback continues normally. If every category is `No skip`, no SponsorBlock API request is made.
 
 Press `a` during playback or in the YouTube queue to add another URL or playlist to `Next in queue`. Current audio continues while metadata resolves.
 

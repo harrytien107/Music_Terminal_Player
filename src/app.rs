@@ -90,10 +90,12 @@ pub(crate) fn launch_menu() -> Result<()> {
                 Err(error) => show_menu_error(&error)?,
             },
             Some(2) => {
-                if let Some(path) = choose_local_folder(&mut library)?
-                    && play_path(&path)? == PlayerExit::Quit
-                {
-                    return Ok(());
+                if let Some(path) = choose_local_folder(&mut library)? {
+                    match play_path(&path) {
+                        Ok(PlayerExit::Quit) => return Ok(()),
+                        Ok(PlayerExit::Back) => {}
+                        Err(error) => show_menu_error(&error)?,
+                    }
                 }
             }
             Some(3) => {
@@ -689,8 +691,8 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
         match select_menu("Playlists", &items)? {
             Some(index) if index < playlist_count => {
                 let playlist = playlists[index].clone();
-                let exit = if playlist.is_local() {
-                    play_tracks(playlist.local_tracks)?
+                let result = if playlist.is_local() {
+                    play_tracks(playlist.local_tracks)
                 } else {
                     runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -700,10 +702,12 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
                             playlist.tracks,
                             0,
                             false,
-                        ))?
+                        ))
                 };
-                if exit == PlayerExit::Quit {
-                    return Ok(exit);
+                match result {
+                    Ok(PlayerExit::Quit) => return Ok(PlayerExit::Quit),
+                    Ok(PlayerExit::Back) => {}
+                    Err(error) => show_menu_error(&error)?,
                 }
             }
             Some(index) if index == playlist_count => {

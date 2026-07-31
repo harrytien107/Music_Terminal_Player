@@ -6,6 +6,7 @@ use crate::app::{
     Playlist, collect_library_tracks, parse_playlists, selected_or_highlighted_channel_indexes,
     serialize_playlists,
 };
+use crate::audio_output::{DEVICE_UNAVAILABLE_MESSAGE, device_unavailable_error};
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
@@ -23,6 +24,18 @@ use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
 };
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+
+#[test]
+fn disconnected_audio_output_uses_stable_friendly_error() {
+    assert_eq!(
+        DEVICE_UNAVAILABLE_MESSAGE,
+        "Audio output device disconnected. The requested device is no longer available; it may have been unplugged or disconnected."
+    );
+    assert_eq!(
+        device_unavailable_error().to_string(),
+        DEVICE_UNAVAILABLE_MESSAGE
+    );
+}
 
 #[test]
 fn safe_file_name_removes_windows_forbidden_chars() {
