@@ -41,13 +41,15 @@ See the [usage guide](docs/usage.md) for setup and command details.
 - `Right` / `Left`: volume up or down 1% for local/Telegram; seek forward/backward 10 seconds for YouTube
 - `,` / `.`: decrease or increase YouTube speed by 0.25x (0.5x–2.0x)
 - `s`: toggle all configured YouTube SponsorBlock categories for the current queue session
-- `r`: toggle shuffle
+- `r`: toggle shuffle for unplayed tracks; manually queued tracks keep their order
 - `l`: cycle loop mode
 - `u`: open the queue
-- `b`: return to the launcher
+- `b` / `Esc`: return to the launcher
 - `q` / `Ctrl+C`: quit
 
-Windows System Media Transport Controls publish the current title, source, and play state. Play, Pause, Next, and Previous work from supported keyboards and Windows media surfaces. If an output device disconnects, YouTube waits for the current default device and resumes near its previous position. Local and Telegram playback stop with a device-unavailable message; Telegram also cancels the active download and clears its temporary cache.
+Playback consumes each track-list entry once per pass. Duplicate entries and manually queued copies are separate plays; manual Previous may replay an entry. Loop Off stops after the remaining track list is exhausted, while Loop All starts a new full pass. The queue stays open across automatic track changes. `Delete` unqueues only a selected `Next in queue` item, leaving or returning one copy under `Next from track list`.
+
+Windows System Media Transport Controls publish the current title, source, and play state. Play, Pause, Next, and Previous work from supported keyboards and Windows media surfaces. If an output device disconnects or Windows resumes after sleep or hibernation, YouTube waits for the current default device and automatically resumes near its previous position. Local and Telegram playback stop with a device-unavailable message; Telegram also cancels the active download and clears its temporary cache.
 
 ## Supported extensions
 

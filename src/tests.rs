@@ -10,15 +10,16 @@ use crate::audio_output::{DEVICE_UNAVAILABLE_MESSAGE, device_unavailable_error};
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
-    load_telegram_catalog, normalize_channel_identity, private_channel_identity,
-    private_channel_is_saved, private_invite_hash, save_telegram_catalog, search_catalog,
-    search_private_channels, selectable_private_channel_matches, telegram_channel_label,
-    telegram_format_hint,
+    load_telegram_catalog, normalize_channel_identity, prioritize_catalog_tracks,
+    private_channel_identity, private_channel_is_saved, private_invite_hash, save_telegram_catalog,
+    search_catalog, search_private_channels, selectable_private_channel_matches,
+    telegram_channel_label, telegram_format_hint,
 };
 use crate::util::{
-    LoopMode, fit_text, insert_queue_next, is_supported_audio_path, normalize_channel,
-    parse_volume_settings, playback_controls, progress_bar, queue_window_start, remove_queue_item,
-    safe_file_name, shuffle_slice, toggle_all,
+    LoopMode, fit_text, forward_track_index, insert_queue_next, is_supported_audio_path,
+    next_track_index, normalize_channel, parse_volume_settings, playback_controls,
+    previous_track_index, progress_bar, queue_window_start, restart_pass_order, safe_file_name,
+    set_shuffle_order, shuffle_slice, toggle_all, unqueue_next_item,
 };
 use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
@@ -178,6 +179,24 @@ fn telegram_stream_uses_highlighted_or_sorted_selected_channels() {
 }
 
 #[test]
+fn telegram_single_search_result_plays_first_without_losing_channel_tracks() {
+    let catalog = vec!["one", "two", "echo", "four"];
+    let queue = prioritize_catalog_tracks(&catalog, &[2]);
+
+    assert_eq!(queue, vec!["echo", "one", "two", "four"]);
+    assert_eq!(queue.len(), catalog.len());
+}
+
+#[test]
+fn telegram_multiple_search_results_form_an_ordered_priority_segment() {
+    let catalog = vec!["one", "two", "three", "four", "five"];
+    let queue = prioritize_catalog_tracks(&catalog, &[3, 1]);
+
+    assert_eq!(queue, vec!["two", "four", "one", "three", "five"]);
+    assert_eq!(queue.len(), catalog.len());
+}
+
+#[test]
 fn youtube_input_accepts_videos_playlists_and_multiple_urls() {
     let urls = parse_youtube_urls("https://youtu.be/abc https://www.youtube.com/playlist?list=xyz")
         .unwrap();
@@ -328,17 +347,48 @@ fn toggle_all_selects_then_deselects_only_matches() {
     toggle_all(&mut selected, [1, 2]);
     assert_eq!(selected, HashSet::from([9]));
 }
+#[test]
+fn previous_replays_manually_then_forward_resumes_automatic_progress() {
+    let mut resume = None;
+    let replay = previous_track_index(3, 5, &mut resume);
+    assert_eq!(replay, 2);
+    assert_eq!(resume, Some(3));
+
+    let replay = previous_track_index(replay, 5, &mut resume);
+    assert_eq!(replay, 1);
+    assert_eq!(resume, Some(3));
+
+    assert_eq!(
+        forward_track_index(replay, 5, LoopMode::Off, true, &mut resume),
+        Some((3, false, false))
+    );
+    assert_eq!(resume, None);
+    assert_eq!(
+        forward_track_index(3, 5, LoopMode::Off, true, &mut resume),
+        Some((4, false, true))
+    );
+}
 
 #[test]
-fn removing_queue_items_keeps_current_track_index() {
-    let mut queue = vec!["a", "b", "c", "d"];
-    let current = remove_queue_item(&mut queue, 2, 0);
-    assert_eq!(queue, vec!["b", "c", "d"]);
-    assert_eq!(current, 1);
+fn deleting_next_in_queue_only_removes_the_extra_priority_play() {
+    let mut queue = vec!["played", "current", "later", "later", "final"];
+    let mut play_next = 1;
 
-    let current = remove_queue_item(&mut queue, current, current);
-    assert_eq!(queue, vec!["b", "d"]);
-    assert_eq!(current, 1);
+    unqueue_next_item(&mut queue, 1, &mut play_next, 2);
+
+    assert_eq!(play_next, 0);
+    assert_eq!(queue, vec!["played", "current", "later", "final"]);
+}
+
+#[test]
+fn deleting_a_unique_queued_song_returns_it_to_the_track_list() {
+    let mut queue = vec!["played", "current", "queued", "later"];
+    let mut play_next = 1;
+
+    unqueue_next_item(&mut queue, 1, &mut play_next, 2);
+
+    assert_eq!(play_next, 0);
+    assert_eq!(queue, vec!["played", "current", "later", "queued"]);
 }
 
 #[test]
@@ -357,6 +407,41 @@ fn shuffle_preserves_every_item() {
     shuffle_slice(&mut items);
     items.sort_unstable();
     assert_eq!(items, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn shuffle_changes_only_the_unplayed_track_list_tail() {
+    let original = vec!["played", "current", "later-a", "later-b", "later-c"];
+    let mut queue = vec![
+        "played", "current", "queued-a", "queued-b", "later-a", "later-b", "later-c",
+    ];
+
+    set_shuffle_order(&mut queue, 1, 2, &original, true);
+    assert_eq!(&queue[..4], &["played", "current", "queued-a", "queued-b"]);
+    let mut tail = queue[4..].to_vec();
+    tail.sort_unstable();
+    assert_eq!(tail, vec!["later-a", "later-b", "later-c"]);
+
+    set_shuffle_order(&mut queue, 1, 2, &original, false);
+    assert_eq!(
+        queue,
+        vec![
+            "played", "current", "queued-a", "queued-b", "later-a", "later-b", "later-c"
+        ]
+    );
+}
+
+#[test]
+fn track_pass_stops_without_loop_and_restarts_only_with_loop_all() {
+    assert_eq!(next_track_index(0, 3, LoopMode::Off, true), Some(1));
+    assert_eq!(next_track_index(2, 3, LoopMode::Off, true), None);
+    assert_eq!(next_track_index(2, 3, LoopMode::One, false), None);
+    assert_eq!(next_track_index(2, 3, LoopMode::All, true), Some(0));
+
+    let original = vec!["a", "b", "c"];
+    let mut pass = vec!["c", "a", "b"];
+    restart_pass_order(&mut pass, &original, false);
+    assert_eq!(pass, original);
 }
 
 #[test]

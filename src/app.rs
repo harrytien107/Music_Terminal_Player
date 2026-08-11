@@ -90,7 +90,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                 Err(error) => show_menu_error(&error)?,
             },
             Some(2) => {
-                if let Some(path) = choose_local_folder(&mut library)? {
+                while let Some(path) = choose_local_folder(&mut library)? {
                     match play_path(&path) {
                         Ok(PlayerExit::Quit) => return Ok(()),
                         Ok(PlayerExit::Back) => {}
@@ -99,7 +99,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                 }
             }
             Some(3) => {
-                if let Some((label, catalog)) =
+                while let Some((label, catalog)) =
                     choose_telegram_catalog(&library, "Stream Telegram channel")?
                 {
                     let result = runtime::Builder::new_multi_thread()
@@ -201,7 +201,7 @@ fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
                     runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()?
-                        .block_on(play_catalog_entries("", catalog, 0, true))
+                        .block_on(play_catalog_entries("", catalog, 0, true, 0))
                 });
                 match result {
                     Ok(PlayerExit::Quit) => return Ok(PlayerExit::Quit),
@@ -702,6 +702,7 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
                             playlist.tracks,
                             0,
                             false,
+                            0,
                         ))
                 };
                 match result {

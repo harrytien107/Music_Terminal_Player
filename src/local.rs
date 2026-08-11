@@ -14,9 +14,10 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration, insert_queue_next,
-    is_supported_audio_path, load_volume, manage_queue, playback_controls, progress_bar,
-    save_volume, shuffle_slice, toggle_all,
+    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration, forward_track_index,
+    insert_queue_next, is_supported_audio_path, load_volume, manage_queue, playback_controls,
+    previous_track_index, progress_bar, restart_pass_order, save_volume, set_shuffle_order,
+    shuffle_slice, toggle_all,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -63,6 +64,7 @@ fn play_tracks_inner(
         shuffle_slice(&mut tracks);
     }
     let mut index = 0usize;
+    let mut resume_after_replay = None;
     let mut play_next = 0usize;
     let mut volume = load_volume();
     let mut shuffle = initially_shuffled;
@@ -94,10 +96,22 @@ fn play_tracks_inner(
                     media_controls.set_playing(false);
                 }
                 MediaCommand::Next => {
-                    if play_next > 0 {
+                    let Some((next, new_pass, advance_queue)) = forward_track_index(
+                        index,
+                        tracks.len(),
+                        loop_mode,
+                        false,
+                        &mut resume_after_replay,
+                    ) else {
+                        return Ok(PlayerExit::Back);
+                    };
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                    }
+                    if advance_queue && play_next > 0 {
                         play_next -= 1;
                     }
-                    index = (index + 1) % tracks.len();
+                    index = next;
                     (sink, duration) = start_track(
                         output.stream(),
                         &media_controls,
@@ -107,11 +121,7 @@ fn play_tracks_inner(
                     )?;
                 }
                 MediaCommand::Previous => {
-                    index = if index == 0 {
-                        tracks.len() - 1
-                    } else {
-                        index - 1
-                    };
+                    index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                     (sink, duration) = start_track(
                         output.stream(),
                         &media_controls,
@@ -138,15 +148,22 @@ fn play_tracks_inner(
         )?;
 
         if sink.empty() {
-            if play_next > 0 && loop_mode != LoopMode::One {
+            let Some((next, new_pass, advance_queue)) = forward_track_index(
+                index,
+                tracks.len(),
+                loop_mode,
+                true,
+                &mut resume_after_replay,
+            ) else {
+                return Ok(PlayerExit::Back);
+            };
+            if new_pass {
+                restart_pass_order(&mut tracks, &original_tracks, shuffle);
+            }
+            if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                 play_next -= 1;
             }
-            match loop_mode {
-                LoopMode::One => {}
-                LoopMode::All => index = (index + 1) % tracks.len(),
-                LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                LoopMode::Off => return Ok(PlayerExit::Back),
-            }
+            index = next;
             (sink, duration) = start_track(
                 output.stream(),
                 &media_controls,
@@ -172,8 +189,8 @@ fn play_tracks_inner(
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(PlayerExit::Quit),
-            KeyCode::Char('b') => return Ok(PlayerExit::Back),
+            KeyCode::Char('q') => return Ok(PlayerExit::Quit),
+            KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if sink.is_paused() {
                     sink.play();
@@ -184,10 +201,22 @@ fn play_tracks_inner(
                 }
             }
             KeyCode::Char('n') => {
-                if play_next > 0 {
+                let Some((next, new_pass, advance_queue)) = forward_track_index(
+                    index,
+                    tracks.len(),
+                    loop_mode,
+                    false,
+                    &mut resume_after_replay,
+                ) else {
+                    return Ok(PlayerExit::Back);
+                };
+                if new_pass {
+                    restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                }
+                if advance_queue && play_next > 0 {
                     play_next -= 1;
                 }
-                index = (index + 1) % tracks.len();
+                index = next;
                 (sink, duration) = start_track(
                     output.stream(),
                     &media_controls,
@@ -197,11 +226,7 @@ fn play_tracks_inner(
                 )?;
             }
             KeyCode::Char('v') => {
-                index = if index == 0 {
-                    tracks.len() - 1
-                } else {
-                    index - 1
-                };
+                index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                 (sink, duration) = start_track(
                     output.stream(),
                     &media_controls,
@@ -222,19 +247,9 @@ fn play_tracks_inner(
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
             KeyCode::Char('r') => {
-                let current = tracks[index].clone();
+                resume_after_replay = None;
                 shuffle = !shuffle;
-                tracks = if shuffle {
-                    let mut shuffled = original_tracks.clone();
-                    shuffle_slice(&mut shuffled);
-                    shuffled
-                } else {
-                    original_tracks.clone()
-                };
-                index = tracks
-                    .iter()
-                    .position(|track| track == &current)
-                    .unwrap_or(0);
+                set_shuffle_order(&mut tracks, index, play_next, &original_tracks, shuffle);
             }
             KeyCode::Char('a') if add_tracks.is_some() => {
                 let was_playing = !sink.is_paused();
@@ -254,7 +269,7 @@ fn play_tracks_inner(
                     sink.play();
                 }
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') => loop {
                 let edit = manage_queue(
                     &mut tracks,
                     index,
@@ -271,15 +286,22 @@ fn play_tracks_inner(
                 )?;
                 index = edit.index;
                 if edit.finished {
-                    if play_next > 0 && loop_mode != LoopMode::One {
+                    let Some((next, new_pass, advance_queue)) = forward_track_index(
+                        index,
+                        tracks.len(),
+                        loop_mode,
+                        true,
+                        &mut resume_after_replay,
+                    ) else {
+                        return Ok(PlayerExit::Back);
+                    };
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                    }
+                    if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                         play_next -= 1;
                     }
-                    match loop_mode {
-                        LoopMode::One => {}
-                        LoopMode::All => index = (index + 1) % tracks.len(),
-                        LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                        LoopMode::Off => return Ok(PlayerExit::Back),
-                    }
+                    index = next;
                     (sink, duration) = start_track(
                         output.stream(),
                         &media_controls,
@@ -287,7 +309,10 @@ fn play_tracks_inner(
                         volume,
                         false,
                     )?;
-                } else if edit.restart {
+                    continue;
+                }
+                if edit.restart {
+                    resume_after_replay = None;
                     play_next = 0;
                     (sink, duration) = start_track(
                         output.stream(),
@@ -297,10 +322,8 @@ fn play_tracks_inner(
                         false,
                     )?;
                 }
-                if edit.changed {
-                    shuffle = false;
-                }
-            }
+                break;
+            },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(1.5);
                 sink.set_volume(volume);

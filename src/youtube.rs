@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::cursor;
@@ -18,8 +18,9 @@ use crate::audio_output::AudioOutput;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_panel, format_duration,
-    insert_queue_next, load_volume, manage_queue_with_adder, playback_controls, progress_bar,
-    prompt, save_volume, select_menu, select_menu_from, shuffle_slice,
+    forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
+    playback_controls, previous_track_index, progress_bar, prompt, restart_pass_order, save_volume,
+    select_menu, select_menu_from, set_shuffle_order,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -27,6 +28,8 @@ const SPONSORBLOCK_SETTINGS_FILE: &str = ".music-terminal/youtube-sponsorblock.t
 const AUDIO_CHANNELS: u16 = 2;
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const SEEK_STEP: Duration = Duration::from_secs(10);
+const RESUME_GAP: Duration = Duration::from_secs(5);
+const TRACK_END_TOLERANCE: Duration = Duration::from_secs(5);
 const MIN_PLAYBACK_RATE: f32 = 0.5;
 const MAX_PLAYBACK_RATE: f32 = 2.0;
 const PLAYBACK_RATE_STEP: f32 = 0.25;
@@ -188,6 +191,14 @@ fn logical_elapsed(
 ) -> Duration {
     let elapsed = offset.saturating_add(scaled_duration(sink_elapsed, rate));
     duration.map_or(elapsed, |total| elapsed.min(total))
+}
+
+fn resume_gap_detected(loop_gap: Duration) -> bool {
+    loop_gap >= RESUME_GAP
+}
+
+fn playback_ended_early(elapsed: Duration, duration: Option<Duration>) -> bool {
+    duration.is_some_and(|total| elapsed.saturating_add(TRACK_END_TOLERANCE) < total)
 }
 
 fn seek_target(elapsed: Duration, duration: Option<Duration>, forward: bool) -> Duration {
@@ -952,6 +963,7 @@ fn play_youtube_tracks(
     let media_controls = MediaControls::new();
     let mut original_tracks = tracks.clone();
     let mut index = 0usize;
+    let mut resume_after_replay = None;
     let mut play_next = 0usize;
     let mut volume = load_volume();
     let mut shuffle = false;
@@ -962,40 +974,73 @@ fn play_youtube_tracks(
     let mut last_skipped = None;
     cache_sponsor_segments(&mut tracks[index], &categories_json);
     let mut playback = start_track(output.stream(), tools, &tracks[index], volume, rate)?;
+    let mut resumed_from_suspend = false;
     media_controls.set_track(&tracks[index].title, "YouTube");
     media_controls.set_playing(true);
 
     loop {
-        if output.is_lost() {
-            let mut offset = playback.elapsed(tracks[index].duration);
+        let elapsed = playback.elapsed(tracks[index].duration);
+        let interrupted = output.is_lost()
+            || resumed_from_suspend
+            || (playback.empty() && playback_ended_early(elapsed, tracks[index].duration));
+        resumed_from_suspend = false;
+        if interrupted {
+            let mut offset = elapsed;
             let mut paused = playback.is_paused();
             let mut changed_track = false;
             playback.stop();
             media_controls.set_playing(false);
+            draw_panel(
+                &mut stdout,
+                "Music Terminal Player · YouTube",
+                &[
+                    format!(
+                        "Track {}/{} | {}",
+                        index + 1,
+                        tracks.len(),
+                        tracks[index].title
+                    ),
+                    String::new(),
+                    "Playback interrupted. Reconnecting audio output...".to_string(),
+                    "[p/Space] pause state · [n/v] track · [b] back · [q] quit".to_string(),
+                ],
+            )?;
             loop {
-                if let Ok(replacement) = AudioOutput::open() {
-                    output = replacement;
-                    playback = if changed_track {
-                        let replacement =
-                            start_track(output.stream(), tools, &tracks[index], volume, rate)?;
-                        if paused {
-                            replacement.pause();
-                        }
-                        replacement
-                    } else {
-                        playback_from_url(
-                            output.stream(),
+                if let Ok(replacement_output) = AudioOutput::open() {
+                    let replacement_playback = if changed_track {
+                        start_track(
+                            replacement_output.stream(),
                             tools,
-                            playback.media_url.clone(),
+                            &tracks[index],
                             volume,
-                            offset,
                             rate,
-                            paused,
-                        )?
+                        )
+                        .map(|replacement| {
+                            if paused {
+                                replacement.pause();
+                            }
+                            replacement
+                        })
+                    } else {
+                        resolve_audio_url(tools, &tracks[index]).and_then(|media_url| {
+                            playback_from_url(
+                                replacement_output.stream(),
+                                tools,
+                                media_url,
+                                volume,
+                                offset,
+                                rate,
+                                paused,
+                            )
+                        })
                     };
-                    media_controls.set_track(&tracks[index].title, "YouTube");
-                    media_controls.set_playing(!paused);
-                    break;
+                    if let Ok(replacement_playback) = replacement_playback {
+                        output = replacement_output;
+                        playback = replacement_playback;
+                        media_controls.set_track(&tracks[index].title, "YouTube");
+                        media_controls.set_playing(!paused);
+                        break;
+                    }
                 }
 
                 if let Some(command) = media_controls.command() {
@@ -1003,7 +1048,22 @@ fn play_youtube_tracks(
                         MediaCommand::Play => paused = false,
                         MediaCommand::Pause => paused = true,
                         MediaCommand::Next => {
-                            index = (index + 1) % tracks.len();
+                            let Some((next, new_pass, advance_queue)) = forward_track_index(
+                                index,
+                                tracks.len(),
+                                loop_mode,
+                                false,
+                                &mut resume_after_replay,
+                            ) else {
+                                return Ok(PlayerExit::Back);
+                            };
+                            if new_pass {
+                                restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                            }
+                            if advance_queue && play_next > 0 {
+                                play_next -= 1;
+                            }
+                            index = next;
                             changed_track = true;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
@@ -1011,11 +1071,8 @@ fn play_youtube_tracks(
                             media_controls.set_track(&tracks[index].title, "YouTube");
                         }
                         MediaCommand::Previous => {
-                            index = if index == 0 {
-                                tracks.len() - 1
-                            } else {
-                                index - 1
-                            };
+                            index =
+                                previous_track_index(index, tracks.len(), &mut resume_after_replay);
                             changed_track = true;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
@@ -1033,11 +1090,26 @@ fn play_youtube_tracks(
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(PlayerExit::Quit),
-                        KeyCode::Char('b') => return Ok(PlayerExit::Back),
+                        KeyCode::Char('q') => return Ok(PlayerExit::Quit),
+                        KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
                         KeyCode::Char('p') | KeyCode::Char(' ') => paused = !paused,
                         KeyCode::Char('n') => {
-                            index = (index + 1) % tracks.len();
+                            let Some((next, new_pass, advance_queue)) = forward_track_index(
+                                index,
+                                tracks.len(),
+                                loop_mode,
+                                false,
+                                &mut resume_after_replay,
+                            ) else {
+                                return Ok(PlayerExit::Back);
+                            };
+                            if new_pass {
+                                restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                            }
+                            if advance_queue && play_next > 0 {
+                                play_next -= 1;
+                            }
+                            index = next;
                             changed_track = true;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
@@ -1045,11 +1117,8 @@ fn play_youtube_tracks(
                             media_controls.set_track(&tracks[index].title, "YouTube");
                         }
                         KeyCode::Char('v') => {
-                            index = if index == 0 {
-                                tracks.len() - 1
-                            } else {
-                                index - 1
-                            };
+                            index =
+                                previous_track_index(index, tracks.len(), &mut resume_after_replay);
                             changed_track = true;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
@@ -1074,10 +1143,22 @@ fn play_youtube_tracks(
                     media_controls.set_playing(false);
                 }
                 MediaCommand::Next => {
-                    if play_next > 0 {
+                    let Some((next, new_pass, advance_queue)) = forward_track_index(
+                        index,
+                        tracks.len(),
+                        loop_mode,
+                        false,
+                        &mut resume_after_replay,
+                    ) else {
+                        return Ok(PlayerExit::Back);
+                    };
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                    }
+                    if advance_queue && play_next > 0 {
                         play_next -= 1;
                     }
-                    index = (index + 1) % tracks.len();
+                    index = next;
                     cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
                     replace_track(
@@ -1092,11 +1173,7 @@ fn play_youtube_tracks(
                     media_controls.set_playing(true);
                 }
                 MediaCommand::Previous => {
-                    index = if index == 0 {
-                        tracks.len() - 1
-                    } else {
-                        index - 1
-                    };
+                    index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                     cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
                     replace_track(
@@ -1149,15 +1226,22 @@ fn play_youtube_tracks(
         )?;
 
         if playback.empty() {
-            if play_next > 0 && loop_mode != LoopMode::One {
+            let Some((next, new_pass, advance_queue)) = forward_track_index(
+                index,
+                tracks.len(),
+                loop_mode,
+                true,
+                &mut resume_after_replay,
+            ) else {
+                return Ok(PlayerExit::Back);
+            };
+            if new_pass {
+                restart_pass_order(&mut tracks, &original_tracks, shuffle);
+            }
+            if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                 play_next -= 1;
             }
-            match loop_mode {
-                LoopMode::One => {}
-                LoopMode::All => index = (index + 1) % tracks.len(),
-                LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                LoopMode::Off => return Ok(PlayerExit::Back),
-            }
+            index = next;
             cache_sponsor_segments(&mut tracks[index], &categories_json);
             last_skipped = None;
             replace_track(
@@ -1173,7 +1257,13 @@ fn play_youtube_tracks(
             continue;
         }
 
-        if !event::poll(Duration::from_millis(200))? {
+        let poll_started = Instant::now();
+        let event_ready = event::poll(Duration::from_millis(200))?;
+        if resume_gap_detected(poll_started.elapsed()) {
+            resumed_from_suspend = true;
+            continue;
+        }
+        if !event_ready {
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -1187,8 +1277,8 @@ fn play_youtube_tracks(
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(PlayerExit::Quit),
-            KeyCode::Char('b') => return Ok(PlayerExit::Back),
+            KeyCode::Char('q') => return Ok(PlayerExit::Quit),
+            KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if playback.is_paused() {
                     playback.play();
@@ -1199,10 +1289,22 @@ fn play_youtube_tracks(
                 }
             }
             KeyCode::Char('n') => {
-                if play_next > 0 {
+                let Some((next, new_pass, advance_queue)) = forward_track_index(
+                    index,
+                    tracks.len(),
+                    loop_mode,
+                    false,
+                    &mut resume_after_replay,
+                ) else {
+                    return Ok(PlayerExit::Back);
+                };
+                if new_pass {
+                    restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                }
+                if advance_queue && play_next > 0 {
                     play_next -= 1;
                 }
-                index = (index + 1) % tracks.len();
+                index = next;
                 cache_sponsor_segments(&mut tracks[index], &categories_json);
                 last_skipped = None;
                 replace_track(
@@ -1217,11 +1319,7 @@ fn play_youtube_tracks(
                 media_controls.set_playing(true);
             }
             KeyCode::Char('v') => {
-                index = if index == 0 {
-                    tracks.len() - 1
-                } else {
-                    index - 1
-                };
+                index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                 cache_sponsor_segments(&mut tracks[index], &categories_json);
                 last_skipped = None;
                 replace_track(
@@ -1265,19 +1363,9 @@ fn play_youtube_tracks(
             KeyCode::Char('s') => sponsor_enabled = !sponsor_enabled,
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
             KeyCode::Char('r') => {
-                let current = tracks[index].clone();
+                resume_after_replay = None;
                 shuffle = !shuffle;
-                tracks = if shuffle {
-                    let mut shuffled = original_tracks.clone();
-                    shuffle_slice(&mut shuffled);
-                    shuffled
-                } else {
-                    original_tracks.clone()
-                };
-                index = tracks
-                    .iter()
-                    .position(|track| track == &current)
-                    .unwrap_or(0);
+                set_shuffle_order(&mut tracks, index, play_next, &original_tracks, shuffle);
             }
             KeyCode::Char('a') => {
                 drop(raw.take());
@@ -1290,7 +1378,7 @@ fn play_youtube_tracks(
                     shuffle = false;
                 }
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') => loop {
                 let edit = manage_queue_with_adder(
                     &mut tracks,
                     index,
@@ -1308,15 +1396,22 @@ fn play_youtube_tracks(
                 )?;
                 index = edit.index;
                 if edit.finished {
-                    if play_next > 0 && loop_mode != LoopMode::One {
+                    let Some((next, new_pass, advance_queue)) = forward_track_index(
+                        index,
+                        tracks.len(),
+                        loop_mode,
+                        true,
+                        &mut resume_after_replay,
+                    ) else {
+                        return Ok(PlayerExit::Back);
+                    };
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                    }
+                    if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                         play_next -= 1;
                     }
-                    match loop_mode {
-                        LoopMode::One => {}
-                        LoopMode::All => index = (index + 1) % tracks.len(),
-                        LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                        LoopMode::Off => return Ok(PlayerExit::Back),
-                    }
+                    index = next;
                     cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
                     replace_track(
@@ -1329,7 +1424,10 @@ fn play_youtube_tracks(
                     )?;
                     media_controls.set_track(&tracks[index].title, "YouTube");
                     media_controls.set_playing(true);
-                } else if edit.restart {
+                    continue;
+                }
+                if edit.restart {
+                    resume_after_replay = None;
                     play_next = 0;
                     cache_sponsor_segments(&mut tracks[index], &categories_json);
                     last_skipped = None;
@@ -1344,10 +1442,8 @@ fn play_youtube_tracks(
                     media_controls.set_track(&tracks[index].title, "YouTube");
                     media_controls.set_playing(true);
                 }
-                if edit.changed {
-                    shuffle = false;
-                }
-            }
+                break;
+            },
             _ => {}
         }
     }
@@ -1423,9 +1519,10 @@ mod youtube_tests {
     use super::{
         SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment, is_portable_yt_dlp,
         logical_elapsed, parse_sponsor_segments, parse_sponsorblock_settings,
-        parse_youtube_track_line, portable_yt_dlp_update_paths, seek_target,
-        serialize_sponsorblock_settings, sponsor_skip_target, sponsorblock_categories_json,
-        stepped_rate, youtube_playback_controls, youtube_stream_format,
+        parse_youtube_track_line, playback_ended_early, portable_yt_dlp_update_paths,
+        resume_gap_detected, seek_target, serialize_sponsorblock_settings, sponsor_skip_target,
+        sponsorblock_categories_json, stepped_rate, youtube_playback_controls,
+        youtube_stream_format,
     };
 
     #[test]
@@ -1463,6 +1560,21 @@ mod youtube_tests {
         assert_eq!(stepped_rate(0.5, false), 0.5);
         assert_eq!(stepped_rate(2.0, true), 2.0);
         assert_eq!(stepped_rate(1.0, true), 1.25);
+    }
+
+    #[test]
+    fn suspend_gap_and_premature_end_trigger_recovery() {
+        assert!(!resume_gap_detected(Duration::from_secs(4)));
+        assert!(resume_gap_detected(Duration::from_secs(5)));
+        assert!(playback_ended_early(
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60))
+        ));
+        assert!(!playback_ended_early(
+            Duration::from_secs(55),
+            Some(Duration::from_secs(60))
+        ));
+        assert!(!playback_ended_early(Duration::from_secs(30), None));
     }
 
     #[test]

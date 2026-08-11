@@ -28,7 +28,6 @@ pub(crate) enum PlayerExit {
 
 pub(crate) struct QueueEdit {
     pub(crate) index: usize,
-    pub(crate) changed: bool,
     pub(crate) restart: bool,
     pub(crate) finished: bool,
 }
@@ -327,26 +326,24 @@ where
     Add: FnMut(&mut Vec<T>, usize, &mut usize, &mut Finished) -> Result<bool>,
     Finished: FnMut() -> bool,
 {
-    let mut current = current.min(queue.len().saturating_sub(1));
+    let current = current.min(queue.len().saturating_sub(1));
     let current_item = queue[current].clone();
     let mut selected = current;
-    let mut changed = false;
     let mut stdout = io::stdout();
     loop {
-        if playback_finished() {
-            return Ok(QueueEdit {
-                index: current,
-                changed,
-                restart: false,
-                finished: true,
-            });
-        }
         draw_frame(
             &mut stdout,
             &queue_table(queue, current, *play_next, selected, label),
         )?;
 
         if !event::poll(Duration::from_millis(200))? {
+            if playback_finished() {
+                return Ok(QueueEdit {
+                    index: current,
+                    restart: false,
+                    finished: true,
+                });
+            }
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -376,28 +373,23 @@ where
                 }
                 return Ok(QueueEdit {
                     index: selected,
-                    changed,
                     restart: queue[selected] != current_item,
                     finished: false,
                 });
             }
-            KeyCode::Delete if queue.len() > 1 && selected != current => {
-                let queued_end = current.saturating_add(*play_next);
-                if selected > current && selected <= queued_end {
-                    *play_next -= 1;
-                }
-                current = remove_queue_item(queue, current, selected);
+            KeyCode::Delete
+                if selected > current && selected <= current.saturating_add(*play_next) =>
+            {
+                unqueue_next_item(queue, current, play_next, selected);
                 selected = selected.min(queue.len() - 1);
-                changed = true;
             }
             KeyCode::Char('a') => {
-                changed |= add(queue, current, play_next, &mut playback_finished)?;
+                add(queue, current, play_next, &mut playback_finished)?;
                 selected = selected.min(queue.len() - 1);
             }
             KeyCode::Esc => {
                 return Ok(QueueEdit {
                     index: current,
-                    changed,
                     restart: queue[current] != current_item,
                     finished: false,
                 });
@@ -474,7 +466,7 @@ where
         ));
     }
     frame.push_str(&format!(
-        "└{}┴{}┴{}┘\r\n\r\n[Up/Down] select | [Enter] play | [Delete] remove | [a] add next | [Esc] close",
+        "└{}┴{}┴{}┘\r\n\r\n[Up/Down] select | [Enter] play | [Delete] unqueue | [a] add next | [Esc] close",
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
@@ -497,12 +489,47 @@ pub(crate) fn queue_window_start(
         .min(length.saturating_sub(page_size))
 }
 
-pub(crate) fn remove_queue_item<T>(queue: &mut Vec<T>, current: usize, remove: usize) -> usize {
-    queue.remove(remove);
-    if remove < current {
-        current - 1
+pub(crate) fn previous_track_index(
+    current: usize,
+    track_count: usize,
+    resume_after_replay: &mut Option<usize>,
+) -> usize {
+    resume_after_replay.get_or_insert(current);
+    if current == 0 {
+        track_count - 1
     } else {
-        current.min(queue.len() - 1)
+        current - 1
+    }
+}
+
+pub(crate) fn forward_track_index(
+    current: usize,
+    track_count: usize,
+    loop_mode: LoopMode,
+    natural_end: bool,
+    resume_after_replay: &mut Option<usize>,
+) -> Option<(usize, bool, bool)> {
+    if let Some(resume) = resume_after_replay.take() {
+        return Some((resume, false, false));
+    }
+    next_track_index(current, track_count, loop_mode, natural_end)
+        .map(|next| (next, next == 0 && next != current, true))
+}
+
+pub(crate) fn unqueue_next_item<T: Eq>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: &mut usize,
+    remove: usize,
+) {
+    let item = queue.remove(remove);
+    *play_next -= 1;
+    let tail_start = current
+        .saturating_add(1)
+        .saturating_add(*play_next)
+        .min(queue.len());
+    if !queue[tail_start..].contains(&item) {
+        queue.push(item);
     }
 }
 
@@ -518,6 +545,62 @@ pub(crate) fn insert_queue_next<T>(
         .min(queue.len());
     *play_next += additions.len();
     queue.splice(insert_at..insert_at, additions);
+}
+
+pub(crate) fn set_shuffle_order<T: Clone + Eq>(
+    queue: &mut Vec<T>,
+    current: usize,
+    play_next: usize,
+    original: &[T],
+    shuffle: bool,
+) {
+    let tail_start = current
+        .saturating_add(1)
+        .saturating_add(play_next)
+        .min(queue.len());
+    if shuffle {
+        shuffle_slice(&mut queue[tail_start..]);
+        return;
+    }
+
+    let mut tail: Vec<_> = queue.drain(tail_start..).collect();
+    restore_order(&mut tail, original);
+    queue.extend(tail);
+}
+
+pub(crate) fn restart_pass_order<T: Clone + Eq>(queue: &mut Vec<T>, original: &[T], shuffle: bool) {
+    if shuffle {
+        shuffle_slice(queue);
+    } else {
+        restore_order(queue, original);
+    }
+}
+
+fn restore_order<T: Clone + Eq>(items: &mut Vec<T>, original: &[T]) {
+    let mut remaining = std::mem::take(items);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for original_item in original {
+        if let Some(index) = remaining.iter().position(|item| item == original_item) {
+            ordered.push(remaining.remove(index));
+        }
+    }
+    ordered.append(&mut remaining);
+    *items = ordered;
+}
+
+pub(crate) fn next_track_index(
+    current: usize,
+    track_count: usize,
+    loop_mode: LoopMode,
+    natural_end: bool,
+) -> Option<usize> {
+    if natural_end && loop_mode == LoopMode::One {
+        return Some(current);
+    }
+    if current + 1 < track_count {
+        return Some(current + 1);
+    }
+    (loop_mode == LoopMode::All).then_some(0)
 }
 
 fn append_to_queue<T, Label, Matches, Finished>(

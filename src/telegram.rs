@@ -33,9 +33,10 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel, format_duration,
-    format_elapsed, is_supported_audio_path, load_volume, manage_queue, normalize_channel,
-    playback_controls, progress_bar, prompt, safe_file_name, save_volume, select_menu,
-    shuffle_slice, toggle_all,
+    format_elapsed, forward_track_index, is_supported_audio_path, load_volume, manage_queue,
+    normalize_channel, playback_controls, previous_track_index, progress_bar, prompt,
+    restart_pass_order, safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice,
+    toggle_all,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -465,22 +466,38 @@ pub(crate) async fn stream_catalog_entries(
         "Play in order".to_string(),
         "Shuffle".to_string(),
         "Search and choose a track".to_string(),
+        "Search and choose multiple tracks".to_string(),
         "Back".to_string(),
     ];
-    let (catalog_index, shuffle) = loop {
-        match select_menu(title, &menu)? {
-            Some(0) => break (0, false),
-            Some(1) => break (0, true),
+    loop {
+        let (tracks, play_next, shuffle) = match select_menu(title, &menu)? {
+            Some(0) => (catalog.clone(), 0, false),
+            Some(1) => (catalog.clone(), 0, true),
             Some(2) => {
-                if let Some(index) = choose_catalog_track(&catalog, title)? {
-                    break (index, false);
-                }
+                let Some(index) = choose_catalog_track(&catalog, title)? else {
+                    continue;
+                };
+                (prioritize_catalog_tracks(&catalog, &[index]), 0, false)
             }
-            Some(3) | None => return Ok(PlayerExit::Back),
+            Some(3) => {
+                let Some(indexes) = choose_catalog_tracks_to_play(&catalog, title)? else {
+                    continue;
+                };
+                let play_next = indexes.len().saturating_sub(1);
+                (
+                    prioritize_catalog_tracks(&catalog, &indexes),
+                    play_next,
+                    false,
+                )
+            }
+            Some(4) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
+        };
+        match play_catalog_entries("", tracks, 0, shuffle, play_next).await? {
+            PlayerExit::Quit => return Ok(PlayerExit::Quit),
+            PlayerExit::Back => {}
         }
-    };
-    play_catalog_entries("", catalog, catalog_index, shuffle).await
+    }
 }
 
 pub(crate) fn channel_catalog(channel: &str) -> Result<Vec<TelegramCatalogEntry>> {
@@ -501,6 +518,7 @@ pub(crate) async fn play_catalog_entries(
     mut catalog: Vec<TelegramCatalogEntry>,
     catalog_index: usize,
     shuffle: bool,
+    play_next: usize,
 ) -> Result<PlayerExit> {
     if catalog.is_empty() {
         bail!("playlist has no songs");
@@ -519,7 +537,7 @@ pub(crate) async fn play_catalog_entries(
     println!("Loading selected Telegram track...");
     let client = telegram_client().await?;
     let catalog_index = catalog_index.min(catalog.len() - 1);
-    play_telegram_tracks(client, catalog, catalog_index, shuffle).await
+    play_telegram_tracks(client, catalog, catalog_index, shuffle, play_next).await
 }
 
 fn choose_catalog_track(
@@ -588,6 +606,118 @@ fn choose_catalog_track(
             _ => {}
         }
     }
+}
+
+fn choose_catalog_tracks_to_play(
+    catalog: &[TelegramCatalogEntry],
+    list_label: &str,
+) -> Result<Option<Vec<usize>>> {
+    let _raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut query = String::new();
+    let mut matches: Vec<_> = (0..catalog.len()).collect();
+    let mut selected_row = 0usize;
+    let mut selected = HashSet::new();
+
+    loop {
+        selected_row = selected_row.min(matches.len().saturating_sub(1));
+        let start = selected_row
+            .saturating_sub(TRACK_LIST_PAGE_SIZE / 2)
+            .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
+        let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
+        let mut frame = format!(
+            "Choose songs to play\r\nList: {list_label}\r\nSearch: {query}_ | {} selected | {} matches\r\n\r\n",
+            selected.len(),
+            matches.len()
+        );
+        for (offset, &catalog_index) in matches[start..end].iter().enumerate() {
+            frame.push_str(&format!(
+                "{} [{}] {}\r\n",
+                if start + offset == selected_row {
+                    ">"
+                } else {
+                    " "
+                },
+                if selected.contains(&catalog_index) {
+                    "x"
+                } else {
+                    " "
+                },
+                catalog[catalog_index].name
+            ));
+        }
+        if matches.is_empty() {
+            frame.push_str("No matching tracks.\r\n");
+        }
+        frame.push_str(
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] play | [Esc] back",
+        );
+        draw_frame(&mut stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up if !matches.is_empty() => {
+                selected_row = selected_row.checked_sub(1).unwrap_or(matches.len() - 1);
+            }
+            KeyCode::Down if !matches.is_empty() => {
+                selected_row = (selected_row + 1) % matches.len();
+            }
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !matches.is_empty() {
+                    let index = matches[selected_row];
+                    if !selected.remove(&index) {
+                        selected.insert(index);
+                    }
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                toggle_all(&mut selected, matches.iter().copied())
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                matches = search_catalog(catalog, &query);
+                selected_row = 0;
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
+                query.push(character);
+                matches = search_catalog(catalog, &query);
+                selected_row = 0;
+            }
+            KeyCode::Enter if !matches.is_empty() || !selected.is_empty() => {
+                if selected.is_empty() {
+                    selected.insert(matches[selected_row]);
+                }
+                let mut indexes: Vec<_> = selected.into_iter().collect();
+                indexes.sort_unstable();
+                return Ok(Some(indexes));
+            }
+            KeyCode::Esc => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn prioritize_catalog_tracks<T: Clone>(catalog: &[T], selected: &[usize]) -> Vec<T> {
+    let selected: HashSet<_> = selected.iter().copied().collect();
+    catalog
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected.contains(index))
+        .chain(
+            catalog
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !selected.contains(index)),
+        )
+        .map(|(_, track)| track.clone())
+        .collect()
 }
 
 pub(crate) fn choose_catalog_tracks(
@@ -731,6 +861,7 @@ async fn play_telegram_tracks(
     mut tracks: Vec<TelegramCatalogEntry>,
     mut index: usize,
     mut shuffle: bool,
+    initial_play_next: usize,
 ) -> Result<PlayerExit> {
     let _raw = RawMode::new()?;
     let mut stdout = io::stdout();
@@ -743,7 +874,8 @@ async fn play_telegram_tracks(
     let output = AudioOutput::open()?;
     let media_controls = MediaControls::new();
     let mut volume = load_volume();
-    let mut play_next = 0usize;
+    let mut resume_after_replay = None;
+    let mut play_next = initial_play_next.min(tracks.len().saturating_sub(1));
     let mut loop_mode = LoopMode::Off;
     let mut active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
     update_telegram_media(&media_controls, &tracks[index], &active);
@@ -766,21 +898,37 @@ async fn play_telegram_tracks(
                     media_controls.set_playing(false);
                 }
                 MediaCommand::Next | MediaCommand::Previous => {
+                    let forward = command == MediaCommand::Next;
+                    let next = if forward {
+                        forward_track_index(
+                            index,
+                            tracks.len(),
+                            loop_mode,
+                            false,
+                            &mut resume_after_replay,
+                        )
+                    } else {
+                        Some((
+                            previous_track_index(index, tracks.len(), &mut resume_after_replay),
+                            false,
+                            false,
+                        ))
+                    };
+                    let Some((next, new_pass, advance_queue)) = next else {
+                        active.stop().await;
+                        delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
+                        return Ok(PlayerExit::Back);
+                    };
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
                     delete_cache_file(&old_cache)?;
-                    if command == MediaCommand::Next {
-                        if play_next > 0 {
-                            play_next -= 1;
-                        }
-                        index = (index + 1) % tracks.len();
-                    } else {
-                        index = if index == 0 {
-                            tracks.len() - 1
-                        } else {
-                            index - 1
-                        };
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
                     }
+                    if advance_queue && play_next > 0 {
+                        play_next -= 1;
+                    }
+                    index = next;
                     active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
                         .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
@@ -803,21 +951,27 @@ async fn play_telegram_tracks(
 
         let complete = active.shared.state.lock().map_err(lock_error)?.complete;
         if complete && active.sink.empty() {
+            let Some((next, new_pass, advance_queue)) = forward_track_index(
+                index,
+                tracks.len(),
+                loop_mode,
+                true,
+                &mut resume_after_replay,
+            ) else {
+                active.stop().await;
+                delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
+                return Ok(PlayerExit::Back);
+            };
             let old_cache = active.cache_path.clone();
             active.stop().await;
             delete_cache_file(&old_cache)?;
-            if play_next > 0 && loop_mode != LoopMode::One {
+            if new_pass {
+                restart_pass_order(&mut tracks, &original_tracks, shuffle);
+            }
+            if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                 play_next -= 1;
             }
-            match loop_mode {
-                LoopMode::One => {}
-                LoopMode::All => index = (index + 1) % tracks.len(),
-                LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                LoopMode::Off => {
-                    delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
-                    return Ok(PlayerExit::Back);
-                }
-            }
+            index = next;
             active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
             update_telegram_media(&media_controls, &tracks[index], &active);
             continue;
@@ -838,12 +992,12 @@ async fn play_telegram_tracks(
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => {
                 active.stop().await;
                 delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
                 return Ok(PlayerExit::Quit);
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b') | KeyCode::Esc => {
                 active.stop().await;
                 delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
                 return Ok(PlayerExit::Back);
@@ -858,13 +1012,27 @@ async fn play_telegram_tracks(
                 }
             }
             KeyCode::Char('n') => {
+                let Some((next, new_pass, advance_queue)) = forward_track_index(
+                    index,
+                    tracks.len(),
+                    loop_mode,
+                    false,
+                    &mut resume_after_replay,
+                ) else {
+                    active.stop().await;
+                    delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
+                    return Ok(PlayerExit::Back);
+                };
                 let old_cache = active.cache_path.clone();
                 active.stop().await;
                 delete_cache_file(&old_cache)?;
-                if play_next > 0 {
+                if new_pass {
+                    restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                }
+                if advance_queue && play_next > 0 {
                     play_next -= 1;
                 }
-                index = (index + 1) % tracks.len();
+                index = next;
                 active =
                     start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
                 update_telegram_media(&media_controls, &tracks[index], &active);
@@ -873,11 +1041,7 @@ async fn play_telegram_tracks(
                 let old_cache = active.cache_path.clone();
                 active.stop().await;
                 delete_cache_file(&old_cache)?;
-                index = if index == 0 {
-                    tracks.len() - 1
-                } else {
-                    index - 1
-                };
+                index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                 active =
                     start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
                 update_telegram_media(&media_controls, &tracks[index], &active);
@@ -894,21 +1058,11 @@ async fn play_telegram_tracks(
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
             KeyCode::Char('r') => {
-                let current = tracks[index].clone();
+                resume_after_replay = None;
                 shuffle = !shuffle;
-                tracks = if shuffle {
-                    let mut shuffled = original_tracks.clone();
-                    shuffle_slice(&mut shuffled);
-                    shuffled
-                } else {
-                    original_tracks.clone()
-                };
-                index = tracks
-                    .iter()
-                    .position(|track| track == &current)
-                    .unwrap_or(0);
+                set_shuffle_order(&mut tracks, index, play_next, &original_tracks, shuffle);
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') => loop {
                 let edit = manage_queue(
                     &mut tracks,
                     index,
@@ -932,25 +1086,34 @@ async fn play_telegram_tracks(
                 )?;
                 index = edit.index;
                 if edit.finished {
+                    let Some((next, new_pass, advance_queue)) = forward_track_index(
+                        index,
+                        tracks.len(),
+                        loop_mode,
+                        true,
+                        &mut resume_after_replay,
+                    ) else {
+                        active.stop().await;
+                        delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
+                        return Ok(PlayerExit::Back);
+                    };
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
                     delete_cache_file(&old_cache)?;
-                    if play_next > 0 && loop_mode != LoopMode::One {
+                    if new_pass {
+                        restart_pass_order(&mut tracks, &original_tracks, shuffle);
+                    }
+                    if advance_queue && play_next > 0 && loop_mode != LoopMode::One {
                         play_next -= 1;
                     }
-                    match loop_mode {
-                        LoopMode::One => {}
-                        LoopMode::All => index = (index + 1) % tracks.len(),
-                        LoopMode::Off if index + 1 < tracks.len() => index += 1,
-                        LoopMode::Off => {
-                            delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
-                            return Ok(PlayerExit::Back);
-                        }
-                    }
+                    index = next;
                     active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
                         .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
-                } else if edit.restart {
+                    continue;
+                }
+                if edit.restart {
+                    resume_after_replay = None;
                     play_next = 0;
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
@@ -959,10 +1122,8 @@ async fn play_telegram_tracks(
                         .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
                 }
-                if edit.changed {
-                    shuffle = false;
-                }
-            }
+                break;
+            },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(1.5);
                 active.sink.set_volume(volume);
