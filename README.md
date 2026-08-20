@@ -27,30 +27,20 @@ Windows is supported. macOS and Linux support are planned.
 
 Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.0.4)
 
-## Usage
-```music-terminal-player.exe``` 
+## Tutorials
 
-The launcher provides local playback, Telegram login and channel actions, playlists, and YouTube audio. English is built into the executable and always works offline. Open `Language`, then select `Tiếng Việt — Download` to explicitly fetch the optional pack from the repository's raw `languages/` directory. Verified packs are cached under `.music-terminal/languages`, apply immediately, persist after restart, and continue working offline. Missing or invalid optional packs fall back to English. CLI commands are also available for local playback, Telegram synchronization, streaming, downloads, and YouTube playback.
+New to Music Terminal Player? Start with the guide for the source you want to play:
 
-See the [usage guide](docs/usage.md) for setup and command details.
+- [Local music tutorial](docs/local-tutorial.md) — add a music folder, play saved folders, and use playback controls.
+- [Telegram tutorial](docs/telegram-tutorial.md) — create API credentials, log in, synchronize channels, and stream or download music.
+- [YouTube tutorial](docs/youtube-tutorial.md) — set up yt-dlp and FFmpeg, play videos or playlists, and update the tools.
 
-## Controls
+### Playlist quick tutorial
 
-- `p` / `Space`: play or pause
-- `n` / `v`: next or previous track
-- `Up` / `Down` or `+` / `-`: volume up or down 10%
-- `Right` / `Left`: volume up or down 1% for local/Telegram; seek forward/backward 10 seconds for YouTube
-- `,` / `.`: decrease or increase YouTube speed by 0.25x (0.5x–2.0x)
-- `s`: toggle all configured YouTube SponsorBlock categories for the current queue session
-- `r`: toggle shuffle for unplayed tracks; manually queued tracks keep their order
-- `l`: cycle loop mode
-- `u`: open the queue
-- `b` / `Esc`: return to the previous menu; launcher `Esc` keeps the player open
-- `q` / `Ctrl+C`: quit completely; the launcher's `Quit` option also exits
-
-Playback consumes each track-list entry once per pass. Duplicate entries and manually queued copies are separate plays; manual Previous may replay an entry. Loop Off stops after the remaining track list is exhausted, while Loop All starts a new full pass. The queue stays open across automatic track changes. `Delete` unqueues only a selected `Next in queue` item, leaving or returning one copy under `Next from track list`.
-
-Windows System Media Transport Controls publish the current title, source, and play state. Play, Pause, Next, and Previous work from supported keyboards and Windows media surfaces. If an output device disconnects or Windows resumes after sleep or hibernation, YouTube waits for the current default device and automatically resumes near its previous position. Local and Telegram playback stop with a device-unavailable message; Telegram also cancels the active download and clears its temporary cache.
+1. Add a local folder or synchronize a Telegram channel first.
+2. Open `Playlists` → `Create playlist`, enter a name, then choose `Local folder` or `Telegram channel`.
+3. Select songs with `Ctrl+Space`; use `Ctrl+A` to select all matching songs, then press `Enter` to save.
+4. Open `Playlists` again and select the playlist to play it. The same menu can edit songs, rename the playlist, or delete it.
 
 ## Supported extensions
 
@@ -69,4 +59,4 @@ music-terminal-player.exe --borderless
 
 ## Documentation
 
-See the [usage guide](docs/usage.md) for Telegram setup, YouTube tools, CLI commands, queues, playlists, data files, and current limitations.
+See the [usage guide](docs/usage.md) for CLI commands, queues, playlists, language packs, data files, and current limitations.

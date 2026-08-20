@@ -2,6 +2,16 @@
 
 Music Terminal Player currently supports Windows.
 
+## Start here
+
+New users can follow one short tutorial at a time:
+
+- [Play music from a local folder](local-tutorial.md)
+- [Play YouTube audio](youtube-tutorial.md)
+- [Log in and stream music from Telegram](telegram-tutorial.md)
+
+Each tutorial starts from the application launcher and explains the required setup, normal playback steps, useful keys, and common problems.
+
 ## Build and run
 
 Build the release executable with Rust:
@@ -24,7 +34,7 @@ Running or double-clicking the executable opens the launcher. `Play YouTube audi
 
 Windows Terminal owns its shared top-level window, so `--borderless` does not alter Windows Terminal tabs. Command-line usage is available through `--help`.
 
-## Language 
+## Language
 
 English is compiled into the executable, needs no language file, and always works offline. Opening `Language` checks the flat catalog at `https://raw.githubusercontent.com/harrytien107/Music_Terminal_Player/main/languages/index.json`. No optional pack downloads during startup.
 
