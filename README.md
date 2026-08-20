@@ -18,18 +18,19 @@ A small terminal player for local libraries and online sources without the overh
 - Windows media controls with track metadata and Play, Pause, Next, and Previous actions
 - Automatic YouTube recovery when the default audio output changes
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
+- Built-in offline English UI with optional, verified Vietnamese download and persistent selection
 - Unicode-aware terminal panels and queue columns
-- Portable or existing yt-dlp and FFmpeg setup with manual stable portable yt-dlp updates
+- Portable or existing yt-dlp and FFmpeg setup with manual portable tool updates
 
 ## Installing
 Windows is supported. macOS and Linux support are planned.
 
-Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v2.0.5)
+Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.0.4)
 
 ## Usage
 ```music-terminal-player.exe``` 
 
-The launcher provides local playback, Telegram login and channel actions, playlists, and YouTube audio. CLI commands are also available for local playback, Telegram synchronization, streaming, downloads, and YouTube playback.
+The launcher provides local playback, Telegram login and channel actions, playlists, and YouTube audio. English is built into the executable and always works offline. Open `Language`, then select `Tiếng Việt — Download` to explicitly fetch the optional pack from the repository's raw `languages/` directory. Verified packs are cached under `.music-terminal/languages`, apply immediately, persist after restart, and continue working offline. Missing or invalid optional packs fall back to English. CLI commands are also available for local playback, Telegram synchronization, streaming, downloads, and YouTube playback.
 
 See the [usage guide](docs/usage.md) for setup and command details.
 
@@ -44,8 +45,8 @@ See the [usage guide](docs/usage.md) for setup and command details.
 - `r`: toggle shuffle for unplayed tracks; manually queued tracks keep their order
 - `l`: cycle loop mode
 - `u`: open the queue
-- `b` / `Esc`: return to the launcher
-- `q` / `Ctrl+C`: quit
+- `b` / `Esc`: return to the previous menu; launcher `Esc` keeps the player open
+- `q` / `Ctrl+C`: quit completely; the launcher's `Quit` option also exits
 
 Playback consumes each track-list entry once per pass. Duplicate entries and manually queued copies are separate plays; manual Previous may replay an entry. Loop Off stops after the remaining track list is exhausted, while Loop All starts a new full pass. The queue stays open across automatic track changes. `Delete` unqueues only a selected `Next in queue` item, leaving or returning one copy under `Next from track list`.
 

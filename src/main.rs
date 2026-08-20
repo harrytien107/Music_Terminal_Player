@@ -6,6 +6,7 @@ use tokio::runtime;
 
 mod app;
 mod audio_output;
+mod i18n;
 mod local;
 mod media_controls;
 mod telegram;
@@ -90,6 +91,7 @@ fn configure_player_window() {}
 
 fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     util::prepare_data_dir()?;
+    i18n::load_language();
     match args.next().as_deref() {
         Some("play") => {
             let path = args

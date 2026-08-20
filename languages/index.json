@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "languages": [
+    {
+      "code": "vi",
+      "name": "Tiếng Việt",
+      "version": 1,
+      "file": "vi.lang",
+      "sha256": "54ced1b38e770b9260d3d54a136f031a26f7be656b63b5733b63c058eeae5f47"
+    }
+  ]
+}

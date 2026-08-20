@@ -7,6 +7,10 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::runtime;
 
+use crate::i18n::{
+    Language, fetch_language_catalog, install_language, installed_language_version, language,
+    set_language, tr,
+};
 use crate::local::{
     choose_local_tracks, collect_tracks, play_path, play_tracks, play_tracks_shuffled,
 };
@@ -59,18 +63,19 @@ struct SavedLibrary {
 
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
-    let items = vec![
-        "▶  Quick play".to_string(),
-        "▶  Play YouTube audio".to_string(),
-        "♫  Play local folder".to_string(),
-        "☁  Stream Telegram channel".to_string(),
-        "↻  Sync and update Telegram channel".to_string(),
-        "↓  Download Telegram channel to .\\music".to_string(),
-        "≡  Open playlists".to_string(),
-        "●  Login to Telegram".to_string(),
-        "×  Quit".to_string(),
-    ];
     loop {
+        let items = vec![
+            format!("▶  {}", tr("msg.quick_play")),
+            format!("▶  {}", tr("msg.play_youtube_audio")),
+            format!("♫  {}", tr("msg.play_local_folder")),
+            format!("☁  {}", tr("msg.stream_telegram_channel")),
+            format!("↻  {}", tr("msg.sync_and_update_telegram_channel")),
+            format!("↓  {}", tr("msg.download_telegram_channel_to_music")),
+            format!("≡  {}", tr("msg.open_playlists")),
+            format!("●  {}", tr("msg.login_to_telegram")),
+            format!("⚙  {}", tr("msg.language")),
+            format!("×  {}", tr("msg.quit")),
+        ];
         let title = format!(
             "╭──────────────────────────────────────╮\n\
              │        MUSIC TERMINAL PLAYER         │\n\
@@ -100,7 +105,7 @@ pub(crate) fn launch_menu() -> Result<()> {
             }
             Some(3) => {
                 while let Some((label, catalog)) =
-                    choose_telegram_catalog(&library, "Stream Telegram channel")?
+                    choose_telegram_catalog(&library, tr("msg.stream_telegram_channel"))?
                 {
                     let result = runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -123,7 +128,12 @@ pub(crate) fn launch_menu() -> Result<()> {
                         if index > 0 {
                             println!();
                         }
-                        println!("Synchronizing channel {}/{}: {label}", index + 1, total);
+                        println!(
+                            "{} {}/{}: {label}",
+                            tr("msg.synchronizing_channel"),
+                            index + 1,
+                            total
+                        );
                         let result = runtime::Builder::new_multi_thread()
                             .enable_all()
                             .build()?
@@ -136,19 +146,25 @@ pub(crate) fn launch_menu() -> Result<()> {
                                 }
                                 summary.push(format!("[OK] {label}"));
                             }
-                            Err(error) => summary.push(format!("[FAILED] {label}: {error:#}")),
+                            Err(error) => {
+                                summary.push(format!("[{}] {label}: {error:#}", tr("msg.failed")))
+                            }
                         }
                     }
-                    println!("\nSynchronization batch complete ({total} channels):");
+                    println!(
+                        "\n{} ({total} {}):",
+                        tr("msg.synchronization_batch_complete"),
+                        tr("msg.channels")
+                    );
                     for result in summary {
                         println!("  {result}");
                     }
-                    prompt("\nPress Enter to continue...")?;
+                    prompt(tr("msg.press_enter_to_continue"))?;
                 }
             }
             Some(5) => {
                 if let Some(channel) =
-                    choose_saved_channel(&library, "Download saved Telegram channel")?
+                    choose_saved_channel(&library, tr("msg.download_saved_telegram_channel"))?
                 {
                     runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -169,33 +185,105 @@ pub(crate) fn launch_menu() -> Result<()> {
                     .block_on(telegram_client());
                 match result {
                     Ok(_) => {
-                        println!("Telegram account ready.");
-                        prompt("Press Enter to return to the menu...")?;
+                        println!("{}", tr("msg.telegram_account_ready"));
+                        prompt(tr("msg.press_enter_to_return_to_the_menu"))?;
                         break;
                     }
                     Err(error) => {
-                        println!("Telegram login failed: {error:#}");
-                        let action = prompt("Press Enter to retry, or type 'back': ")?;
+                        println!("{}: {error:#}", tr("msg.telegram_login_failed"));
+                        let action = prompt(tr("msg.press_enter_to_retry_or_type_back"))?;
                         if action.trim().eq_ignore_ascii_case("back") {
                             break;
                         }
                     }
                 }
             },
-            Some(8) | None => return Ok(()),
+            Some(8) => manage_language()?,
+            Some(9) => return Ok(()),
+            None => {}
             _ => unreachable!(),
         }
     }
 }
 
+fn manage_language() -> Result<()> {
+    let catalog = fetch_language_catalog();
+    let vietnamese = catalog.as_ref().ok().and_then(|languages| {
+        languages
+            .iter()
+            .find(|info| info.language == Language::Vietnamese)
+    });
+    let installed_version = installed_language_version(Language::Vietnamese);
+    let mut title = tr("msg.language").to_string();
+    if catalog.is_err() {
+        title.push_str(&format!("\n{}", tr("msg.language_catalog_unavailable")));
+    }
+    let english_marker = if language() == Language::English {
+        "●"
+    } else {
+        "○"
+    };
+    let vietnamese_marker = if language() == Language::Vietnamese {
+        "●"
+    } else if installed_version.is_some() {
+        "○"
+    } else if vietnamese.is_some() {
+        "↓"
+    } else {
+        "×"
+    };
+    let vietnamese_status = match (installed_version, vietnamese) {
+        (Some(installed), Some(info)) if installed < info.version => tr("msg.update"),
+        (Some(_), _) => tr("msg.installed"),
+        (None, Some(_)) => tr("msg.download"),
+        (None, None) => tr("msg.unavailable"),
+    };
+    let items = vec![
+        format!("{english_marker}  {}", Language::English.label()),
+        format!(
+            "{vietnamese_marker}  {} — {vietnamese_status}",
+            vietnamese
+                .map(|info| info.name.as_str())
+                .unwrap_or(Language::Vietnamese.label())
+        ),
+        format!("←  {}", tr("msg.back")),
+    ];
+    match select_menu(&title, &items)? {
+        Some(0) => set_language(Language::English)?,
+        Some(1) => {
+            let needs_download = match (installed_version, vietnamese) {
+                (None, Some(_)) => true,
+                (Some(installed), Some(info)) => installed < info.version,
+                _ => false,
+            };
+            if needs_download {
+                clear_screen()?;
+                println!("{}", tr("msg.downloading_language_pack"));
+                if let Err(error) = install_language(
+                    vietnamese.expect("downloadable language has catalog metadata"),
+                ) {
+                    show_menu_error(&error)?;
+                    return Ok(());
+                }
+            }
+            if installed_version.is_some() || needs_download {
+                set_language(Language::Vietnamese)?;
+            }
+        }
+        Some(2) | None => {}
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
     let items = vec![
-        "▶  Shuffle Telegram library".to_string(),
-        "♫  Shuffle Local library".to_string(),
-        "←  Back".to_string(),
+        format!("▶  {}", tr("msg.shuffle_telegram_library")),
+        format!("♫  {}", tr("msg.shuffle_local_library")),
+        format!("←  {}", tr("msg.back")),
     ];
     loop {
-        match select_menu("Quick play", &items)? {
+        match select_menu(tr("msg.quick_play"), &items)? {
             Some(0) => {
                 let result = all_channel_tracks(library).and_then(|catalog| {
                     runtime::Builder::new_multi_thread()
@@ -258,8 +346,8 @@ fn choose_telegram_catalog(
     const PAGE_SIZE: usize = 20;
     if library.channels.is_empty() {
         clear_screen()?;
-        println!("No synchronized Telegram channels.");
-        prompt("Use 'Sync and update Telegram channel' to add one. Press Enter to return...")?;
+        println!("{}", tr("msg.no_synchronized_telegram_channels"));
+        prompt(tr("msg.use_sync_and_update_telegram_channel_to_add"))?;
         return Ok(None);
     }
 
@@ -273,9 +361,11 @@ fn choose_telegram_catalog(
             .min(library.channels.len().saturating_sub(PAGE_SIZE));
         let end = (start + PAGE_SIZE).min(library.channels.len());
         let mut frame = format!(
-            "{title}\r\n{} selected | {} synchronized\r\n\r\n",
+            "{title}\r\n{} {} | {} {}\r\n\r\n",
             selected.len(),
-            library.channels.len()
+            tr("msg.selected"),
+            library.channels.len(),
+            tr("msg.synchronized")
         );
         for (offset, channel) in library.channels[start..end].iter().enumerate() {
             let channel_index = start + offset;
@@ -294,9 +384,7 @@ fn choose_telegram_catalog(
                 telegram_channel_label(channel)
             ));
         }
-        frame.push_str(
-            "\r\n[Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] play | [Esc] back",
-        );
+        frame.push_str(tr("msg.space_toggle_ctrl_a_toggle_all_up_down"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -334,15 +422,19 @@ fn choose_telegram_catalog(
                 }
                 let label = if indexes.len() == 1 {
                     format!(
-                        "Telegram channel: {}\n{} tracks",
+                        "{}: {}\n{} {}",
+                        tr("msg.telegram_channel"),
                         telegram_channel_label(&library.channels[indexes[0]]),
-                        tracks.len()
+                        tracks.len(),
+                        tr("msg.tracks")
                     )
                 } else {
                     format!(
-                        "{} selected Telegram channels\n{} tracks",
+                        "{} {}\n{} {}",
                         indexes.len(),
-                        tracks.len()
+                        tr("msg.selected_telegram_channels"),
+                        tracks.len(),
+                        tr("msg.tracks")
                     )
                 };
                 return Ok(Some((label, tracks)));
@@ -368,8 +460,8 @@ pub(crate) fn selected_or_highlighted_channel_indexes(
 fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<String>> {
     if library.channels.is_empty() {
         clear_screen()?;
-        println!("No synchronized Telegram channels.");
-        prompt("Use 'Sync and update Telegram channel' to add one. Press Enter to return...")?;
+        println!("{}", tr("msg.no_synchronized_telegram_channels"));
+        prompt(tr("msg.use_sync_and_update_telegram_channel_to_add"))?;
         return Ok(None);
     }
     let mut items: Vec<_> = library
@@ -378,7 +470,7 @@ fn choose_saved_channel(library: &SavedLibrary, title: &str) -> Result<Option<St
         .map(|channel| telegram_channel_label(channel))
         .collect();
     let channel_count = items.len();
-    items.push("←  Back".to_string());
+    items.push(format!("←  {}", tr("msg.back")));
     Ok(select_menu(title, &items)?
         .and_then(|index| (index < channel_count).then(|| library.channels[index].clone())))
 }
@@ -430,7 +522,7 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
             }
             Some(index) if index == saved_item_count => {
                 clear_screen()?;
-                let channel = normalize_channel(&prompt("Public channel: ")?);
+                let channel = normalize_channel(&prompt(tr("msg.public_channel"))?);
                 if !channel.is_empty() {
                     return Ok(Some(vec![(
                         channel.clone(),
@@ -461,7 +553,7 @@ fn choose_channel_to_sync(library: &mut SavedLibrary) -> Result<Option<Vec<(Stri
             }
             Some(index) if index == saved_item_count + 2 => {
                 clear_screen()?;
-                let link = prompt("Private channel invite link (or type 'back'): ")?;
+                let link = prompt(tr("msg.private_channel_invite_link_or_type_back"))?;
                 if link.trim().eq_ignore_ascii_case("back") || link.trim().is_empty() {
                     continue;
                 }
@@ -522,7 +614,7 @@ fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
     const PAGE_SIZE: usize = 20;
     if library.channels.is_empty() {
         clear_screen()?;
-        prompt("No saved Telegram channels. Press Enter to return...")?;
+        prompt(tr("msg.no_saved_telegram_channels_press_enter_to_return"))?;
         return Ok(());
     }
 
@@ -607,26 +699,35 @@ fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
     }
 }
 
+pub(crate) fn local_folder_label(folder: &Path) -> String {
+    folder
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(folder.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn choose_local_folder(library: &mut SavedLibrary) -> Result<Option<PathBuf>> {
     loop {
         let mut items: Vec<_> = library
             .folders
             .iter()
-            .map(|folder| format!("♫  {}", folder.display()))
+            .map(|folder| format!("♫  {}", local_folder_label(folder)))
             .collect();
         let folder_count = items.len();
         items.extend([
-            "＋  Add folder".to_string(),
-            "−  Forget location".to_string(),
-            "←  Back".to_string(),
+            format!("＋  {}", tr("msg.add_folder")),
+            format!("−  {}", tr("msg.forget_location")),
+            format!("←  {}", tr("msg.back")),
         ]);
-        match select_menu("Local folders", &items)? {
+        match select_menu(tr("msg.local_folders"), &items)? {
             Some(index) if index < folder_count => {
                 return Ok(Some(library.folders[index].clone()));
             }
             Some(index) if index == folder_count => {
                 clear_screen()?;
-                let input = prompt("Folder path: ")?;
+                let input = prompt(tr("msg.folder_path"))?;
                 let path = fs::canonicalize(input.trim())
                     .with_context(|| format!("folder not found: {}", input.trim()))?;
                 if !path.is_dir() {
@@ -649,11 +750,11 @@ fn forget_folder(library: &mut SavedLibrary) -> Result<()> {
     let mut items: Vec<_> = library
         .folders
         .iter()
-        .map(|folder| format!("♫  {}", folder.display()))
+        .map(|folder| format!("♫  {}", local_folder_label(folder)))
         .collect();
     let folder_count = items.len();
-    items.push("←  Cancel".to_string());
-    if let Some(index) = select_menu("Forget which location?", &items)?
+    items.push(format!("←  {}", tr("msg.cancel")));
+    if let Some(index) = select_menu(tr("msg.forget_which_location"), &items)?
         && index < folder_count
     {
         library.folders.remove(index);
@@ -669,26 +770,31 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
             .iter()
             .map(|playlist| {
                 let source = if playlist.is_local() {
-                    "local".to_string()
+                    tr("msg.local").to_string()
                 } else {
-                    format!("Telegram, {} channels", playlist.channel_count())
+                    format!(
+                        "Telegram, {} {}",
+                        playlist.channel_count(),
+                        tr("msg.channels")
+                    )
                 };
                 format!(
-                    "▶  {} ({source}, {} songs)",
+                    "▶  {} ({source}, {} {})",
                     playlist.name,
-                    playlist.song_count()
+                    playlist.song_count(),
+                    tr("msg.songs")
                 )
             })
             .collect();
         let playlist_count = items.len();
         items.extend([
-            "＋  Create playlist".to_string(),
-            "✎  Edit playlist songs".to_string(),
-            "✎  Rename playlist".to_string(),
-            "−  Delete playlist".to_string(),
-            "←  Back".to_string(),
+            format!("＋  {}", tr("msg.create_playlist")),
+            format!("✎  {}", tr("msg.edit_playlist_songs")),
+            format!("✎  {}", tr("msg.rename_playlist")),
+            format!("−  {}", tr("msg.delete_playlist")),
+            format!("←  {}", tr("msg.back")),
         ]);
-        match select_menu("Playlists", &items)? {
+        match select_menu(tr("msg.playlists"), &items)? {
             Some(index) if index < playlist_count => {
                 let playlist = playlists[index].clone();
                 let result = if playlist.is_local() {
@@ -715,15 +821,15 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
                 create_playlist(library, &mut playlists)?;
             }
             Some(index) if index == playlist_count + 1 => {
-                if let Some(index) = choose_playlist("Edit which playlist?", &playlists)? {
+                if let Some(index) = choose_playlist(tr("msg.edit_which_playlist"), &playlists)? {
                     edit_playlist(library, &mut playlists[index])?;
                     save_playlists(&playlists)?;
                 }
             }
             Some(index) if index == playlist_count + 2 => {
-                if let Some(index) = choose_playlist("Rename which playlist?", &playlists)? {
+                if let Some(index) = choose_playlist(tr("msg.rename_which_playlist"), &playlists)? {
                     clear_screen()?;
-                    let name = clean_playlist_name(&prompt("New playlist name: ")?);
+                    let name = clean_playlist_name(&prompt(tr("msg.new_playlist_name"))?);
                     if !name.is_empty() {
                         playlists[index].name = name;
                         save_playlists(&playlists)?;
@@ -731,7 +837,7 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
                 }
             }
             Some(index) if index == playlist_count + 3 => {
-                if let Some(index) = choose_playlist("Delete which playlist?", &playlists)? {
+                if let Some(index) = choose_playlist(tr("msg.delete_which_playlist"), &playlists)? {
                     playlists.remove(index);
                     save_playlists(&playlists)?;
                 }
@@ -743,15 +849,15 @@ fn manage_playlists(library: &mut SavedLibrary) -> Result<PlayerExit> {
 
 fn create_playlist(library: &mut SavedLibrary, playlists: &mut Vec<Playlist>) -> Result<()> {
     clear_screen()?;
-    let name = clean_playlist_name(&prompt("Playlist name: ")?);
+    let name = clean_playlist_name(&prompt(tr("msg.playlist_name"))?);
     if name.is_empty() {
         return Ok(());
     }
     let Some(source) = select_menu(
-        "Playlist source",
+        tr("msg.playlist_source"),
         &[
-            "☁  Telegram channel".to_string(),
-            "♫  Local folder".to_string(),
+            format!("☁  {}", tr("msg.telegram_channel")),
+            format!("♫  {}", tr("msg.local_folder")),
         ],
     )?
     else {
@@ -778,10 +884,10 @@ fn create_playlist(library: &mut SavedLibrary, playlists: &mut Vec<Playlist>) ->
 // ponytail: local and Telegram tracks stay separate; add a source-aware unified queue when mixed playlists are requested.
 fn edit_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> Result<()> {
     let Some(source) = select_menu(
-        "Playlist source",
+        tr("msg.playlist_source"),
         &[
-            "☁  Telegram channel".to_string(),
-            "♫  Local folder".to_string(),
+            format!("☁  {}", tr("msg.telegram_channel")),
+            format!("♫  {}", tr("msg.local_folder")),
         ],
     )?
     else {
@@ -796,7 +902,7 @@ fn edit_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> Result<
 
 fn edit_telegram_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> Result<()> {
     while let Some(channel) =
-        choose_saved_channel(library, "Choose a channel to add or edit playlist songs")?
+        choose_saved_channel(library, tr("msg.choose_a_channel_to_add_or_edit_playlist"))?
     {
         let catalog = match channel_catalog(&channel) {
             Ok(catalog) => catalog,
@@ -841,7 +947,7 @@ fn edit_local_playlist(library: &mut SavedLibrary, playlist: &mut Playlist) -> R
 fn show_menu_error(error: &anyhow::Error) -> Result<()> {
     clear_screen()?;
     println!("{error:#}");
-    prompt("Press Enter to go back...")?;
+    prompt(tr("msg.press_enter_to_go_back"))?;
     Ok(())
 }
 
@@ -854,7 +960,7 @@ fn choose_playlist(title: &str, playlists: &[Playlist]) -> Result<Option<usize>>
         .map(|playlist| playlist.name.clone())
         .collect();
     let count = items.len();
-    items.push("←  Cancel".to_string());
+    items.push(format!("←  {}", tr("msg.cancel")));
     Ok(select_menu(title, &items)?.filter(|index| *index < count))
 }
 
@@ -948,16 +1054,16 @@ pub(crate) fn serialize_playlists(playlists: &[Playlist]) -> String {
 
 fn telegram_login_status() -> &'static str {
     if Path::new(SESSION_FILE).exists() && Path::new(TELEGRAM_CREDENTIALS_FILE).exists() {
-        "logged in (saved session)"
+        tr("msg.logged_in_saved_session")
     } else {
-        "not logged in"
+        tr("msg.not_logged_in")
     }
 }
 
 pub(crate) fn print_usage() {
     println!("music-terminal-player");
     println!();
-    println!("Usage:");
+    println!("{}:", tr("msg.usage"));
     println!("  music-terminal-player [--borderless]");
     println!("  music-terminal-player [--borderless] play <file-or-folder>");
     println!("  music-terminal-player login");
@@ -966,10 +1072,10 @@ pub(crate) fn print_usage() {
     println!("  music-terminal-player download <public-channel> [folder]");
     println!("  music-terminal-player youtube");
     println!();
-    println!("Controls while playing:");
-    println!("  p/Space play/pause | n next | v previous | r shuffle | l loop mode");
-    println!("  u queue | Up/Down and +/- volume 10% | Left/Right volume 1%");
-    println!("  b menu | q/Ctrl+C quit");
+    println!("{}:", tr("msg.controls_while_playing"));
+    println!("  {}", tr("msg.p_space_play_pause_n_next_v_previous"));
+    println!("  {}", tr("msg.u_queue_up_down_and_volume_10_left"));
+    println!("  {}", tr("msg.b_menu_q_ctrl_c_quit"));
     println!();
-    println!("Telegram login and streaming need TG_ID and TG_HASH from https://my.telegram.org");
+    println!("{}", tr("msg.telegram_login_and_streaming_need_tg_id_and"));
 }

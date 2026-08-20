@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+
+use crate::i18n::tr;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
 
@@ -50,9 +52,9 @@ impl LoopMode {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Off => "off",
-            Self::All => "all",
-            Self::One => "one",
+            Self::Off => tr("msg.off"),
+            Self::All => tr("msg.all"),
+            Self::One => tr("msg.one"),
         }
     }
 }
@@ -107,6 +109,8 @@ fn migrate_file(old: impl AsRef<Path>, new: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const MAX_VOLUME: f32 = 1.0;
+
 pub(crate) fn load_volume() -> f32 {
     fs::read_to_string(SETTINGS_FILE)
         .ok()
@@ -120,14 +124,14 @@ pub(crate) fn parse_volume_settings(text: &str) -> f32 {
         .and_then(|value| value.parse::<f32>().ok())
         .filter(|volume| volume.is_finite())
         .unwrap_or(0.8)
-        .clamp(0.0, 1.5)
+        .clamp(0.0, MAX_VOLUME)
 }
 
 pub(crate) fn save_volume(volume: f32) -> Result<()> {
     fs::create_dir_all(DATA_DIR)?;
     fs::write(
         SETTINGS_FILE,
-        format!("volume={:.2}\n", volume.clamp(0.0, 1.5)),
+        format!("volume={:.2}\n", volume.clamp(0.0, MAX_VOLUME)),
     )?;
     Ok(())
 }
@@ -183,6 +187,11 @@ pub(crate) fn prompt(message: &str) -> Result<String> {
     Ok(line)
 }
 
+pub(crate) fn menu_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('q')
+        || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
+}
+
 pub(crate) fn select_menu(title: &str, items: &[String]) -> Result<Option<usize>> {
     select_menu_from(title, items, 0)
 }
@@ -207,7 +216,7 @@ pub(crate) fn select_menu_from(
                 item
             ));
         }
-        frame.push_str("\r\nUp/Down select | Enter confirm | Esc back");
+        frame.push_str(tr("msg.up_down_select_enter_confirm_esc_back_q"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -215,6 +224,11 @@ pub(crate) fn select_menu_from(
         };
         if key.kind == KeyEventKind::Release {
             continue;
+        }
+        if menu_quit_key(key.code, key.modifiers) {
+            drop(_raw);
+            clear_screen()?;
+            std::process::exit(0);
         }
         match key.code {
             KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(items.len() - 1),
@@ -436,14 +450,16 @@ where
         .unwrap_or_else(|| " ".repeat(WIDTH))
     };
     let mut frame = format!(
-        "Playback queue | {} songs\r\n\r\n┌{}┬{}┬{}┐\r\n│{}│{}│{}│\r\n├{}┼{}┼{}┤\r\n",
+        "{} | {} {}\r\n\r\n┌{}┬{}┬{}┐\r\n│{}│{}│{}│\r\n├{}┼{}┼{}┤\r\n",
+        tr("msg.playback_queue"),
         queue.len(),
+        tr("msg.songs"),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
-        fit_text("Now playing", WIDTH),
-        fit_text("Next in queue", WIDTH),
-        fit_text("Next from track list", WIDTH),
+        fit_text(tr("msg.now_playing"), WIDTH),
+        fit_text(tr("msg.next_in_queue"), WIDTH),
+        fit_text(tr("msg.next_from_track_list"), WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
@@ -466,10 +482,11 @@ where
         ));
     }
     frame.push_str(&format!(
-        "└{}┴{}┴{}┘\r\n\r\n[Up/Down] select | [Enter] play | [Delete] unqueue | [a] add next | [Esc] close",
+        "└{}┴{}┴{}┘\r\n\r\n{}",
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
+        tr("msg.up_down_select_enter_play_delete_unqueue_a"),
     ));
     frame
 }
@@ -722,10 +739,14 @@ where
 
 pub(crate) fn playback_controls() -> Vec<String> {
     const CELL_WIDTH: usize = 14;
-    const CONTROLS: [[&str; 3]; 3] = [
-        ["[p] play/pause", "[v] previous", "[n] next"],
-        ["[r] shuffle", "[l] loop", "[u] queue"],
-        ["[↑/↓] volume", "[b] menu", "[q] quit"],
+    let controls = [
+        [
+            tr("msg.p_play_pause"),
+            tr("msg.v_previous"),
+            tr("msg.n_next"),
+        ],
+        [tr("msg.r_shuffle"), tr("msg.l_loop"), tr("msg.u_queue")],
+        [tr("msg.volume"), tr("msg.b_menu"), tr("msg.q_quit")],
     ];
 
     let border = |left, middle, right| {
@@ -747,11 +768,11 @@ pub(crate) fn playback_controls() -> Vec<String> {
 
     vec![
         border('┌', '┬', '┐'),
-        row(CONTROLS[0]),
+        row(controls[0]),
         border('├', '┼', '┤'),
-        row(CONTROLS[1]),
+        row(controls[1]),
         border('├', '┼', '┤'),
-        row(CONTROLS[2]),
+        row(controls[2]),
         border('└', '┴', '┘'),
     ]
 }

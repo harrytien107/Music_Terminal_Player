@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, Read};
 use std::ops::Deref;
@@ -15,9 +16,10 @@ use rodio::{OutputStream, Sink, Source};
 use serde_json::Value;
 
 use crate::audio_output::AudioOutput;
+use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_panel, format_duration,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_panel, format_duration,
     forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
     playback_controls, previous_track_index, progress_bar, prompt, restart_pass_order, save_volume,
     select_menu, select_menu_from, set_shuffle_order,
@@ -44,8 +46,18 @@ const SPONSORBLOCK_CATEGORIES: [SponsorBlockCategory; 6] = [
 ];
 const YT_DLP_DOWNLOAD_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+const YT_DLP_RELEASE_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 const FFMPEG_DOWNLOAD_URL: &str =
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+const FFMPEG_VERSION_URL: &str =
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.ver";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackInterruption {
+    AudioOutput,
+    Resume,
+    Stream,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SponsorBlockCategory {
@@ -96,6 +108,12 @@ struct YouTubeTrack {
 pub(crate) struct YouTubeTools {
     pub(crate) yt_dlp: String,
     pub(crate) ffmpeg: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ToolUpdateVersions {
+    yt_dlp: Option<String>,
+    ffmpeg: Option<String>,
 }
 
 type SharedChild = Arc<Mutex<Child>>;
@@ -201,6 +219,33 @@ fn playback_ended_early(elapsed: Duration, duration: Option<Duration>) -> bool {
     duration.is_some_and(|total| elapsed.saturating_add(TRACK_END_TOLERANCE) < total)
 }
 
+fn playback_interruption(
+    audio_lost: bool,
+    resumed: bool,
+    stream_ended_early: bool,
+) -> Option<PlaybackInterruption> {
+    if audio_lost {
+        Some(PlaybackInterruption::AudioOutput)
+    } else if resumed {
+        Some(PlaybackInterruption::Resume)
+    } else if stream_ended_early {
+        Some(PlaybackInterruption::Stream)
+    } else {
+        None
+    }
+}
+
+fn recovery_message(interruption: PlaybackInterruption, stream_failures: usize) -> &'static str {
+    match interruption {
+        PlaybackInterruption::AudioOutput => "Audio output disconnected. Reconnecting...",
+        PlaybackInterruption::Resume => "System resumed. Reconnecting playback...",
+        PlaybackInterruption::Stream if stream_failures >= 3 => {
+            "YouTube stream unavailable. Press p/Space to retry or choose another track."
+        }
+        PlaybackInterruption::Stream => "YouTube stream interrupted. Resolving a fresh stream...",
+    }
+}
+
 fn seek_target(elapsed: Duration, duration: Option<Duration>, forward: bool) -> Duration {
     if forward {
         let target = elapsed.saturating_add(SEEK_STEP);
@@ -222,12 +267,12 @@ fn stepped_rate(rate: f32, increase: bool) -> f32 {
 pub(crate) fn play_youtube() -> Result<PlayerExit> {
     loop {
         let items = vec![
-            "▶  Play YouTube URL or playlist".to_string(),
-            "✓  SponsorBlock categories".to_string(),
-            "⚙  YouTube tools and updater".to_string(),
-            "←  Back".to_string(),
+            format!("▶  {}", tr("msg.play_youtube_url_or_playlist")),
+            format!("✓  {}", tr("msg.sponsorblock_categories")),
+            format!("⚙  {}", tr("msg.youtube_tools_and_updater")),
+            format!("←  {}", tr("msg.back")),
         ];
-        match select_menu("YouTube audio", &items)? {
+        match select_menu(tr("msg.youtube_audio"), &items)? {
             Some(0) => {
                 let tools = load_or_prompt_tools()?;
                 let tracks = prompt_and_resolve_tracks(&tools)?;
@@ -316,14 +361,18 @@ fn manage_sponsorblock_categories() -> Result<()> {
             .map(|(category, enabled)| {
                 format!(
                     "{:<9}  {}",
-                    if enabled { "Auto skip" } else { "No skip" },
+                    if enabled {
+                        tr("msg.auto_skip")
+                    } else {
+                        tr("msg.no_skip")
+                    },
                     category.label
                 )
             })
             .collect();
-        items.push("←  Back".to_string());
+        items.push(format!("←  {}", tr("msg.back")));
 
-        match select_menu_from("SponsorBlock categories", &items, selected)? {
+        match select_menu_from(tr("msg.sponsorblock_categories"), &items, selected)? {
             Some(index) if index < SPONSORBLOCK_CATEGORIES.len() => {
                 settings.enabled[index] = !settings.enabled[index];
                 save_sponsorblock_settings(&settings)?;
@@ -335,22 +384,26 @@ fn manage_sponsorblock_categories() -> Result<()> {
 }
 
 fn load_or_prompt_tools() -> Result<YouTubeTools> {
-    if let Ok(text) = fs::read_to_string(TOOLS_FILE) {
-        if let Some(tools) = parse_youtube_tools(&text) {
-            if validate_tool(&tools.yt_dlp, "--version").is_ok()
-                && validate_tool(&tools.ffmpeg, "-version").is_ok()
-            {
-                return Ok(tools);
-            }
+    if let Ok(text) = fs::read_to_string(TOOLS_FILE)
+        && let Some(tools) = parse_youtube_tools(&text)
+    {
+        let tools = repair_portable_tool_paths(tools)?;
+        if validate_tool(&tools.yt_dlp, "--version").is_ok()
+            && validate_tool(&tools.ffmpeg, "-version").is_ok()
+        {
+            return Ok(tools);
         }
     }
 
     let items = vec![
-        "↓  Download portable yt-dlp and FFmpeg".to_string(),
-        "⌕  Use existing yt-dlp and FFmpeg installations".to_string(),
-        "←  Back".to_string(),
+        format!("↓  {}", tr("msg.download_portable_yt_dlp_and_ffmpeg")),
+        format!(
+            "⌕  {}",
+            tr("msg.use_existing_yt_dlp_and_ffmpeg_installations")
+        ),
+        format!("←  {}", tr("msg.back")),
     ];
-    let tools = match select_menu("YouTube direct-stream setup", &items)? {
+    let tools = match select_menu(tr("msg.youtube_direct_stream_setup"), &items)? {
         Some(0) => download_portable_tools()?,
         Some(1) => prompt_existing_tools()?,
         Some(2) | None => bail!("YouTube setup cancelled"),
@@ -369,10 +422,13 @@ fn load_or_prompt_tools() -> Result<YouTubeTools> {
 
 fn prompt_existing_tools() -> Result<YouTubeTools> {
     clear_screen()?;
-    println!("Enter existing executable paths. Command names on PATH also work.\n");
+    println!(
+        "{}\n",
+        tr("msg.enter_existing_executable_paths_command_names_on_path")
+    );
     let tools = YouTubeTools {
-        yt_dlp: normalize_executable_input(&prompt("yt-dlp executable path: ")?),
-        ffmpeg: normalize_executable_input(&prompt("FFmpeg executable path: ")?),
+        yt_dlp: normalize_executable_input(&prompt(tr("msg.yt_dlp_executable_path"))?),
+        ffmpeg: normalize_executable_input(&prompt(tr("msg.ffmpeg_executable_path"))?),
     };
     if tools.yt_dlp.is_empty() || tools.ffmpeg.is_empty() {
         bail!("both yt-dlp and FFmpeg executable paths are required");
@@ -394,15 +450,18 @@ fn download_portable_tools() -> Result<YouTubeTools> {
     let extracted = tools_dir.join("ffmpeg-extracted");
 
     clear_screen()?;
-    println!("Downloading portable yt-dlp...");
+    println!("{}", tr("msg.downloading_portable_yt_dlp"));
     download_file(YT_DLP_DOWNLOAD_URL, &yt_dlp)?;
-    println!("Downloading portable FFmpeg (this is a large download)...");
+    println!(
+        "{}",
+        tr("msg.downloading_portable_ffmpeg_this_is_a_large_download")
+    );
     download_file(FFMPEG_DOWNLOAD_URL, &archive)?;
     if extracted.exists() {
         fs::remove_dir_all(&extracted)?;
     }
     fs::create_dir_all(&extracted)?;
-    println!("Extracting FFmpeg...");
+    println!("{}", tr("msg.extracting_ffmpeg"));
     let status = Command::new("tar.exe")
         .args(["-xf"])
         .arg(&archive)
@@ -490,6 +549,111 @@ fn tool_version(executable: &str, version_argument: &str) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+fn installed_version(version_output: &str, tool: &str) -> String {
+    if version_output == "unavailable" {
+        return version_output.to_string();
+    }
+    match tool {
+        "FFmpeg" => version_output
+            .strip_prefix("ffmpeg version ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or(version_output)
+            .trim_end_matches("-essentials_build-www.gyan.dev")
+            .to_string(),
+        _ => version_output.trim().to_string(),
+    }
+}
+
+fn version_numbers(version: &str) -> Vec<u64> {
+    version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+fn compare_versions(installed: &str, latest: &str) -> Ordering {
+    let installed = version_numbers(installed);
+    let latest = version_numbers(latest);
+    let length = installed.len().max(latest.len());
+    (0..length)
+        .map(|index| {
+            installed
+                .get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&latest.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}
+
+fn update_status(installed: &str, latest: Option<&str>, checked: bool) -> String {
+    let Some(latest) = latest else {
+        return if checked {
+            tr("msg.unable_to_check").to_string()
+        } else {
+            tr("msg.not_checked").to_string()
+        };
+    };
+    if installed == "unavailable" {
+        return format!(
+            "{} {latest}; {}",
+            tr("msg.latest"),
+            tr("msg.installed_version_unavailable")
+        );
+    }
+    match compare_versions(installed, latest) {
+        Ordering::Less => format!("{}: {latest}", tr("msg.update_available")),
+        Ordering::Equal => tr("msg.latest").to_string(),
+        Ordering::Greater => format!("{} {latest}", tr("msg.newer_than_stable")),
+    }
+}
+
+fn fetch_update_text(url: &str) -> Result<String> {
+    let output = Command::new("curl.exe")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--user-agent",
+            "Music-Terminal-Player",
+        ])
+        .arg(url)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to check {url}"))?;
+    if !output.status.success() {
+        bail!(
+            "update check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_yt_dlp_release(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("tag_name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn check_tool_updates() -> ToolUpdateVersions {
+    ToolUpdateVersions {
+        yt_dlp: fetch_update_text(YT_DLP_RELEASE_API)
+            .ok()
+            .and_then(|text| parse_yt_dlp_release(&text)),
+        ffmpeg: fetch_update_text(FFMPEG_VERSION_URL)
+            .ok()
+            .filter(|version| !version.is_empty()),
+    }
+}
+
 fn comparable_path(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -513,11 +677,95 @@ fn is_portable_yt_dlp(yt_dlp: &str, executable: &Path) -> bool {
     })
 }
 
+fn is_portable_ffmpeg(ffmpeg: &str, executable: &Path) -> bool {
+    executable.parent().is_some_and(|directory| {
+        comparable_path(Path::new(ffmpeg))
+            == comparable_path(&directory.join("tools").join("ffmpeg.exe"))
+    })
+}
+
+fn portable_tool_pair(tools: &YouTubeTools) -> bool {
+    let yt_dlp = Path::new(&tools.yt_dlp);
+    let ffmpeg = Path::new(&tools.ffmpeg);
+    yt_dlp
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("yt-dlp.exe"))
+        && ffmpeg
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ffmpeg.exe"))
+        && yt_dlp.parent().is_some_and(|directory| {
+            directory
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("tools"))
+                && ffmpeg.parent().is_some_and(|ffmpeg_directory| {
+                    comparable_path(directory) == comparable_path(ffmpeg_directory)
+                })
+        })
+}
+
+fn relocated_portable_tools(tools: &YouTubeTools, executable: &Path) -> Option<YouTubeTools> {
+    let directory = executable.parent()?;
+    if !portable_tool_pair(tools) {
+        return None;
+    }
+    let tools_dir = directory.join("tools");
+    let relocated = YouTubeTools {
+        yt_dlp: tools_dir.join("yt-dlp.exe").to_string_lossy().into_owned(),
+        ffmpeg: tools_dir.join("ffmpeg.exe").to_string_lossy().into_owned(),
+    };
+    (comparable_path(Path::new(&tools.yt_dlp)) != comparable_path(Path::new(&relocated.yt_dlp))
+        && (Path::new(&relocated.yt_dlp).exists() || Path::new(&relocated.ffmpeg).exists()))
+    .then_some(relocated)
+}
+
+fn repair_portable_tool_paths(tools: YouTubeTools) -> Result<YouTubeTools> {
+    let executable = std::env::current_exe().context("failed to locate the player executable")?;
+    let Some(relocated) = relocated_portable_tools(&tools, &executable) else {
+        return Ok(tools);
+    };
+    fs::create_dir_all(DATA_DIR)?;
+    fs::write(TOOLS_FILE, serialize_youtube_tools(&relocated))?;
+    Ok(relocated)
+}
+
 fn portable_yt_dlp_update_paths(yt_dlp: &Path) -> (PathBuf, PathBuf) {
     (
         yt_dlp.with_extension("exe.download"),
         yt_dlp.with_extension("exe.backup"),
     )
+}
+
+fn portable_ffmpeg_update_paths(ffmpeg: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let directory = ffmpeg.parent().unwrap_or_else(|| Path::new("."));
+    (
+        directory.join("ffmpeg.zip"),
+        directory.join("ffmpeg-extracted"),
+        ffmpeg.with_extension("exe.download"),
+        ffmpeg.with_extension("exe.backup"),
+    )
+}
+
+fn install_staged_tool(
+    target: &Path,
+    download: &Path,
+    backup: &Path,
+    tool_name: &str,
+) -> Result<()> {
+    let had_existing = target.exists();
+    if had_existing {
+        fs::rename(target, backup)
+            .with_context(|| format!("failed to back up portable {tool_name}"))?;
+    }
+    if let Err(error) = fs::rename(download, target) {
+        if had_existing {
+            let _ = fs::rename(backup, target);
+        }
+        let _ = fs::remove_file(download);
+        return Err(error)
+            .with_context(|| format!("failed to install portable {tool_name} update"));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
 }
 
 fn update_portable_yt_dlp(yt_dlp: &Path) -> Result<()> {
@@ -532,53 +780,171 @@ fn update_portable_yt_dlp(yt_dlp: &Path) -> Result<()> {
         return Err(error).context("downloaded yt-dlp failed validation");
     }
 
-    fs::rename(yt_dlp, &backup).context("failed to back up portable yt-dlp")?;
-    if let Err(error) = fs::rename(&download, yt_dlp) {
-        let _ = fs::rename(&backup, yt_dlp);
-        let _ = fs::remove_file(&download);
-        return Err(error).context("failed to install portable yt-dlp update");
+    install_staged_tool(yt_dlp, &download, &backup, "yt-dlp")
+}
+
+fn update_portable_ffmpeg(ffmpeg: &Path) -> Result<()> {
+    let (archive, extracted, download, backup) = portable_ffmpeg_update_paths(ffmpeg);
+    let _ = fs::remove_file(&archive);
+    let _ = fs::remove_dir_all(&extracted);
+    let _ = fs::remove_file(&download);
+    let _ = fs::remove_file(&backup);
+
+    download_file(FFMPEG_DOWNLOAD_URL, &archive)?;
+    fs::create_dir_all(&extracted)?;
+    let status = Command::new("tar.exe")
+        .args(["-xf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&extracted)
+        .status()
+        .context("Windows tar.exe is required to extract portable FFmpeg")?;
+    if !status.success() {
+        let _ = fs::remove_file(&archive);
+        let _ = fs::remove_dir_all(&extracted);
+        bail!("failed to extract the FFmpeg archive");
     }
-    let _ = fs::remove_file(backup);
-    Ok(())
+
+    let extracted_ffmpeg = find_file(&extracted, "ffmpeg.exe")?
+        .context("the FFmpeg archive did not contain ffmpeg.exe")?;
+    fs::copy(extracted_ffmpeg, &download).context("failed to stage portable FFmpeg update")?;
+    let _ = fs::remove_file(&archive);
+    let _ = fs::remove_dir_all(&extracted);
+
+    let downloaded = download.to_string_lossy();
+    if let Err(error) = validate_tool(downloaded.as_ref(), "-version") {
+        let _ = fs::remove_file(&download);
+        return Err(error).context("downloaded FFmpeg failed validation");
+    }
+
+    install_staged_tool(ffmpeg, &download, &backup, "FFmpeg")
 }
 
 fn manage_youtube_tools() -> Result<()> {
-    let tools = load_or_prompt_tools()?;
+    let tools = match fs::read_to_string(TOOLS_FILE)
+        .ok()
+        .and_then(|text| parse_youtube_tools(&text))
+        .map(repair_portable_tool_paths)
+        .transpose()?
+    {
+        Some(tools) => tools,
+        None => load_or_prompt_tools()?,
+    };
+    let mut updates: Option<ToolUpdateVersions> = None;
     loop {
         let executable =
             std::env::current_exe().context("failed to locate the player executable")?;
-        let portable = is_portable_yt_dlp(&tools.yt_dlp, &executable);
+        let portable_yt_dlp = is_portable_yt_dlp(&tools.yt_dlp, &executable);
+        let portable_ffmpeg = is_portable_ffmpeg(&tools.ffmpeg, &executable);
+        let yt_dlp_version = installed_version(&tool_version(&tools.yt_dlp, "--version"), "yt-dlp");
+        let ffmpeg_version = installed_version(&tool_version(&tools.ffmpeg, "-version"), "FFmpeg");
+        let checked = updates.is_some();
         let title = format!(
-            "YouTube tools\nyt-dlp: {}\nFFmpeg: {}\nUpdater: {}",
-            tool_version(&tools.yt_dlp, "--version"),
-            tool_version(&tools.ffmpeg, "-version"),
-            if portable {
-                "portable stable channel"
+            "{}\nyt-dlp: {} ({})\nFFmpeg: {} ({})\n{}: {}",
+            tr("msg.youtube_tools"),
+            yt_dlp_version,
+            update_status(
+                &yt_dlp_version,
+                updates
+                    .as_ref()
+                    .and_then(|versions| versions.yt_dlp.as_deref()),
+                checked,
+            ),
+            ffmpeg_version,
+            update_status(
+                &ffmpeg_version,
+                updates
+                    .as_ref()
+                    .and_then(|versions| versions.ffmpeg.as_deref()),
+                checked,
+            ),
+            tr("msg.updater"),
+            if portable_yt_dlp || portable_ffmpeg {
+                tr("msg.portable_stable_channels")
             } else {
-                "disabled for external/PATH installation"
+                tr("msg.disabled_for_external_path_installations")
             }
         );
         let items = vec![
-            "↓  Update portable yt-dlp (stable)".to_string(),
-            "←  Back".to_string(),
+            format!("⌕  {}", tr("msg.check_for_tool_updates")),
+            format!("↓  {}", tr("msg.update_portable_yt_dlp_stable")),
+            format!("↓  {}", tr("msg.update_portable_ffmpeg_gyan_essentials")),
+            format!("↓  {}", tr("msg.update_both_portable_tools")),
+            format!("←  {}", tr("msg.back")),
         ];
         match select_menu(&title, &items)? {
-            Some(0) if portable => {
-                clear_screen()?;
-                println!("Downloading the latest stable portable yt-dlp...");
-                update_portable_yt_dlp(Path::new(&tools.yt_dlp))?;
-                println!("yt-dlp updated successfully.");
-                prompt("Press Enter to go back...")?;
-            }
             Some(0) => {
                 clear_screen()?;
+                println!("{}", tr("msg.checking_stable_yt_dlp_and_ffmpeg_versions"));
+                updates = Some(check_tool_updates());
+            }
+            Some(1) if portable_yt_dlp => {
+                clear_screen()?;
                 println!(
-                    "This updater only manages the application-relative tools\\yt-dlp.exe.\nConfigured yt-dlp: {}",
+                    "{}",
+                    tr("msg.downloading_the_latest_stable_portable_yt_dlp")
+                );
+                update_portable_yt_dlp(Path::new(&tools.yt_dlp))?;
+                updates = Some(check_tool_updates());
+                println!("{}", tr("msg.yt_dlp_updated_successfully"));
+                prompt(tr("msg.press_enter_to_go_back"))?;
+            }
+            Some(1) => {
+                clear_screen()?;
+                println!(
+                    "{}\n{}: {}",
+                    tr("msg.this_updater_only_manages_the_application_relative_tools"),
+                    tr("msg.configured_yt_dlp"),
                     tools.yt_dlp
                 );
-                prompt("Press Enter to go back...")?;
+                prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(1) | None => return Ok(()),
+            Some(2) if portable_ffmpeg => {
+                clear_screen()?;
+                println!(
+                    "{}",
+                    tr("msg.downloading_the_latest_portable_ffmpeg_essentials_build")
+                );
+                update_portable_ffmpeg(Path::new(&tools.ffmpeg))?;
+                updates = Some(check_tool_updates());
+                println!("{}", tr("msg.ffmpeg_updated_successfully"));
+                prompt(tr("msg.press_enter_to_go_back"))?;
+            }
+            Some(2) => {
+                clear_screen()?;
+                println!(
+                    "{}\n{}: {}",
+                    tr("msg.this_updater_only_manages_the_application_relative_tools_2"),
+                    tr("msg.configured_ffmpeg"),
+                    tools.ffmpeg
+                );
+                prompt(tr("msg.press_enter_to_go_back"))?;
+            }
+            Some(3) if portable_yt_dlp && portable_ffmpeg => {
+                clear_screen()?;
+                println!(
+                    "{}",
+                    tr("msg.downloading_the_latest_stable_portable_yt_dlp")
+                );
+                update_portable_yt_dlp(Path::new(&tools.yt_dlp))?;
+                println!(
+                    "{}",
+                    tr("msg.downloading_the_latest_portable_ffmpeg_essentials_build")
+                );
+                update_portable_ffmpeg(Path::new(&tools.ffmpeg))?;
+                updates = Some(check_tool_updates());
+                println!("{}", tr("msg.yt_dlp_and_ffmpeg_updated_successfully"));
+                prompt(tr("msg.press_enter_to_go_back"))?;
+            }
+            Some(3) => {
+                clear_screen()?;
+                println!(
+                    "{}",
+                    tr("msg.updating_both_requires_application_relative_tools_yt_dlp")
+                );
+                prompt(tr("msg.press_enter_to_go_back"))?;
+            }
+            Some(4) | None => return Ok(()),
             _ => unreachable!(),
         }
     }
@@ -607,9 +973,10 @@ pub(crate) fn serialize_youtube_tools(tools: &YouTubeTools) -> String {
 fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> {
     clear_screen()?;
     println!(
-        "YouTube audio\nTutor: Paste one URL, multiple space-separated URLs (https://... https://), or a playlist URL."
+        "{}",
+        tr("msg.youtube_audio_tutor_paste_one_url_multiple_space")
     );
-    let input = prompt("URL(s): ")?;
+    let input = prompt(tr("msg.url_s"))?;
     let urls = parse_youtube_urls(&input)?;
     if urls.is_empty() {
         return Ok(Vec::new());
@@ -649,7 +1016,10 @@ pub(crate) fn parse_youtube_urls(input: &str) -> Result<Vec<String>> {
 
 fn resolve_tracks(tools: &YouTubeTools, urls: &[String]) -> Result<Vec<YouTubeTrack>> {
     clear_screen()?;
-    println!("Resolving YouTube video and playlist metadata...");
+    println!(
+        "{}",
+        tr("msg.resolving_youtube_video_and_playlist_metadata")
+    );
     let output = Command::new(&tools.yt_dlp)
         .args([
             "--no-warnings",
@@ -692,12 +1062,16 @@ fn parse_youtube_track_line(line: &str) -> Option<YouTubeTrack> {
                 .is_finite()
                 .then(|| Duration::from_secs_f64(seconds.max(0.0)))
         });
-    if video_id.is_empty() || webpage_url.is_empty() || title.is_empty() {
+    if video_id.is_empty() || webpage_url.is_empty() {
         return None;
     }
     Some(YouTubeTrack {
         video_id: video_id.to_string(),
-        title: title.to_string(),
+        title: if title.is_empty() {
+            format!("YouTube video {video_id}")
+        } else {
+            title.to_string()
+        },
         webpage_url: webpage_url.to_string(),
         duration,
         sponsor_segments: None,
@@ -710,11 +1084,19 @@ fn youtube_stream_format() -> &'static str {
     "18/bestaudio/best"
 }
 
+fn youtube_extractor_args() -> &'static str {
+    // ponytail: Android currently avoids rejected ANDROID_VR stream signatures. Add client fallback
+    // probing if YouTube starts varying working clients by video or account.
+    "youtube:player_client=android"
+}
+
 fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<String> {
     let output = Command::new(&tools.yt_dlp)
         .args([
             "--no-warnings",
             "--no-playlist",
+            "--extractor-args",
+            youtube_extractor_args(),
             "--format",
             youtube_stream_format(),
             "--get-url",
@@ -972,6 +1354,7 @@ fn play_youtube_tracks(
     let categories_json = sponsorblock_categories_json(sponsor_settings);
     let mut sponsor_enabled = categories_json != "[]";
     let mut last_skipped = None;
+    let mut stream_failures = 0usize;
     cache_sponsor_segments(&mut tracks[index], &categories_json);
     let mut playback = start_track(output.stream(), tools, &tracks[index], volume, rate)?;
     let mut resumed_from_suspend = false;
@@ -980,63 +1363,71 @@ fn play_youtube_tracks(
 
     loop {
         let elapsed = playback.elapsed(tracks[index].duration);
-        let interrupted = output.is_lost()
-            || resumed_from_suspend
-            || (playback.empty() && playback_ended_early(elapsed, tracks[index].duration));
+        let stream_ended_early =
+            playback.empty() && playback_ended_early(elapsed, tracks[index].duration);
+        if stream_ended_early {
+            stream_failures += 1;
+        } else if elapsed >= Duration::from_secs(2) {
+            stream_failures = 0;
+        }
+        let interruption =
+            playback_interruption(output.is_lost(), resumed_from_suspend, stream_ended_early);
         resumed_from_suspend = false;
-        if interrupted {
+        if let Some(mut interruption) = interruption {
             let mut offset = elapsed;
             let mut paused = playback.is_paused();
             let mut changed_track = false;
             playback.stop();
             media_controls.set_playing(false);
-            draw_panel(
-                &mut stdout,
-                "Music Terminal Player · YouTube",
-                &[
-                    format!(
-                        "Track {}/{} | {}",
-                        index + 1,
-                        tracks.len(),
-                        tracks[index].title
-                    ),
-                    String::new(),
-                    "Playback interrupted. Reconnecting audio output...".to_string(),
-                    "[p/Space] pause state · [n/v] track · [b] back · [q] quit".to_string(),
-                ],
-            )?;
             loop {
-                if let Ok(replacement_output) = AudioOutput::open() {
-                    let replacement_playback = if changed_track {
-                        start_track(
-                            replacement_output.stream(),
-                            tools,
-                            &tracks[index],
-                            volume,
-                            rate,
-                        )
-                        .map(|replacement| {
-                            if paused {
-                                replacement.pause();
-                            }
-                            replacement
-                        })
-                    } else {
-                        resolve_audio_url(tools, &tracks[index]).and_then(|media_url| {
-                            playback_from_url(
-                                replacement_output.stream(),
-                                tools,
-                                media_url,
-                                volume,
-                                offset,
-                                rate,
-                                paused,
+                draw_panel(
+                    &mut stdout,
+                    "Music Terminal Player · YouTube",
+                    &[
+                        format!(
+                            "Track {}/{} | {}",
+                            index + 1,
+                            tracks.len(),
+                            tracks[index].title
+                        ),
+                        String::new(),
+                        recovery_message(interruption, stream_failures).to_string(),
+                        "[p/Space] pause/retry · [n/v] track · [b] back · [q] quit".to_string(),
+                    ],
+                )?;
+
+                let can_retry = interruption != PlaybackInterruption::Stream || stream_failures < 3;
+                if can_retry {
+                    let replacement_playback = |stream: &OutputStream| {
+                        if changed_track {
+                            start_track(stream, tools, &tracks[index], volume, rate).inspect(
+                                |replacement| {
+                                    if paused {
+                                        replacement.pause();
+                                    }
+                                },
                             )
-                        })
+                        } else {
+                            resolve_audio_url(tools, &tracks[index]).and_then(|media_url| {
+                                playback_from_url(
+                                    stream, tools, media_url, volume, offset, rate, paused,
+                                )
+                            })
+                        }
                     };
-                    if let Ok(replacement_playback) = replacement_playback {
+
+                    if interruption == PlaybackInterruption::Stream {
+                        if let Ok(replacement) = replacement_playback(output.stream()) {
+                            playback = replacement;
+                            media_controls.set_track(&tracks[index].title, "YouTube");
+                            media_controls.set_playing(!paused);
+                            break;
+                        }
+                    } else if let Ok(replacement_output) = AudioOutput::open()
+                        && let Ok(replacement) = replacement_playback(replacement_output.stream())
+                    {
                         output = replacement_output;
-                        playback = replacement_playback;
+                        playback = replacement;
                         media_controls.set_track(&tracks[index].title, "YouTube");
                         media_controls.set_playing(!paused);
                         break;
@@ -1065,6 +1456,8 @@ fn play_youtube_tracks(
                             }
                             index = next;
                             changed_track = true;
+                            interruption = PlaybackInterruption::Stream;
+                            stream_failures = 0;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
                             last_skipped = None;
@@ -1074,6 +1467,8 @@ fn play_youtube_tracks(
                             index =
                                 previous_track_index(index, tracks.len(), &mut resume_after_replay);
                             changed_track = true;
+                            interruption = PlaybackInterruption::Stream;
+                            stream_failures = 0;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
                             last_skipped = None;
@@ -1092,6 +1487,9 @@ fn play_youtube_tracks(
                     match key.code {
                         KeyCode::Char('q') => return Ok(PlayerExit::Quit),
                         KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
+                        KeyCode::Char('p') | KeyCode::Char(' ') if stream_failures >= 3 => {
+                            stream_failures = 0;
+                        }
                         KeyCode::Char('p') | KeyCode::Char(' ') => paused = !paused,
                         KeyCode::Char('n') => {
                             let Some((next, new_pass, advance_queue)) = forward_track_index(
@@ -1111,6 +1509,8 @@ fn play_youtube_tracks(
                             }
                             index = next;
                             changed_track = true;
+                            interruption = PlaybackInterruption::Stream;
+                            stream_failures = 0;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
                             last_skipped = None;
@@ -1120,6 +1520,8 @@ fn play_youtube_tracks(
                             index =
                                 previous_track_index(index, tracks.len(), &mut resume_after_replay);
                             changed_track = true;
+                            interruption = PlaybackInterruption::Stream;
+                            stream_failures = 0;
                             cache_sponsor_segments(&mut tracks[index], &categories_json);
                             offset = Duration::ZERO;
                             last_skipped = None;
@@ -1343,7 +1745,7 @@ fn play_youtube_tracks(
                 restart_playback(&mut playback, output.stream(), tools, volume, target, rate)?;
             }
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
-                volume = (volume + 0.10).min(1.5);
+                volume = (volume + 0.10).min(MAX_VOLUME);
                 playback.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -1460,9 +1862,9 @@ fn draw_youtube_player(
     sponsor_enabled: bool,
 ) -> Result<()> {
     let state = if playback.is_paused() {
-        "paused"
+        tr("msg.paused")
     } else {
-        "playing"
+        tr("msg.playing")
     };
     let duration = tracks[index].duration;
     let elapsed = playback.elapsed(duration);
@@ -1471,7 +1873,8 @@ fn draw_youtube_player(
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
         format!(
-            "Track {}/{} | {}",
+            "{} {}/{} | {}",
+            tr("msg.track"),
             index + 1,
             tracks.len(),
             tracks[index].title
@@ -1484,16 +1887,23 @@ fn draw_youtube_player(
             total
         ),
         format!(
-            "{} · {:.0}% · {:.2}x · shuffle {} · loop {}",
+            "{} · {:.0}% · {:.2}x · {} {} · {} {}",
             state,
             volume * 100.0,
             playback.rate,
-            if shuffle { "on" } else { "off" },
+            tr("msg.shuffle"),
+            if shuffle { tr("msg.on") } else { tr("msg.off") },
+            tr("msg.loop"),
             loop_mode.label(),
         ),
         format!(
-            "SponsorBlock {} · [a] add next URL or playlist",
-            if sponsor_enabled { "on" } else { "off" }
+            "SponsorBlock {} · {}",
+            if sponsor_enabled {
+                tr("msg.on")
+            } else {
+                tr("msg.off")
+            },
+            tr("msg.a_add_next_url_or_playlist")
         ),
     ];
     rows.extend(youtube_playback_controls());
@@ -1505,7 +1915,7 @@ fn youtube_playback_controls() -> Vec<String> {
     rows.pop();
     rows.extend([
         "├────────────────┼────────────────┼────────────────┤".to_string(),
-        "│ [←/→] seek 10s │ [,/.] ±0.25x   │ [s] sponsors   │".to_string(),
+        tr("msg.seek_10s_0_25x_s_sponsors").to_string(),
         "└────────────────┴────────────────┴────────────────┘".to_string(),
     ]);
     rows
@@ -1513,16 +1923,20 @@ fn youtube_playback_controls() -> Vec<String> {
 
 #[cfg(test)]
 mod youtube_tests {
+    use std::fs;
     use std::path::Path;
     use std::time::Duration;
 
     use super::{
-        SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment, is_portable_yt_dlp,
-        logical_elapsed, parse_sponsor_segments, parse_sponsorblock_settings,
-        parse_youtube_track_line, playback_ended_early, portable_yt_dlp_update_paths,
+        PlaybackInterruption, SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment,
+        YouTubeTools, compare_versions, install_staged_tool, installed_version, is_portable_ffmpeg,
+        is_portable_yt_dlp, logical_elapsed, parse_sponsor_segments, parse_sponsorblock_settings,
+        parse_youtube_track_line, parse_yt_dlp_release, playback_ended_early,
+        playback_interruption, portable_ffmpeg_update_paths, portable_tool_pair,
+        portable_yt_dlp_update_paths, recovery_message, relocated_portable_tools,
         resume_gap_detected, seek_target, serialize_sponsorblock_settings, sponsor_skip_target,
-        sponsorblock_categories_json, stepped_rate, youtube_playback_controls,
-        youtube_stream_format,
+        sponsorblock_categories_json, stepped_rate, update_status, youtube_extractor_args,
+        youtube_playback_controls, youtube_stream_format,
     };
 
     #[test]
@@ -1536,6 +1950,12 @@ mod youtube_tests {
         let live =
             parse_youtube_track_line("live\thttps://youtu.be/live\tLive stream\tNA").unwrap();
         assert_eq!(live.duration, None);
+
+        let untitled = parse_youtube_track_line(
+            "l-vSSYEuO88\thttps://www.youtube.com/watch?v=l-vSSYEuO88\t\t8707",
+        )
+        .unwrap();
+        assert_eq!(untitled.title, "YouTube video l-vSSYEuO88");
     }
 
     #[test]
@@ -1578,8 +1998,21 @@ mod youtube_tests {
     }
 
     #[test]
-    fn youtube_stream_prefers_seekable_progressive_mp4() {
+    fn youtube_stream_uses_android_client_and_classifies_recovery() {
         assert_eq!(youtube_stream_format(), "18/bestaudio/best");
+        assert_eq!(youtube_extractor_args(), "youtube:player_client=android");
+        assert_eq!(
+            playback_interruption(false, false, true),
+            Some(PlaybackInterruption::Stream)
+        );
+        assert_eq!(
+            recovery_message(PlaybackInterruption::Stream, 3),
+            "YouTube stream unavailable. Press p/Space to retry or choose another track."
+        );
+        assert_eq!(
+            playback_interruption(true, false, true),
+            Some(PlaybackInterruption::AudioOutput)
+        );
     }
 
     #[test]
@@ -1642,19 +2075,147 @@ mod youtube_tests {
     }
 
     #[test]
-    fn updater_only_accepts_executable_relative_portable_yt_dlp() {
+    fn tool_update_versions_parse_compare_and_report_status() {
+        assert_eq!(
+            parse_yt_dlp_release(r#"{"tag_name":"2026.07.04"}"#).as_deref(),
+            Some("2026.07.04")
+        );
+        assert_eq!(parse_yt_dlp_release("invalid"), None);
+        assert_eq!(
+            installed_version(
+                "ffmpeg version 9.0.1-essentials_build-www.gyan.dev Copyright FFmpeg",
+                "FFmpeg",
+            ),
+            "9.0.1"
+        );
+        assert_eq!(installed_version("2026.07.04\n", "yt-dlp"), "2026.07.04");
+
+        assert_eq!(
+            compare_versions("2026.07.03", "2026.07.04"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("9.0.1", "8.1.2"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("1.0.1", "1"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("1.0", "1"), std::cmp::Ordering::Equal);
+
+        assert_eq!(update_status("8.1.2", None, false), "not checked");
+        assert_eq!(update_status("8.1.2", None, true), "unable to check");
+        assert_eq!(update_status("9.0.1", Some("9.0.1"), true), "latest");
+        assert_eq!(
+            update_status("8.1.2", Some("9.0.1"), true),
+            "update available: 9.0.1"
+        );
+        assert_eq!(
+            update_status("9.1", Some("9.0.1"), true),
+            "newer than stable 9.0.1"
+        );
+        assert_eq!(
+            update_status("unavailable", Some("9.0.1"), true),
+            "latest 9.0.1; installed version unavailable"
+        );
+    }
+
+    #[test]
+    fn updater_only_accepts_executable_relative_portable_tools() {
         let executable = Path::new(r"C:\Player\music-terminal-player.exe");
         assert!(is_portable_yt_dlp(
             r"C:\Player\tools\yt-dlp.exe",
             executable
         ));
+        assert!(is_portable_ffmpeg(
+            r"C:\Player\tools\ffmpeg.exe",
+            executable
+        ));
         assert!(!is_portable_yt_dlp("yt-dlp", executable));
+        assert!(!is_portable_ffmpeg("ffmpeg", executable));
         assert!(!is_portable_yt_dlp(r"C:\Other\yt-dlp.exe", executable));
+        assert!(!is_portable_ffmpeg(r"C:\Other\ffmpeg.exe", executable));
 
         let (download, backup) =
             portable_yt_dlp_update_paths(Path::new(r"C:\Player\tools\yt-dlp.exe"));
         assert_eq!(download, Path::new(r"C:\Player\tools\yt-dlp.exe.download"));
         assert_eq!(backup, Path::new(r"C:\Player\tools\yt-dlp.exe.backup"));
+
+        let (archive, extracted, download, backup) =
+            portable_ffmpeg_update_paths(Path::new(r"C:\Player\tools\ffmpeg.exe"));
+        assert_eq!(archive, Path::new(r"C:\Player\tools\ffmpeg.zip"));
+        assert_eq!(extracted, Path::new(r"C:\Player\tools\ffmpeg-extracted"));
+        assert_eq!(download, Path::new(r"C:\Player\tools\ffmpeg.exe.download"));
+        assert_eq!(backup, Path::new(r"C:\Player\tools\ffmpeg.exe.backup"));
+    }
+
+    #[test]
+    fn failed_portable_tool_install_restores_existing_executable() {
+        let root = std::env::temp_dir().join(format!(
+            "music-terminal-player-updater-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("ffmpeg.exe");
+        let download = root.join("missing.download");
+        let backup = root.join("ffmpeg.exe.backup");
+        fs::write(&target, b"existing").unwrap();
+
+        assert!(install_staged_tool(&target, &download, &backup, "FFmpeg").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        assert!(!backup.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moved_portable_tools_rebase_when_only_sibling_ffmpeg_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "music-terminal-player-relocation-{}",
+            std::process::id()
+        ));
+        let moved = root.join("moved");
+        let tools_dir = moved.join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+        fs::write(tools_dir.join("ffmpeg.exe"), b"").unwrap();
+
+        let saved = YouTubeTools {
+            yt_dlp: root
+                .join("old")
+                .join("tools")
+                .join("yt-dlp.exe")
+                .to_string_lossy()
+                .into_owned(),
+            ffmpeg: root
+                .join("old")
+                .join("tools")
+                .join("ffmpeg.exe")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        assert!(portable_tool_pair(&saved));
+        let relocated =
+            relocated_portable_tools(&saved, &moved.join("music-terminal-player.exe")).unwrap();
+        assert_eq!(Path::new(&relocated.yt_dlp), tools_dir.join("yt-dlp.exe"));
+        assert_eq!(Path::new(&relocated.ffmpeg), tools_dir.join("ffmpeg.exe"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relocation_rejects_path_commands_and_mixed_external_tools() {
+        let executable = Path::new(r"C:\Player\music-terminal-player.exe");
+        for tools in [
+            YouTubeTools {
+                yt_dlp: "yt-dlp".to_string(),
+                ffmpeg: "ffmpeg".to_string(),
+            },
+            YouTubeTools {
+                yt_dlp: r"C:\Player\tools\yt-dlp.exe".to_string(),
+                ffmpeg: r"C:\FFmpeg\ffmpeg.exe".to_string(),
+            },
+        ] {
+            assert!(!portable_tool_pair(&tools));
+            assert!(relocated_portable_tools(&tools, executable).is_none());
+        }
     }
 
     #[test]

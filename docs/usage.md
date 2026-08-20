@@ -24,6 +24,14 @@ Running or double-clicking the executable opens the launcher. `Play YouTube audi
 
 Windows Terminal owns its shared top-level window, so `--borderless` does not alter Windows Terminal tabs. Command-line usage is available through `--help`.
 
+## Language 
+
+English is compiled into the executable, needs no language file, and always works offline. Opening `Language` checks the flat catalog at `https://raw.githubusercontent.com/harrytien107/Music_Terminal_Player/main/languages/index.json`. No optional pack downloads during startup.
+
+Select `Tiếng Việt — Download` to explicitly download `https://raw.githubusercontent.com/harrytien107/Music_Terminal_Player/main/languages/vi.lang`. The player limits file size, validates UTF-8 and pack metadata, verifies the catalog SHA-256, then atomically installs the pack as `.music-terminal/languages/vi.lang`. Successful installation applies immediately; `.music-terminal/language.txt` restores the selection on the next run. Installed packs continue working offline. A newer catalog version appears as `Update`.
+
+If the catalog is unavailable, English and installed valid packs remain selectable. Missing, oversized, malformed, mismatched, or otherwise invalid optional packs fall back to English. Application menus, prompts, playback panels, queues, setup screens, and updater status use the selected language. Song and playlist names, folder paths, channel names, URLs, executable names, versions, keyboard keys, and raw errors from external tools remain unchanged.
+
 ## Player controls
 
 - `p` / `Space`: play or pause
@@ -37,8 +45,8 @@ Windows Terminal owns its shared top-level window, so `--borderless` does not al
 - `r`: toggle shuffle for unplayed tracks; `Next in queue` keeps its manual order
 - `l`: cycle loop mode through `off`, `all`, and `one`
 - `u`: open the editable playback queue
-- `b` / `Esc`: return to the launcher
-- `q` / `Ctrl+C`: quit
+- `b` / `Esc`: return to the previous menu; `Esc` at the launcher keeps the player open
+- `q` / `Ctrl+C`: quit completely from a player or menu; the launcher's `Quit` option also exits
 
 The queue has `Now playing`, `Next in queue`, and `Next from track list` columns. Use `Up` / `Down` to select, `Enter` to play, `Delete` to unqueue a selected `Next in queue` item, `a` to add next, and `Esc` to close. Delete does nothing in `Now playing` or `Next from track list`. Unqueueing leaves an existing track-list copy in place; a unique queued item returns to the end of `Next from track list`. Local and Telegram queues use existing-track search. YouTube prompts for another URL or playlist. Audio continues while the queue is open, and automatic track changes keep the queue open.
 
@@ -59,7 +67,7 @@ cargo run -- play .\music
 cargo run -- play .\music\song.mp3
 ```
 
-From the launcher, add a local folder once and select its saved location on later runs. `Forget location` removes only the saved reference; it never deletes the folder or music files.
+From the launcher, add a local folder once and select its saved location on later runs. Saved locations display only their final folder name, such as `The-V-songs`; the complete canonical path remains stored internally. `Forget location` removes only the saved reference; it never deletes the folder or music files.
 
 Supported extensions: `mp3`, `flac`, `wav`, `ogg`, `opus`, `m4a`, `aac`, `alac`, `aiff`, and `webm`.
 
@@ -106,6 +114,8 @@ From `Stream Telegram channel`, choose one or multiple saved channels. Use `Spac
 
 `Search and choose a track` starts the highlighted result first, then retains every other song from the selected channel catalogs under `Next from track list`. `Search and choose multiple tracks` uses `Ctrl+Space` to toggle one result, `Ctrl+A` to toggle all current matches, and `Enter` to play. Selected songs keep catalog order: the first starts immediately, the rest appear under `Next in queue`, and all unselected songs remain under `Next from track list`.
 
+If a Telegram upload is corrupt or uses an unsupported format, the player shows a short warning and keeps the queue open. Press `p`, `Space`, or `n` to continue manually with the next queued track.
+
 Inside a player, `b` and `Esc` return one level to the immediate playback-options menu. Back from Telegram playback options returns to channel selection; Back from local playback returns to local-folder selection. Use each parent menu's Back action to continue toward the launcher.
 
 Stream a synchronized public channel from the CLI:
@@ -140,7 +150,11 @@ On first use, choose one setup option:
 - `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable and automatically saves both executable locations in `.music-terminal/youtube-tools.txt`. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
 - `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH`.
 
-Tool paths are saved in `.music-terminal/youtube-tools.txt`. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`. `YouTube tools and updater` displays installed versions. Its manual stable-channel updater downloads and validates GitHub's fixed latest-release asset only for the player-managed `tools/yt-dlp.exe` beside the application. External paths and `PATH` commands remain usable but are never updated by the player. No background update checks or startup notices run.
+Tool paths are saved in `.music-terminal/youtube-tools.txt`. When the complete portable folder is moved, the player detects the saved `tools/yt-dlp.exe` and `tools/ffmpeg.exe` pair, rebases both paths beside the running executable, and saves the repaired paths. A remaining sibling tool is enough to identify the moved folder, so the updater can reinstall either missing portable tool. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`.
+
+`YouTube tools and updater` displays installed versions. Choose `Check for tool updates` to compare them with GitHub's latest stable yt-dlp release and Gyan.dev's latest FFmpeg Essentials version. Results show `latest`, `update available`, `newer than stable`, or `unable to check`; they are cached only while this menu remains open. The check uses a 10-second network timeout, does not block playback or startup, and never runs in the background. External paths and `PATH` commands receive version status but are never rewritten or updated by the player.
+
+The manual update actions download and validate GitHub's fixed latest yt-dlp release asset and Gyan.dev's latest FFmpeg Essentials archive. `Update both portable tools` runs both updates only when both configured files are inside the application-relative `tools` folder. Updates are staged beside the application, and an existing executable is restored if installation fails.
 
 Start YouTube playback from the launcher or CLI:
 
@@ -168,7 +182,7 @@ Playlists are stored in `.music-terminal/playlists.txt`.
 
 ## Data files
 
-Player data lives under `.music-terminal`, which is ignored by Git. It contains settings, saved libraries, playlists, Telegram credentials and sessions, channel catalogs, YouTube tool paths, and temporary Telegram stream cache. Existing root-level data files migrate automatically.
+Player data lives under `.music-terminal`, which is ignored by Git. It contains the selected-language setting, downloaded optional packs under `.music-terminal/languages`, volume settings, saved libraries, playlists, Telegram credentials and sessions, channel catalogs, YouTube tool paths, and temporary Telegram stream cache. Existing root-level data files migrate automatically.
 
 ## Terminal UI notes
 

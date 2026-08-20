@@ -3,28 +3,34 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::app::{
-    Playlist, collect_library_tracks, parse_playlists, selected_or_highlighted_channel_indexes,
-    serialize_playlists,
+    Playlist, collect_library_tracks, local_folder_label, parse_playlists,
+    selected_or_highlighted_channel_indexes, serialize_playlists,
 };
 use crate::audio_output::{DEVICE_UNAVAILABLE_MESSAGE, device_unavailable_error};
+use crate::i18n::{
+    Language, load_language_from, parse_language, parse_language_catalog, parse_pack_value,
+    save_language_to, tr, validate_language_pack,
+};
 use crate::local::search_local_tracks;
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
-    load_telegram_catalog, normalize_channel_identity, prioritize_catalog_tracks,
-    private_channel_identity, private_channel_is_saved, private_invite_hash, save_telegram_catalog,
-    search_catalog, search_private_channels, selectable_private_channel_matches,
-    telegram_channel_label, telegram_format_hint,
+    load_telegram_catalog, normalize_channel_identity, open_cache_for_write,
+    prioritize_catalog_tracks, private_channel_identity, private_channel_is_saved,
+    private_invite_hash, save_telegram_catalog, search_catalog, search_private_channels,
+    selectable_private_channel_matches, telegram_channel_label, telegram_format_hint,
 };
 use crate::util::{
     LoopMode, fit_text, forward_track_index, insert_queue_next, is_supported_audio_path,
-    next_track_index, normalize_channel, parse_volume_settings, playback_controls,
+    menu_quit_key, next_track_index, normalize_channel, parse_volume_settings, playback_controls,
     previous_track_index, progress_bar, queue_window_start, restart_pass_order, safe_file_name,
     set_shuffle_order, shuffle_slice, toggle_all, unqueue_next_item,
 };
 use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
 };
+use crossterm::event::{KeyCode, KeyModifiers};
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn disconnected_audio_output_uses_stable_friendly_error() {
@@ -36,6 +42,102 @@ fn disconnected_audio_output_uses_stable_friendly_error() {
         device_unavailable_error().to_string(),
         DEVICE_UNAVAILABLE_MESSAGE
     );
+}
+
+#[test]
+fn local_folder_menu_uses_only_the_folder_name() {
+    assert_eq!(
+        local_folder_label(Path::new(r"\\?\D:\Music\The-V-songs")),
+        "The-V-songs"
+    );
+    assert_eq!(local_folder_label(Path::new(r"D:\")), r"D:\");
+}
+
+#[test]
+fn menu_quit_keys_exclude_escape() {
+    assert!(menu_quit_key(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(menu_quit_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!menu_quit_key(KeyCode::Esc, KeyModifiers::NONE));
+}
+
+#[test]
+fn language_codes_and_embedded_english_fallback_are_stable() {
+    assert_eq!(parse_language("vi\n"), Language::Vietnamese);
+    assert_eq!(parse_language("unknown"), Language::English);
+    assert_eq!(Language::English.code(), "en");
+    assert_eq!(Language::Vietnamese.code(), "vi");
+    assert_eq!(Language::Vietnamese.label(), "Tiếng Việt");
+    assert_eq!(tr("msg.back"), "Back");
+    assert_eq!(tr("msg.missing_test_key"), "msg.missing_test_key");
+}
+
+#[test]
+fn language_pack_values_decode_safe_escapes_and_reject_terminal_controls() {
+    assert_eq!(
+        parse_pack_value(r"line\nnext\\path").unwrap(),
+        "line\nnext\\path"
+    );
+    assert!(parse_pack_value(r"bad\xescape").is_err());
+    assert!(parse_pack_value("bad\u{1b}escape").is_err());
+}
+
+#[test]
+fn language_pack_validation_rejects_wrong_metadata_and_duplicate_keys() {
+    let valid =
+        "language.code=vi\nlanguage.name=Tiếng Việt\nlanguage.version=1\nmsg.back=Quay lại\n";
+    assert!(validate_language_pack(valid, "vi").is_ok());
+    assert!(validate_language_pack(valid, "en").is_err());
+    assert!(validate_language_pack(&format!("{valid}msg.back=Lùi lại\n"), "vi").is_err());
+}
+
+#[test]
+fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
+    let catalog = parse_language_catalog(include_str!("../languages/index.json")).unwrap();
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].language, Language::Vietnamese);
+    assert_eq!(catalog[0].name, "Tiếng Việt");
+    assert_eq!(catalog[0].version, 1);
+    assert_eq!(catalog[0].file, "vi.lang");
+    assert_eq!(
+        catalog[0].sha256,
+        format!(
+            "{:x}",
+            Sha256::digest(include_bytes!("../languages/vi.lang"))
+        )
+    );
+    assert!(validate_language_pack(include_str!("../languages/vi.lang"), "vi").is_ok());
+}
+
+#[test]
+fn language_catalog_rejects_paths_duplicates_and_invalid_hashes() {
+    let hash = "0".repeat(64);
+    let path = format!(
+        r#"{{"format":1,"languages":[{{"code":"vi","name":"Tiếng Việt","version":1,"file":"../vi.lang","sha256":"{hash}"}}]}}"#
+    );
+    assert!(parse_language_catalog(&path).is_err());
+    let duplicate = format!(
+        r#"{{"format":1,"languages":[{{"code":"vi","name":"Tiếng Việt","version":1,"file":"vi.lang","sha256":"{hash}"}},{{"code":"vi","name":"Tiếng Việt","version":2,"file":"vi.lang","sha256":"{hash}"}}]}}"#
+    );
+    assert!(parse_language_catalog(&duplicate).is_err());
+    let bad_hash = r#"{"format":1,"languages":[{"code":"vi","name":"Tiếng Việt","version":1,"file":"vi.lang","sha256":"bad"}]}"#;
+    assert!(parse_language_catalog(bad_hash).is_err());
+}
+
+#[test]
+fn language_setting_round_trips_without_using_the_application_file() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "music-terminal-language-{}-{unique}.txt",
+        std::process::id()
+    ));
+    save_language_to(&path, Language::Vietnamese).unwrap();
+    assert_eq!(load_language_from(&path), Language::Vietnamese);
+    fs::write(&path, "invalid\n").unwrap();
+    assert_eq!(load_language_from(&path), Language::English);
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -70,6 +172,31 @@ fn telegram_decoder_hints_match_track_extensions_case_insensitively() {
         Some("m4a")
     );
     assert_eq!(telegram_format_hint(Path::new("unknown")), None);
+}
+
+#[test]
+fn telegram_cache_survives_writer_close_for_decoder_retry() {
+    use std::io::Write;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "music-terminal-player-cache-{}-{unique}.mp3",
+        std::process::id()
+    ));
+    {
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(b"old").unwrap();
+    }
+    {
+        let mut file = open_cache_for_write(&path).unwrap();
+        file.write_all(b"new").unwrap();
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -269,8 +396,9 @@ fn loop_mode_cycles_off_all_one() {
 
 #[test]
 fn saved_volume_defaults_and_stays_bounded() {
-    assert_eq!(parse_volume_settings("volume=1.25\n"), 1.25);
-    assert_eq!(parse_volume_settings("volume=9\n"), 1.5);
+    assert_eq!(parse_volume_settings("volume=0.75\n"), 0.75);
+    assert_eq!(parse_volume_settings("volume=1.25\n"), 1.0);
+    assert_eq!(parse_volume_settings("volume=9\n"), 1.0);
     assert_eq!(parse_volume_settings("invalid\n"), 0.8);
 }
 

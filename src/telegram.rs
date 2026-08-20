@@ -30,11 +30,12 @@ use symphonia_adapter_libopus::OpusDecoder;
 use tokio::task::JoinHandle;
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
+use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel, format_duration,
-    format_elapsed, forward_track_index, is_supported_audio_path, load_volume, manage_queue,
-    normalize_channel, playback_controls, previous_track_index, progress_bar, prompt,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
+    format_duration, format_elapsed, forward_track_index, is_supported_audio_path, load_volume,
+    manage_queue, normalize_channel, playback_controls, previous_track_index, progress_bar, prompt,
     restart_pass_order, safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice,
     toggle_all,
 };
@@ -50,7 +51,6 @@ const PRIVATE_CHANNEL_PREFIX: &str = "private:";
 
 #[derive(Clone)]
 struct TelegramTrack {
-    name: String,
     media: Media,
     size: Option<u64>,
     cache_path: PathBuf,
@@ -317,10 +317,12 @@ pub(crate) async fn telegram_client() -> Result<Client> {
     }
 
     clear_screen()?;
-    println!("Signing in to Telegram...");
+    println!("{}", tr("msg.signing_in_to_telegram"));
     'login: loop {
         let phone = loop {
-            let phone = prompt("Phone number, international format (example +84901234567): ")?;
+            let phone = prompt(tr(
+                "msg.phone_number_international_format_example_84901234567",
+            ))?;
             let phone = phone.trim();
             if phone.len() > 1
                 && phone.starts_with('+')
@@ -328,15 +330,17 @@ pub(crate) async fn telegram_client() -> Result<Client> {
             {
                 break phone.to_string();
             }
-            println!("Invalid phone number. Include + and the country code.");
+            println!(
+                "{}",
+                tr("msg.invalid_phone_number_include_and_the_country_code")
+            );
         };
         let token = loop {
             match client.request_login_code(&phone, &api_hash).await {
                 Ok(token) => break token,
                 Err(error) => {
-                    println!("Could not request a login code: {error}");
-                    let action =
-                        prompt("Press Enter to retry, type 'phone', or type 'credentials': ")?;
+                    println!("{}: {error}", tr("msg.could_not_request_a_login_code"));
+                    let action = prompt(tr("msg.press_enter_to_retry_type_phone_or_type"))?;
                     if action.trim().eq_ignore_ascii_case("credentials") {
                         let _ = fs::remove_file(TELEGRAM_CREDENTIALS_FILE);
                         bail!("Telegram credentials cleared; retry login to enter them again");
@@ -349,14 +353,16 @@ pub(crate) async fn telegram_client() -> Result<Client> {
         };
 
         loop {
-            let code = prompt("Login code: ")?;
+            let code = prompt(tr("msg.login_code"))?;
             if code.trim().is_empty() {
-                println!("Login code cannot be empty.");
+                println!("{}", tr("msg.login_code_cannot_be_empty"));
                 continue;
             }
             match client.sign_in(&token, code.trim()).await {
                 Ok(_) => break 'login,
-                Err(SignInError::InvalidCode) => println!("Invalid login code. Try again."),
+                Err(SignInError::InvalidCode) => {
+                    println!("{}", tr("msg.invalid_login_code_try_again"))
+                }
                 Err(SignInError::PasswordRequired(mut password_token)) => loop {
                     let hint = password_token.hint().unwrap_or("");
                     let password =
@@ -364,23 +370,35 @@ pub(crate) async fn telegram_client() -> Result<Client> {
                     match client.check_password(password_token, password.trim()).await {
                         Ok(_) => break 'login,
                         Err(SignInError::InvalidPassword(next_token)) => {
-                            println!("Invalid two-step password. Try again.");
+                            println!("{}", tr("msg.invalid_two_step_password_try_again"));
                             password_token = next_token;
                         }
                         Err(error) => {
-                            println!("Telegram login failed: {error}. Requesting a new code.");
+                            println!(
+                                "{}: {error}. {}",
+                                tr("msg.telegram_login_failed"),
+                                tr("msg.requesting_a_new_code")
+                            );
                             continue 'login;
                         }
                     }
                 },
                 Err(error) => {
-                    println!("Telegram login failed: {error}. Requesting a new code.");
+                    println!(
+                        "{}: {error}. {}",
+                        tr("msg.telegram_login_failed"),
+                        tr("msg.requesting_a_new_code")
+                    );
                     continue 'login;
                 }
             }
         }
     }
-    println!("Signed in. Session saved in {SESSION_FILE}.");
+    println!(
+        "{}. {} {SESSION_FILE}.",
+        tr("msg.signed_in"),
+        tr("msg.session_saved_in")
+    );
     Ok(client)
 }
 
@@ -409,22 +427,28 @@ fn telegram_credentials() -> Result<(i32, String)> {
                 return Ok((id, hash));
             }
         }
-        println!("Saved Telegram credentials are invalid. Enter them again.");
+        println!(
+            "{}",
+            tr("msg.saved_telegram_credentials_are_invalid_enter_them_again")
+        );
     }
 
     clear_screen()?;
-    println!("Telegram setup: create api_id and api_hash at https://my.telegram.org");
+    println!("{}", tr("msg.telegram_setup_create_api_id_and_api_hash"));
     loop {
         let id = match prompt("Telegram api_id: ")?.trim().parse::<i32>() {
             Ok(id) if id > 0 => id,
             _ => {
-                println!("Telegram api_id must be a positive integer.");
+                println!("{}", tr("msg.telegram_api_id_must_be_a_positive_integer"));
                 continue;
             }
         };
         let hash = prompt("Telegram api_hash: ")?.trim().to_string();
         if !valid_api_credentials(id, &hash) {
-            println!("Telegram api_hash must be 32 hexadecimal characters.");
+            println!(
+                "{}",
+                tr("msg.telegram_api_hash_must_be_32_hexadecimal_characters")
+            );
             continue;
         }
         fs::write(TELEGRAM_CREDENTIALS_FILE, format!("{id}\n{hash}\n"))?;
@@ -448,8 +472,10 @@ pub(crate) async fn stream_channel(channel: &str) -> Result<PlayerExit> {
     }
 
     let title = format!(
-        "Telegram channel: {label}\n{} tracks | {}",
+        "{}: {label}\n{} {} | {}",
+        tr("msg.telegram_channel"),
         catalog.len(),
+        tr("msg.tracks"),
         catalog_path.display()
     );
     stream_catalog_entries(&title, catalog).await
@@ -463,11 +489,11 @@ pub(crate) async fn stream_catalog_entries(
         bail!("selected Telegram channels contain no tracks");
     }
     let menu = vec![
-        "Play in order".to_string(),
-        "Shuffle".to_string(),
-        "Search and choose a track".to_string(),
-        "Search and choose multiple tracks".to_string(),
-        "Back".to_string(),
+        tr("msg.play_in_order").to_string(),
+        tr("msg.shuffle_2").to_string(),
+        tr("msg.search_and_choose_a_track").to_string(),
+        tr("msg.search_and_choose_multiple_tracks").to_string(),
+        tr("msg.back").to_string(),
     ];
     loop {
         let (tracks, play_next, shuffle) = match select_menu(title, &menu)? {
@@ -534,7 +560,7 @@ pub(crate) async fn play_catalog_entries(
     }
     delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
     clear_screen()?;
-    println!("Loading selected Telegram track...");
+    println!("{}", tr("msg.loading_selected_telegram_track"));
     let client = telegram_client().await?;
     let catalog_index = catalog_index.min(catalog.len() - 1);
     play_telegram_tracks(client, catalog, catalog_index, shuffle, play_next).await
@@ -561,8 +587,12 @@ fn choose_catalog_track(
             .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
         let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
         let mut frame = format!(
-            "Search songs\r\nList: {list_label}\r\nSearch: {query}_\r\n{} match(es)\r\n\r\n",
-            matches.len()
+            "{}\r\n{}: {list_label}\r\n{}: {query}_\r\n{} {}\r\n\r\n",
+            tr("msg.search_songs"),
+            tr("msg.list"),
+            tr("msg.search"),
+            matches.len(),
+            tr("msg.match_es")
         );
         for (match_index, &catalog_index) in matches[start..end].iter().enumerate() {
             let absolute_index = start + match_index;
@@ -573,11 +603,9 @@ fn choose_catalog_track(
             ));
         }
         if matches.is_empty() {
-            frame.push_str("No matching tracks.\r\n");
+            frame.push_str(tr("msg.no_matching_tracks"));
         }
-        frame.push_str(
-            "\r\nType to search | Backspace edit | Up/Down select | Enter play | Esc back",
-        );
+        frame.push_str(tr("msg.type_to_search_backspace_edit_up_down_select"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -626,9 +654,14 @@ fn choose_catalog_tracks_to_play(
             .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
         let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
         let mut frame = format!(
-            "Choose songs to play\r\nList: {list_label}\r\nSearch: {query}_ | {} selected | {} matches\r\n\r\n",
+            "{}\r\n{}: {list_label}\r\n{}: {query}_ | {} {} | {} {}\r\n\r\n",
+            tr("msg.choose_songs_to_play"),
+            tr("msg.list"),
+            tr("msg.search"),
             selected.len(),
-            matches.len()
+            tr("msg.selected"),
+            matches.len(),
+            tr("msg.matches")
         );
         for (offset, &catalog_index) in matches[start..end].iter().enumerate() {
             frame.push_str(&format!(
@@ -647,11 +680,9 @@ fn choose_catalog_tracks_to_play(
             ));
         }
         if matches.is_empty() {
-            frame.push_str("No matching tracks.\r\n");
+            frame.push_str(tr("msg.no_matching_tracks"));
         }
-        frame.push_str(
-            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] play | [Esc] back",
-        );
+        frame.push_str(tr("msg.type_to_search_ctrl_space_toggle_ctrl_a_2"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -742,9 +773,13 @@ pub(crate) fn choose_catalog_tracks(
             .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
         let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
         let mut frame = format!(
-            "Choose playlist songs\r\nSearch: {query}_ | {} selected | {} matches\r\n\r\n",
+            "{}\r\n{}: {query}_ | {} {} | {} {}\r\n\r\n",
+            tr("msg.choose_playlist_songs"),
+            tr("msg.search"),
             selected.len(),
-            matches.len()
+            tr("msg.selected"),
+            matches.len(),
+            tr("msg.matches")
         );
         for (offset, &catalog_index) in matches[start..end].iter().enumerate() {
             let entry = &catalog[catalog_index];
@@ -764,11 +799,9 @@ pub(crate) fn choose_catalog_tracks(
             ));
         }
         if matches.is_empty() {
-            frame.push_str("No matching tracks.\r\n");
+            frame.push_str(tr("msg.no_matching_tracks"));
         }
-        frame.push_str(
-            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
-        );
+        frame.push_str(tr("msg.type_to_search_ctrl_space_toggle_ctrl_a"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -837,12 +870,15 @@ pub(crate) fn search_catalog(catalog: &[TelegramCatalogEntry], query: &str) -> V
         .collect()
 }
 
+const DECODE_WARNING: &str = "Cannot decode this track. Press p, Space, or n for next.";
+
 struct ActiveTelegramTrack {
     sink: Sink,
     duration: Option<Duration>,
     cache_path: PathBuf,
     shared: Arc<SharedDownload>,
     download_task: Option<JoinHandle<()>>,
+    warning: Option<&'static str>,
 }
 
 impl ActiveTelegramTrack {
@@ -889,10 +925,11 @@ async fn play_telegram_tracks(
 
         if let Some(command) = media_controls.command() {
             match command {
-                MediaCommand::Play => {
+                MediaCommand::Play if active.warning.is_none() => {
                     active.sink.play();
                     media_controls.set_playing(true);
                 }
+                MediaCommand::Play => {}
                 MediaCommand::Pause => {
                     active.sink.pause();
                     media_controls.set_playing(false);
@@ -947,10 +984,11 @@ async fn play_telegram_tracks(
             shuffle,
             &active.shared,
             loop_mode,
+            active.warning,
         )?;
 
         let complete = active.shared.state.lock().map_err(lock_error)?.complete;
-        if complete && active.sink.empty() {
+        if active.warning.is_none() && complete && active.sink.empty() {
             let Some((next, new_pass, advance_queue)) = forward_track_index(
                 index,
                 tracks.len(),
@@ -1002,7 +1040,7 @@ async fn play_telegram_tracks(
                 delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
                 return Ok(PlayerExit::Back);
             }
-            KeyCode::Char('p') | KeyCode::Char(' ') => {
+            KeyCode::Char('p') | KeyCode::Char(' ') if active.warning.is_none() => {
                 if active.sink.is_paused() {
                     active.sink.play();
                     media_controls.set_playing(true);
@@ -1011,7 +1049,7 @@ async fn play_telegram_tracks(
                     media_controls.set_playing(false);
                 }
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char(' ') => {
                 let Some((next, new_pass, advance_queue)) = forward_track_index(
                     index,
                     tracks.len(),
@@ -1052,7 +1090,7 @@ async fn play_telegram_tracks(
                 save_volume(volume)?;
             }
             KeyCode::Right => {
-                volume = (volume + 0.01).min(1.5);
+                volume = (volume + 0.01).min(MAX_VOLUME);
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -1075,7 +1113,8 @@ async fn play_telegram_tracks(
                             .contains(&query.trim().to_lowercase())
                     },
                     || {
-                        active.sink.empty()
+                        active.warning.is_none()
+                            && active.sink.empty()
                             && active
                                 .shared
                                 .state
@@ -1125,7 +1164,7 @@ async fn play_telegram_tracks(
                 break;
             },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
-                volume = (volume + 0.10).min(1.5);
+                volume = (volume + 0.10).min(MAX_VOLUME);
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -1145,7 +1184,7 @@ fn update_telegram_media(
     active: &ActiveTelegramTrack,
 ) {
     media_controls.set_track(&track.name, &track.channel);
-    media_controls.set_playing(!active.sink.is_paused());
+    media_controls.set_playing(active.warning.is_none() && !active.sink.is_paused());
 }
 
 fn delete_cache_file(path: &Path) -> Result<()> {
@@ -1213,7 +1252,6 @@ async fn start_catalog_track(
         );
     }
     let track = TelegramTrack {
-        name: entry.name.clone(),
         size: media.size().map(|size| size as u64),
         cache_path: cache_dir.join(format!(
             "{}-{}",
@@ -1257,12 +1295,11 @@ async fn start_telegram_track(
         download_task = Some(tokio::spawn(async move {
             if let Err(error) =
                 download_progressively(client, media, path, Arc::clone(&download)).await
+                && let Ok(mut state) = download.state.lock()
             {
-                if let Ok(mut state) = download.state.lock() {
-                    state.error = Some(error.to_string());
-                    state.buffering = false;
-                    download.changed.notify_all();
-                }
+                state.error = Some(error.to_string());
+                state.buffering = false;
+                download.changed.notify_all();
             }
         }));
 
@@ -1290,27 +1327,45 @@ async fn start_telegram_track(
     };
     let sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
+    let mut warning = None;
     let duration = if is_opus_path(&track.cache_path) {
-        let source = OpusSource::new(reader)
-            .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
-        let duration = source.total_duration();
-        sink.append(source);
-        duration
+        match OpusSource::new(reader) {
+            Ok(source) => {
+                let duration = source.total_duration();
+                sink.append(source);
+                duration
+            }
+            Err(_) => {
+                warning = Some(DECODE_WARNING);
+                None
+            }
+        }
     } else {
-        let mut builder = Decoder::builder().with_data(BufReader::new(reader));
-        if let Some(size) = track.size {
-            builder = builder.with_byte_len(size);
-        }
         let hint = telegram_format_hint(&track.cache_path);
-        if let Some(hint) = hint.as_deref() {
-            builder = builder.with_hint(hint);
-        }
-        let decoder = builder
-            .build()
-            .with_context(|| format!("failed to decode Telegram track {}", track.name))?;
-        let duration = decoder.total_duration();
-        sink.append(decoder);
-        duration
+        let decoder = match telegram_decoder(reader, track.size, hint.as_deref()) {
+            Ok(decoder) => Some(decoder),
+            Err(_) if !cache_complete => {
+                wait_for_download(&shared).await?;
+                let reader = ProgressiveReader {
+                    file: open_cache_for_read(&track.cache_path)?,
+                    position: 0,
+                    shared: Arc::clone(&shared),
+                };
+                telegram_decoder(reader, track.size, hint.as_deref()).ok()
+            }
+            Err(_) => None,
+        };
+        decoder.map_or_else(
+            || {
+                warning = Some(DECODE_WARNING);
+                None
+            },
+            |decoder| {
+                let duration = decoder.total_duration();
+                sink.append(decoder);
+                duration
+            },
+        )
     };
     Ok(ActiveTelegramTrack {
         sink,
@@ -1318,7 +1373,41 @@ async fn start_telegram_track(
         cache_path: track.cache_path.clone(),
         shared,
         download_task,
+        warning,
     })
+}
+
+fn telegram_decoder(
+    reader: ProgressiveReader,
+    byte_len: Option<u64>,
+    hint: Option<&str>,
+) -> Result<Decoder<BufReader<ProgressiveReader>>, rodio::decoder::DecoderError> {
+    let mut builder = Decoder::builder().with_data(BufReader::new(reader));
+    if let Some(byte_len) = byte_len {
+        builder = builder.with_byte_len(byte_len);
+    }
+    if let Some(hint) = hint {
+        builder = builder.with_hint(hint);
+    }
+    builder.build()
+}
+
+async fn wait_for_download(shared: &SharedDownload) -> Result<()> {
+    loop {
+        {
+            let state = shared.state.lock().map_err(lock_error)?;
+            if let Some(error) = &state.error {
+                bail!("Telegram download failed: {error}");
+            }
+            if state.cancelled {
+                bail!("Telegram download was cancelled");
+            }
+            if state.complete {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn download_progressively(
@@ -1399,14 +1488,11 @@ fn open_cache_for_read(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn open_cache_for_write(path: &Path) -> io::Result<File> {
+pub(crate) fn open_cache_for_write(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).truncate(true);
     #[cfg(windows)]
-    options
-        .access_mode(0x40000000 | 0x00010000)
-        .share_mode(0x1 | 0x2 | 0x4)
-        .custom_flags(0x04000000);
+    options.share_mode(0x1 | 0x2 | 0x4);
     options.open(path)
 }
 
@@ -1420,16 +1506,19 @@ fn draw_telegram_player(
     shuffle: bool,
     shared: &SharedDownload,
     loop_mode: LoopMode,
+    warning: Option<&str>,
 ) -> Result<()> {
     let state = shared.state.lock().map_err(lock_error)?;
-    let playback = if sink.is_paused() {
-        "paused"
+    let playback = if warning.is_some() {
+        tr("msg.cannot_play")
+    } else if sink.is_paused() {
+        tr("msg.paused")
     } else if state.reconnecting {
-        "reconnecting"
+        tr("msg.reconnecting")
     } else if state.buffering {
-        "buffering"
+        tr("msg.buffering")
     } else {
-        "playing"
+        tr("msg.playing")
     };
     let progress = state
         .total
@@ -1442,7 +1531,8 @@ fn draw_telegram_player(
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
         format!(
-            "Track {}/{} | {}",
+            "{} {}/{} | {}",
+            tr("msg.track"),
             index + 1,
             tracks.len(),
             tracks[index].name
@@ -1455,15 +1545,21 @@ fn draw_telegram_player(
             total
         ),
         format!(
-            "{} · {:.0}% · cache {} · shuffle {} · loop {}",
+            "{} · {:.0}% · cache {} · {} {} · {} {}",
             playback,
             volume * 100.0,
             progress,
-            if shuffle { "on" } else { "off" },
+            tr("msg.shuffle"),
+            if shuffle { tr("msg.on") } else { tr("msg.off") },
+            tr("msg.loop"),
             loop_mode.label()
         ),
         String::new(),
     ];
+    if let Some(warning) = warning {
+        rows.push(format!("{}: {warning}", tr("msg.warning")));
+        rows.push(String::new());
+    }
     rows.extend(playback_controls());
     draw_panel(stdout, "Music Terminal Player · Telegram", &rows)
 }
@@ -1481,7 +1577,7 @@ pub(crate) async fn choose_private_channel(
     saved_channels: &[String],
 ) -> Result<Option<Vec<String>>> {
     clear_screen()?;
-    println!("Scanning Telegram account dialogs...");
+    println!("{}", tr("msg.scanning_telegram_account_dialogs"));
     let client = telegram_client().await?;
     let mut dialogs = client.iter_dialogs();
     let mut channels = Vec::new();
@@ -1506,7 +1602,7 @@ pub(crate) async fn choose_private_channel(
         io::stdout().flush()?;
     }
     println!();
-    channels.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    channels.sort_by_key(|channel| channel.0.to_lowercase());
     if channels.is_empty() {
         bail!("the logged-in account has no private broadcast channels");
     }
@@ -1558,7 +1654,7 @@ pub(crate) async fn choose_private_channel(
             ));
         }
         if matches.is_empty() {
-            frame.push_str("No matching private channels.\r\n");
+            frame.push_str(tr("msg.no_matching_private_channels"));
         }
         frame.push_str(
             "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down/Page Up/Page Down scroll | [Enter] sync | [Esc] cancel",
@@ -1717,7 +1813,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
     let mut document_count = 0usize;
     let mut messages = client.iter_messages(peer);
 
-    println!("Scanning all songs in {label}...");
+    println!("{} {label}...", tr("msg.scanning_all_songs_in"));
     while let Some(message) = messages.next().await? {
         message_count += 1;
         let Some(media) = message.media() else {
@@ -1762,7 +1858,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
         catalog_path.display()
     );
     let Some(folder) = download_folder else {
-        println!("Song-list update complete.");
+        println!("{}", tr("msg.song_list_update_complete"));
         return Ok(());
     };
 

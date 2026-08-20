@@ -12,12 +12,13 @@ use crossterm::terminal::{self, ClearType};
 use rodio::{Decoder, OutputStream, Sink, Source};
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
+use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    LoopMode, PlayerExit, RawMode, draw_frame, draw_panel, format_duration, forward_track_index,
-    insert_queue_next, is_supported_audio_path, load_volume, manage_queue, playback_controls,
-    previous_track_index, progress_bar, restart_pass_order, save_volume, set_shuffle_order,
-    shuffle_slice, toggle_all,
+    LoopMode, MAX_VOLUME, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
+    forward_track_index, insert_queue_next, is_supported_audio_path, load_volume, manage_queue,
+    playback_controls, previous_track_index, progress_bar, restart_pass_order, save_volume,
+    set_shuffle_order, shuffle_slice, toggle_all,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -30,11 +31,11 @@ pub(crate) fn play_path(path: &Path) -> Result<PlayerExit> {
 }
 
 pub(crate) fn play_tracks(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
-    play_tracks_inner(tracks, "Local", None, false)
+    play_tracks_inner(tracks, tr("msg.local_2"), None, false)
 }
 
 pub(crate) fn play_tracks_shuffled(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
-    play_tracks_inner(tracks, "Local library", None, true)
+    play_tracks_inner(tracks, tr("msg.local_library"), None, true)
 }
 
 fn play_tracks_inner(
@@ -241,7 +242,7 @@ fn play_tracks_inner(
                 save_volume(volume)?;
             }
             KeyCode::Right => {
-                volume = (volume + 0.01).min(1.5);
+                volume = (volume + 0.01).min(MAX_VOLUME);
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -325,7 +326,7 @@ fn play_tracks_inner(
                 break;
             },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
-                volume = (volume + 0.10).min(1.5);
+                volume = (volume + 0.10).min(MAX_VOLUME);
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -380,9 +381,9 @@ fn draw_player(
     can_add_tracks: bool,
 ) -> Result<()> {
     let state = if sink.is_paused() {
-        "paused"
+        tr("msg.paused")
     } else {
-        "playing"
+        tr("msg.playing")
     };
     let elapsed = sink.get_pos();
     let total = duration
@@ -390,7 +391,8 @@ fn draw_player(
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
         format!(
-            "Track {}/{} | {}",
+            "{} {}/{} | {}",
+            tr("msg.track"),
             index + 1,
             tracks.len(),
             tracks[index].display()
@@ -403,16 +405,18 @@ fn draw_player(
             total
         ),
         format!(
-            "{} · {:.0}% · shuffle {} · loop {}",
+            "{} · {:.0}% · {} {} · {} {}",
             state,
             volume * 100.0,
-            if shuffle { "on" } else { "off" },
+            tr("msg.shuffle"),
+            if shuffle { tr("msg.on") } else { tr("msg.off") },
+            tr("msg.loop"),
             loop_mode.label()
         ),
         String::new(),
     ];
     if can_add_tracks {
-        rows.push("[a] add YouTube URL or playlist".to_string());
+        rows.push(tr("msg.a_add_youtube_url_or_playlist").to_string());
     }
     rows.extend(playback_controls());
     draw_panel(stdout, &format!("Music Terminal Player · {title}"), &rows)
@@ -455,9 +459,13 @@ pub(crate) fn choose_local_tracks(
             .min(matches.len().saturating_sub(TRACK_LIST_PAGE_SIZE));
         let end = (start + TRACK_LIST_PAGE_SIZE).min(matches.len());
         let mut frame = format!(
-            "Choose local playlist songs\r\nSearch: {query}_ | {} selected | {} matches\r\n\r\n",
+            "{}\r\n{}: {query}_ | {} {} | {} {}\r\n\r\n",
+            tr("msg.choose_local_playlist_songs"),
+            tr("msg.search"),
             selected.len(),
-            matches.len()
+            tr("msg.selected"),
+            matches.len(),
+            tr("msg.matches")
         );
         for (offset, &track_index) in matches[start..end].iter().enumerate() {
             let track = &tracks[track_index];
@@ -473,11 +481,9 @@ pub(crate) fn choose_local_tracks(
             ));
         }
         if matches.is_empty() {
-            frame.push_str("No matching tracks.\r\n");
+            frame.push_str(tr("msg.no_matching_tracks"));
         }
-        frame.push_str(
-            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down select | [Enter] save | [Esc] cancel",
-        );
+        frame.push_str(tr("msg.type_to_search_ctrl_space_toggle_ctrl_a"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
