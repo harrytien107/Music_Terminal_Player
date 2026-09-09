@@ -113,6 +113,7 @@ msg.quit=Quit
 msg.r_shuffle=[r] shuffle
 msg.reconnecting=reconnecting
 msg.rename_playlist=Rename playlist
+msg.recently_added=Recently added
 msg.rename_which_playlist=Rename which playlist?
 msg.requesting_a_new_code=Requesting a new code.
 msg.resolving_youtube_video_and_playlist_metadata=Resolving YouTube video and playlist metadata...

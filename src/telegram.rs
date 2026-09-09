@@ -60,6 +60,7 @@ struct TelegramTrack {
 pub(crate) struct TelegramCatalogEntry {
     pub(crate) channel: String,
     pub(crate) message_id: i32,
+    pub(crate) published_at: i64,
     pub(crate) name: String,
 }
 
@@ -491,6 +492,7 @@ pub(crate) async fn stream_catalog_entries(
     let menu = vec![
         tr("msg.play_in_order").to_string(),
         tr("msg.shuffle_2").to_string(),
+        tr("msg.recently_added").to_string(),
         tr("msg.search_and_choose_a_track").to_string(),
         tr("msg.search_and_choose_multiple_tracks").to_string(),
         tr("msg.back").to_string(),
@@ -500,12 +502,17 @@ pub(crate) async fn stream_catalog_entries(
             Some(0) => (catalog.clone(), 0, false),
             Some(1) => (catalog.clone(), 0, true),
             Some(2) => {
+                let mut tracks = catalog.clone();
+                sort_catalog_by_published_descending(&mut tracks);
+                (tracks, 0, false)
+            }
+            Some(3) => {
                 let Some(index) = choose_catalog_track(&catalog, title)? else {
                     continue;
                 };
                 (prioritize_catalog_tracks(&catalog, &[index]), 0, false)
             }
-            Some(3) => {
+            Some(4) => {
                 let Some(indexes) = choose_catalog_tracks_to_play(&catalog, title)? else {
                     continue;
                 };
@@ -516,8 +523,8 @@ pub(crate) async fn stream_catalog_entries(
                     false,
                 )
             }
-            Some(4) | None => return Ok(PlayerExit::Back),
-            _ => unreachable!(),
+            Some(5) | None => return Ok(PlayerExit::Back),
+            Some(_) => unreachable!(),
         };
         match play_catalog_entries("", tracks, 0, shuffle, play_next).await? {
             PlayerExit::Quit => return Ok(PlayerExit::Quit),
@@ -749,6 +756,15 @@ pub(crate) fn prioritize_catalog_tracks<T: Clone>(catalog: &[T], selected: &[usi
         )
         .map(|(_, track)| track.clone())
         .collect()
+}
+pub(crate) fn sort_catalog_by_published_descending(catalog: &mut [TelegramCatalogEntry]) {
+    catalog.sort_by(|left, right| {
+        right
+            .published_at
+            .cmp(&left.published_at)
+            .then_with(|| left.channel.cmp(&right.channel))
+            .then_with(|| right.message_id.cmp(&left.message_id))
+    });
 }
 
 pub(crate) fn choose_catalog_tracks(
@@ -1831,6 +1847,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
         catalog.push(TelegramCatalogEntry {
             channel: channel.clone(),
             message_id: message.id(),
+            published_at: message.date().timestamp(),
             name: name.clone(),
         });
         if let Some(folder) = download_folder {
@@ -1999,7 +2016,10 @@ pub(crate) fn save_telegram_catalog(path: &Path, catalog: &[TelegramCatalogEntry
     let mut text = String::new();
     for entry in catalog {
         let name = entry.name.replace(['\t', '\r', '\n'], " ");
-        text.push_str(&format!("{}\t{name}\n", entry.message_id));
+        text.push_str(&format!(
+            "{}\t{}\t{name}\n",
+            entry.message_id, entry.published_at
+        ));
     }
     fs::write(path, text)
         .with_context(|| format!("failed to save Telegram song list {}", path.display()))
@@ -2011,18 +2031,30 @@ pub(crate) fn load_telegram_catalog(path: &Path) -> Result<Vec<TelegramCatalogEn
     text.lines()
         .enumerate()
         .map(|(index, line)| {
-            let (message_id, name) = line.split_once('\t').with_context(|| {
+            let mut fields = line.splitn(3, '\t');
+            let message_id = fields.next().context("missing message ID")?;
+            let second = fields.next().with_context(|| {
                 format!(
                     "invalid song list entry at {}:{}",
                     path.display(),
                     index + 1
                 )
             })?;
+            let (published_at, name) = match fields.next() {
+                Some(name) => (
+                    second.parse().with_context(|| {
+                        format!("invalid published time at {}:{}", path.display(), index + 1)
+                    })?,
+                    name,
+                ),
+                None => (0, second),
+            };
             Ok(TelegramCatalogEntry {
                 channel: String::new(),
                 message_id: message_id.parse().with_context(|| {
                     format!("invalid message ID at {}:{}", path.display(), index + 1)
                 })?,
+                published_at,
                 name: name.to_string(),
             })
         })

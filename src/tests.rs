@@ -11,13 +11,14 @@ use crate::i18n::{
     Language, load_language_from, parse_language, parse_language_catalog, parse_pack_value,
     save_language_to, tr, validate_language_pack,
 };
-use crate::local::search_local_tracks;
+use crate::local::{local_track_label, search_local_tracks, sort_tracks_by_modified_descending};
 use crate::telegram::{
     TelegramCatalogEntry, checked_position, delete_cache_directory, is_opus_path,
     load_telegram_catalog, normalize_channel_identity, open_cache_for_write,
     prioritize_catalog_tracks, private_channel_identity, private_channel_is_saved,
     private_invite_hash, save_telegram_catalog, search_catalog, search_private_channels,
-    selectable_private_channel_matches, telegram_channel_label, telegram_format_hint,
+    selectable_private_channel_matches, sort_catalog_by_published_descending,
+    telegram_channel_label, telegram_format_hint,
 };
 use crate::util::{
     LoopMode, NORMAL_TEXT_COLOR, bold_key_bindings, bold_text, fit_text, forward_track_index,
@@ -53,6 +54,15 @@ fn local_folder_menu_uses_only_the_folder_name() {
         "The-V-songs"
     );
     assert_eq!(local_folder_label(Path::new(r"D:\")), r"D:\");
+}
+
+#[test]
+fn local_track_label_uses_only_the_file_stem() {
+    assert_eq!(
+        local_track_label(Path::new(r"\\?\D:\Music\The-V-songs\_anhmuonsao_.flac")),
+        "_anhmuonsao_"
+    );
+    assert_eq!(local_track_label(Path::new("song.mp3")), "song");
 }
 
 #[test]
@@ -140,7 +150,7 @@ fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].language, Language::Vietnamese);
     assert_eq!(catalog[0].name, "Tiếng Việt");
-    assert_eq!(catalog[0].version, 2);
+    assert_eq!(catalog[0].version, 3);
     assert_eq!(catalog[0].file, "vi.lang");
     assert_eq!(
         catalog[0].sha256,
@@ -277,6 +287,7 @@ fn private_channel_identity_round_trips_through_library_and_playlist_formats() {
             channel: channel.clone(),
             message_id: 42,
             name: "Private song.opus".to_string(),
+            published_at: 0,
         }],
         local_tracks: Vec::new(),
     };
@@ -490,11 +501,13 @@ fn playlist_round_trips_multi_channel_tracks_and_order() {
                 channel: "music_channel".to_string(),
                 message_id: 7,
                 name: "First song.mp3".to_string(),
+                published_at: 0,
             },
             TelegramCatalogEntry {
                 channel: "other_channel".to_string(),
                 message_id: 9,
                 name: "Second song.flac".to_string(),
+                published_at: 0,
             },
         ],
         local_tracks: Vec::new(),
@@ -669,17 +682,19 @@ fn local_library_collection_combines_folders_without_duplicates() {
 }
 
 #[test]
-fn telegram_catalog_round_trips_track_ids_and_names() {
+fn telegram_catalog_round_trips_track_ids_times_and_names() {
     let path = PathBuf::from("target/test-telegram-catalog.txt");
     let catalog = vec![
         TelegramCatalogEntry {
             channel: String::new(),
             message_id: 12,
+            published_at: 10,
             name: "First song.mp3".to_string(),
         },
         TelegramCatalogEntry {
             channel: String::new(),
             message_id: 34,
+            published_at: 20,
             name: "Second\ttrack\n.flac".to_string(),
         },
     ];
@@ -690,7 +705,51 @@ fn telegram_catalog_round_trips_track_ids_and_names() {
 
     assert_eq!(loaded[0], catalog[0]);
     assert_eq!(loaded[1].message_id, 34);
+    assert_eq!(loaded[1].published_at, 20);
     assert_eq!(loaded[1].name, "Second track .flac");
+}
+
+#[test]
+fn telegram_catalog_loads_legacy_entries_and_sorts_recent_first() {
+    let path = PathBuf::from("target/test-telegram-catalog-legacy.txt");
+    fs::write(
+        &path,
+        "1\tOlder.mp3\n2\t200\tOlder same-time.mp3\n3\t200\tNewest same-time.mp3\n",
+    )
+    .unwrap();
+    let mut catalog = load_telegram_catalog(&path).unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(catalog[0].published_at, 0);
+    sort_catalog_by_published_descending(&mut catalog);
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|track| track.message_id)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+}
+
+#[test]
+fn local_recent_order_uses_modified_time() {
+    let root = std::env::temp_dir().join(format!(
+        "music-terminal-player-recent-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let older = root.join("a.mp3");
+    let newer = root.join("b.mp3");
+    fs::write(&older, b"").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&newer, b"").unwrap();
+    let mut tracks = vec![older.clone(), newer.clone()];
+
+    sort_tracks_by_modified_descending(&mut tracks).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert_eq!(tracks, vec![newer, older]);
 }
 
 #[test]
@@ -700,16 +759,19 @@ fn telegram_catalog_search_is_case_insensitive_and_keeps_original_indexes() {
             channel: "first_channel".to_string(),
             message_id: 1,
             name: "First Song.mp3".to_string(),
+            published_at: 0,
         },
         TelegramCatalogEntry {
             channel: "other_channel".to_string(),
             message_id: 2,
             name: "Another track.flac".to_string(),
+            published_at: 0,
         },
         TelegramCatalogEntry {
             channel: "second_channel".to_string(),
             message_id: 3,
             name: "Second SONG.ogg".to_string(),
+            published_at: 0,
         },
     ];
 

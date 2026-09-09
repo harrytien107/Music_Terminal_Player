@@ -18,7 +18,7 @@ Use this tutorial to play music already stored on your computer.
    ```
 
 5. Press `Enter`. The player scans the folder and its subfolders.
-6. Select how to play the songs, then press `Enter`.
+6. Select `Play in order`, `Shuffle`, or `Recently added`, then press `Enter`.
 
 The folder is saved for later. The menu displays only its final name, such as `The-V-songs`, but the full path remains stored internally.
 

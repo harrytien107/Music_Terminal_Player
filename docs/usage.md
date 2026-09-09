@@ -79,6 +79,8 @@ cargo run -- play .\music\song.mp3
 
 From the launcher, add a local folder once and select its saved location on later runs. Saved locations display only their final folder name, such as `The-V-songs`; the complete canonical path remains stored internally. `Forget location` removes only the saved reference; it never deletes the folder or music files.
 
+After choosing a saved folder, select `Play in order`, `Shuffle`, or `Recently added`. Recently added orders supported files by newest modification time first; paths break equal-time ties.
+
 Supported extensions: `mp3`, `flac`, `wav`, `ogg`, `opus`, `m4a`, `aac`, `alac`, `aiff`, and `webm`.
 
 ## Telegram setup
@@ -112,7 +114,7 @@ The synchronization menu groups saved channels and add/manage actions inside ali
 
 `Forget channel` supports one or many saved channels. Use `Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to forget, and `Esc` to cancel. With no toggled channels, `Enter` forgets only the highlighted channel.
 
-The scan stores audio message IDs and song names under `.music-terminal/catalogs` without downloading music. An empty scan reports Telegram's message and document counts and does not overwrite an existing catalog. Saved private-channel access is tied to the Telegram session; after changing accounts or deleting the session, forget and add that private channel again.
+The scan stores audio message IDs, publish times, and song names under `.music-terminal/catalogs` without downloading music. An empty scan reports Telegram's message and document counts and does not overwrite an existing catalog. Saved private-channel access is tied to the Telegram session; after changing accounts or deleting the session, forget and add that private channel again.
 
 CLI synchronization:
 
@@ -123,6 +125,8 @@ cargo run -- sync public_channel_username
 From `Stream Telegram channel`, choose one or multiple saved channels. Use `Space` to toggle one, `Ctrl+A` to toggle all, arrows or Page Up/Page Down to scroll, `Enter` to play, and `Esc` to return. With no toggled channels, `Enter` uses only the highlighted channel. Multiple selected catalogs are combined into one playback queue while each track keeps its original channel identity. This menu alone uses plain `Space`; searchable selection screens continue to use `Ctrl+Space` so spaces can be typed into search text.
 
 `Search and choose a track` starts the highlighted result first, then retains every other song from the selected channel catalogs under `Next from track list`. `Search and choose multiple tracks` uses `Ctrl+Space` to toggle one result, `Ctrl+A` to toggle all current matches, and `Enter` to play. Selected songs keep catalog order: the first starts immediately, the rest appear under `Next in queue`, and all unselected songs remain under `Next from track list`.
+
+Playback options include `Recently added`, which orders selected-channel tracks by newest Telegram publish time first. Equal timestamps use channel then message ID. Catalogs created before this feature have no publish times and sort last until synchronized again.
 
 If a Telegram upload is corrupt or uses an unsupported format, the player shows a short warning and keeps the queue open. Press `p`, `Space`, or `n` to continue manually with the next queued track.
 

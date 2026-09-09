@@ -55,6 +55,7 @@ Synchronization saves song names and Telegram message IDs. Run the same action l
 4. Choose a playback option:
    - `Play in order`.
    - `Shuffle`.
+   - `Recently added`, newest Telegram publish time first. Re-sync older catalogs to record publish times.
    - `Search and choose a track`.
    - `Search and choose multiple tracks`.
 

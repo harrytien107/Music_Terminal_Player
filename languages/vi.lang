@@ -1,6 +1,6 @@
 language.code=vi
 language.name=Tiếng Việt
-language.version=2
+language.version=3
 msg.a_add_next_url_or_playlist=[a] thêm URL hoặc danh sách phát tiếp theo
 msg.a_add_youtube_url_or_playlist=[a] thêm URL hoặc danh sách phát YouTube
 msg.add_folder=Thêm thư mục
@@ -113,6 +113,7 @@ msg.quit=Thoát
 msg.r_shuffle=[r] trộn bài
 msg.reconnecting=đang kết nối lại
 msg.rename_playlist=Đổi tên danh sách phát
+msg.recently_added=Thêm gần đây
 msg.rename_which_playlist=Đổi tên danh sách phát nào?
 msg.requesting_a_new_code=Đang yêu cầu mã mới.
 msg.resolving_youtube_video_and_playlist_metadata=Đang lấy thông tin video và danh sách phát YouTube...

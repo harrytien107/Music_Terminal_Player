@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,6 +36,36 @@ pub(crate) fn play_tracks(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
 
 pub(crate) fn play_tracks_shuffled(tracks: Vec<PathBuf>) -> Result<PlayerExit> {
     play_tracks_inner(tracks, tr("msg.local_library"), None, true)
+}
+pub(crate) fn play_tracks_recently_added(mut tracks: Vec<PathBuf>) -> Result<PlayerExit> {
+    sort_tracks_by_modified_descending(&mut tracks)?;
+    play_tracks(tracks)
+}
+
+pub(crate) fn sort_tracks_by_modified_descending(tracks: &mut [PathBuf]) -> Result<()> {
+    let mut dated_tracks = tracks
+        .iter()
+        .map(|track| {
+            Ok((
+                fs::metadata(track)
+                    .with_context(|| format!("failed to read metadata for {}", track.display()))?
+                    .modified()
+                    .with_context(|| {
+                        format!("failed to read modified time for {}", track.display())
+                    })?,
+                track.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    dated_tracks.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    for (track, (_, path)) in tracks.iter_mut().zip(dated_tracks) {
+        *track = path;
+    }
+    Ok(())
 }
 
 fn play_tracks_inner(
@@ -276,7 +306,7 @@ fn play_tracks_inner(
                     index,
                     &mut play_next,
                     &available_tracks,
-                    |track| track.display().to_string(),
+                    |track| local_track_label(track),
                     |track, query| {
                         track
                             .to_string_lossy()
@@ -348,12 +378,12 @@ fn start_track(
     paused: bool,
 ) -> Result<(Sink, Option<Duration>)> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let decoder = Decoder::try_from(BufReader::new(file))
-        .with_context(|| format!("failed to decode {}", path.display()))?;
+    let decoder =
+        Decoder::try_from(file).with_context(|| format!("failed to decode {}", path.display()))?;
     let duration = decoder.total_duration();
     let sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
-    let title = path.file_stem().unwrap_or_default().to_string_lossy();
+    let title = local_track_label(path);
     let artist = path
         .parent()
         .and_then(Path::file_name)
@@ -395,7 +425,7 @@ fn draw_player(
             tr("msg.track"),
             index + 1,
             tracks.len(),
-            bold_text(&tracks[index].display().to_string())
+            bold_text(&local_track_label(&tracks[index]))
         ),
         String::new(),
         format!(
@@ -420,6 +450,14 @@ fn draw_player(
     }
     rows.extend(playback_controls());
     draw_panel(stdout, &format!("Music Terminal Player · {title}"), &rows)
+}
+
+pub(crate) fn local_track_label(path: &Path) -> String {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub(crate) fn collect_tracks(path: &Path) -> Result<Vec<PathBuf>> {
@@ -477,7 +515,7 @@ pub(crate) fn choose_local_tracks(
                     " "
                 },
                 if selected.contains(track) { "x" } else { " " },
-                track.display()
+                local_track_label(track)
             ));
         }
         if matches.is_empty() {

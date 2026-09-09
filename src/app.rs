@@ -13,7 +13,8 @@ use crate::i18n::{
     set_language, tr,
 };
 use crate::local::{
-    choose_local_tracks, collect_tracks, play_path, play_tracks, play_tracks_shuffled,
+    choose_local_tracks, collect_tracks, play_tracks, play_tracks_recently_added,
+    play_tracks_shuffled,
 };
 use crate::telegram::{
     SESSION_FILE, TELEGRAM_CREDENTIALS_FILE, TelegramCatalogEntry, channel_catalog,
@@ -100,7 +101,7 @@ pub(crate) fn launch_menu() -> Result<()> {
             },
             Some(2) => {
                 while let Some(path) = choose_local_folder(&mut library)? {
-                    match play_path(&path) {
+                    match play_local_folder(&path) {
                         Ok(PlayerExit::Quit) => return Ok(()),
                         Ok(PlayerExit::Back) => {}
                         Err(error) => show_menu_error(&error)?,
@@ -722,6 +723,29 @@ pub(crate) fn local_folder_label(folder: &Path) -> String {
         .into_owned()
 }
 
+fn play_local_folder(path: &Path) -> Result<PlayerExit> {
+    let tracks = collect_tracks(path)?;
+    if tracks.is_empty() {
+        bail!("no supported audio files found in {}", path.display());
+    }
+    let items = [
+        tr("msg.play_in_order").to_string(),
+        tr("msg.shuffle_2").to_string(),
+        tr("msg.recently_added").to_string(),
+        tr("msg.back").to_string(),
+    ];
+    match select_menu(
+        &format!("{}: {}", tr("msg.local_folder"), local_folder_label(path)),
+        &items,
+    )? {
+        Some(0) => play_tracks(tracks),
+        Some(1) => play_tracks_shuffled(tracks),
+        Some(2) => play_tracks_recently_added(tracks),
+        Some(3) | None => Ok(PlayerExit::Back),
+        _ => unreachable!(),
+    }
+}
+
 fn choose_local_folder(library: &mut SavedLibrary) -> Result<Option<PathBuf>> {
     loop {
         let mut items: Vec<_> = library
@@ -1009,6 +1033,7 @@ pub(crate) fn parse_playlists(text: &str) -> Vec<Playlist> {
                     playlist.tracks.push(TelegramCatalogEntry {
                         channel: normalize_channel_identity(channel),
                         message_id,
+                        published_at: 0,
                         name: name.to_string(),
                     });
                 }
@@ -1021,6 +1046,7 @@ pub(crate) fn parse_playlists(text: &str) -> Vec<Playlist> {
                         channel: playlist.channel.clone(),
                         message_id,
                         name: name.to_string(),
+                        published_at: 0,
                     });
                 }
             }
