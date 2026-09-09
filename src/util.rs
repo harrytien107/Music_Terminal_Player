@@ -11,8 +11,18 @@ use anyhow::Result;
 
 use crate::i18n::tr;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
+
+const BOLD_START: char = '\u{1}';
+const BOLD_END: char = '\u{2}';
+
+pub(crate) const NORMAL_TEXT_COLOR: Color = Color::Rgb {
+    r: 0xd3,
+    g: 0xc6,
+    b: 0xaa,
+};
 
 pub(crate) const DATA_DIR: &str = ".music-terminal";
 pub(crate) const LIBRARY_FILE: &str = ".music-terminal/library.txt";
@@ -192,6 +202,124 @@ pub(crate) fn menu_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
         || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
 }
 
+pub(crate) fn bold_text(text: &str) -> String {
+    format!("{BOLD_START}{text}{BOLD_END}")
+}
+
+fn is_key_binding(token: &str) -> bool {
+    matches!(
+        token,
+        "Ctrl+Space"
+            | "Ctrl+A"
+            | "Up/Down"
+            | "Up/Down/Page Up/Page Down"
+            | "Left/Right"
+            | "Enter"
+            | "Esc"
+            | "Space"
+            | "Backspace"
+            | "Delete"
+            | "p/Space"
+            | "q/Ctrl+C"
+            | "n/v"
+            | "+/-"
+            | "←/→"
+            | ",/."
+            | "↑/↓"
+            | "a"
+            | "b"
+            | "l"
+            | "n"
+            | "p"
+            | "q"
+            | "r"
+            | "s"
+            | "u"
+            | "v"
+    )
+}
+
+pub(crate) fn bold_key_bindings(text: &str) -> String {
+    const KEYS: &[&str] = &[
+        "Up/Down/Page Up/Page Down",
+        "Up/Down",
+        "Left/Right",
+        "Ctrl+Space",
+        "Ctrl+A",
+        "q/Ctrl+C",
+        "p/Space",
+        "Backspace",
+        "Delete",
+        "Enter",
+        "Space",
+        "Esc",
+        "+/-",
+        "n/v",
+        "b",
+        "u",
+        "n",
+        "v",
+        "r",
+        "l",
+    ];
+
+    let mut output = String::with_capacity(text.len() + 16);
+    let mut index = 0;
+    while index < text.len() {
+        let remaining = &text[index..];
+        if let Some(close) = remaining
+            .strip_prefix('[')
+            .and_then(|value| value.find(']'))
+        {
+            let end = close + 2;
+            if is_key_binding(&remaining[1..end - 1]) {
+                output.push_str(&bold_text(&remaining[..end]));
+                index += end;
+                continue;
+            }
+        }
+
+        let boundary = index == 0
+            || text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_whitespace() || "|·(".contains(character));
+        if boundary
+            && let Some(key) = KEYS.iter().find(|key| {
+                remaining.starts_with(**key)
+                    && remaining[key.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|character| {
+                            character.is_whitespace() || "|·),".contains(character)
+                        })
+            })
+        {
+            output.push_str(&bold_text(key));
+            index += key.len();
+            continue;
+        }
+
+        let character = remaining.chars().next().expect("non-empty remainder");
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
+}
+
+fn bold_menu_title(title: &str) -> String {
+    if title.starts_with(BOLD_START) {
+        return title.to_string();
+    }
+    if title.starts_with('╭') {
+        return bold_text(title);
+    }
+    title.split_once('\n').map_or_else(
+        || bold_text(title),
+        |(first, rest)| format!("{}\n{rest}", bold_text(first)),
+    )
+}
+
 pub(crate) fn select_menu(title: &str, items: &[String]) -> Result<Option<usize>> {
     select_menu_from(title, items, 0)
 }
@@ -208,12 +336,15 @@ pub(crate) fn select_menu_from(
     let mut selected = initial_selection.min(items.len() - 1);
     let mut stdout = io::stdout();
     loop {
-        let mut frame = format!("{title}\r\n\r\n");
-        for (index, item) in items.iter().enumerate() {
+        let mut frame = if title.is_empty() {
+            String::new()
+        } else {
+            format!("{}\r\n\r\n", bold_menu_title(title))
+        };
+        for (index, label) in items.iter().enumerate() {
             frame.push_str(&format!(
-                "{} {}\r\n",
+                "{} {label}\r\n",
                 if index == selected { ">" } else { " " },
-                item
             ));
         }
         frame.push_str(tr("msg.up_down_select_enter_confirm_esc_back_q"));
@@ -457,9 +588,9 @@ where
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
-        fit_text(tr("msg.now_playing"), WIDTH),
-        fit_text(tr("msg.next_in_queue"), WIDTH),
-        fit_text(tr("msg.next_from_track_list"), WIDTH),
+        bold_text(&fit_text(tr("msg.now_playing"), WIDTH)),
+        bold_text(&fit_text(tr("msg.next_in_queue"), WIDTH)),
+        bold_text(&fit_text(tr("msg.next_from_track_list"), WIDTH)),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
         "─".repeat(WIDTH),
@@ -793,20 +924,39 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if UnicodeWidthStr::width(text) <= width {
-        return format!("{text}{}", " ".repeat(width - UnicodeWidthStr::width(text)));
+    let visible_width = text
+        .chars()
+        .filter(|character| !matches!(*character, BOLD_START | BOLD_END))
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    if visible_width <= width {
+        return format!("{text}{}", " ".repeat(width - visible_width));
     }
 
     let content_width = width.saturating_sub(1);
     let mut value = String::new();
     let mut used = 0usize;
+    let mut bold = false;
     for character in text.chars() {
+        if character == BOLD_START {
+            bold = true;
+            value.push(character);
+            continue;
+        }
+        if character == BOLD_END {
+            bold = false;
+            value.push(character);
+            continue;
+        }
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
         if used + character_width > content_width {
             break;
         }
         value.push(character);
         used += character_width;
+    }
+    if bold {
+        value.push(BOLD_END);
     }
     value.push('…');
     value.push_str(&" ".repeat(width.saturating_sub(used + 1)));
@@ -823,11 +973,34 @@ pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
         queue!(
             output,
             terminal::Clear(ClearType::CurrentLine),
-            cursor::MoveToColumn(0)
+            cursor::MoveToColumn(0),
+            SetForegroundColor(NORMAL_TEXT_COLOR)
         )?;
-        output.write_all(line.trim_end_matches('\r').as_bytes())?;
+        let line = line.trim_end_matches('\r');
+        let line = if index == 0 && !line.contains(BOLD_START) {
+            bold_text(line)
+        } else {
+            line.to_string()
+        };
+        let styled_line = bold_key_bindings(&line);
+        for part in styled_line.split_inclusive([BOLD_START, BOLD_END]) {
+            if let Some(text) = part.strip_suffix(BOLD_START) {
+                output.write_all(text.as_bytes())?;
+                queue!(output, SetAttribute(Attribute::Bold))?;
+            } else if let Some(text) = part.strip_suffix(BOLD_END) {
+                output.write_all(text.as_bytes())?;
+                queue!(output, SetAttribute(Attribute::NormalIntensity))?;
+            } else {
+                output.write_all(part.as_bytes())?;
+            }
+        }
     }
-    queue!(output, terminal::Clear(ClearType::FromCursorDown))?;
+    queue!(
+        output,
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        terminal::Clear(ClearType::FromCursorDown)
+    )?;
     stdout.write_all(&output)?;
     stdout.flush()?;
     Ok(())
@@ -845,7 +1018,7 @@ pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) 
     let width = content.clamp(28, 52).min(available.max(28));
     let mut frame = String::new();
     frame.push_str(&format!("┌{}┐\r\n", "─".repeat(width + 2)));
-    frame.push_str(&format!("│ {} │\r\n", fit_text(title, width)));
+    frame.push_str(&format!("│ {} │\r\n", bold_text(&fit_text(title, width))));
     frame.push_str(&format!("├{}┤\r\n", "─".repeat(width + 2)));
     for row in rows {
         frame.push_str(&format!("│ {} │\r\n", fit_text(row, width)));

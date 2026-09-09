@@ -26,7 +26,7 @@ Run it:
 .\target\release\music-terminal-player.exe
 ```
 
-Running or double-clicking the executable opens the launcher. `Play YouTube audio` is the second row for quick access. Use `Up` / `Down` to select, `Enter` to confirm, and `Esc` to return. Add `--borderless` to remove the classic Windows Console Host border and size its window to 1200×500 pixels:
+Running or double-clicking the executable opens the boxed ten-action launcher without blank rows. YouTube is red, local-folder playback is green, and Telegram streaming is cyan. Normal text, menu titles, and box borders throughout the interface use the warm neutral color `#d3c6aa`. The complete launcher title box and each menu or player title are bold. Login shows the current Telegram login state. Use `Enter` to confirm and `Esc` to return. Add `--borderless` to remove the classic Windows Console Host border and size its window to 1200×500 pixels:
 
 ```powershell
 .\target\release\music-terminal-player.exe --borderless
@@ -58,7 +58,7 @@ If the catalog is unavailable, English and installed valid packs remain selectab
 - `b` / `Esc`: return to the previous menu; `Esc` at the launcher keeps the player open
 - `q` / `Ctrl+C`: quit completely from a player or menu; the launcher's `Quit` option also exits
 
-The queue has `Now playing`, `Next in queue`, and `Next from track list` columns. Use `Up` / `Down` to select, `Enter` to play, `Delete` to unqueue a selected `Next in queue` item, `a` to add next, and `Esc` to close. Delete does nothing in `Now playing` or `Next from track list`. Unqueueing leaves an existing track-list copy in place; a unique queued item returns to the end of `Next from track list`. Local and Telegram queues use existing-track search. YouTube prompts for another URL or playlist. Audio continues while the queue is open, and automatic track changes keep the queue open.
+The player displays the current local song, Telegram song, or YouTube video title in bold. The queue has bold `Now playing`, `Next in queue`, and `Next from track list` column headings. Use `Up` / `Down` to select, `Enter` to play, `Delete` to unqueue a selected `Next in queue` item, `a` to add next, and `Esc` to close. Delete does nothing in `Now playing` or `Next from track list`. Unqueueing leaves an existing track-list copy in place; a unique queued item returns to the end of `Next from track list`. Local and Telegram queues use existing-track search. YouTube prompts for another URL or playlist. Audio continues while the queue is open, and automatic track changes keep the queue open. In on-screen control hints, only key tokens such as `[s]`, `Enter`, or `q/Ctrl+C` are bold; action words remain normal.
 
 A track-list entry is consumed once per playback pass. Duplicate entries remain separate plays, a manually queued copy is an extra play, and manual Previous may replay an entry without changing automatic forward progress. Loop Off stops after the remaining channel or track list is exhausted. Loop All starts a new full pass only after exhaustion. Loop One repeats only the current track. Toggling shuffle changes only the unplayed `Next from track list` tail; the current track, already consumed tracks, and manually ordered `Next in queue` entries do not move.
 
@@ -158,15 +158,16 @@ The download action updates the catalog, skips existing files, and reports progr
 On first use, choose one setup option:
 
 - `Download portable yt-dlp and FFmpeg` downloads both Windows executables into a `tools` folder beside the player executable and automatically saves both executable locations in `.music-terminal/youtube-tools.txt`. Portable setup uses Windows `curl.exe` and `tar.exe` and requires access to GitHub and gyan.dev.
-- `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH`.
+- `Use existing yt-dlp and FFmpeg installations` accepts full executable paths or commands available on `PATH` during first-time setup.
+- `Use your own yt-dlp and FFmpeg` remains available in `YouTube tools and updater` after setup. It validates both replacements before saving them, so invalid input does not replace the working configuration.
 
 Tool paths are saved in `.music-terminal/youtube-tools.txt`. When the complete portable folder is moved, the player detects the saved `tools/yt-dlp.exe` and `tools/ffmpeg.exe` pair, rebases both paths beside the running executable, and saves the repaired paths. A remaining sibling tool is enough to identify the moved folder, so the updater can reinstall either missing portable tool. yt-dlp is validated with `--version`; FFmpeg is validated with `-version`.
 
-`YouTube tools and updater` displays installed versions. Choose `Check for tool updates` to compare them with GitHub's latest stable yt-dlp release and Gyan.dev's latest FFmpeg Essentials version. Results show `latest`, `update available`, `newer than stable`, or `unable to check`; they are cached only while this menu remains open. The check uses a 10-second network timeout, does not block playback or startup, and never runs in the background. External paths and `PATH` commands receive version status but are never rewritten or updated by the player.
+`YouTube tools and updater` displays installed versions. Choose `Check for tool updates` to compare them with GitHub's latest stable yt-dlp release and Gyan.dev's latest FFmpeg Essentials version. Results show `latest`, `update available`, `newer than stable`, or `unable to check`; they are cached only while this menu remains open. The check uses a 10-second network timeout, does not block playback or startup, and never runs in the background. External paths and `PATH` commands receive version status but are never rewritten or updated by the player. Use `Use your own yt-dlp and FFmpeg` to switch between portable, external, or `PATH` tool pairs at any time.
 
 The manual update actions download and validate GitHub's fixed latest yt-dlp release asset and Gyan.dev's latest FFmpeg Essentials archive. `Update both portable tools` runs both updates only when both configured files are inside the application-relative `tools` folder. Updates are staged beside the application, and an existing executable is restored if installation fails.
 
-Start YouTube playback from the launcher or CLI:
+Start YouTube playback from the launcher or CLI. `Quick play` also provides `Play YouTube URL or playlist`, which opens URL input directly without first opening the full YouTube submenu:
 
 ```powershell
 cargo run -- youtube

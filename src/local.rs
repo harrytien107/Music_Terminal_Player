@@ -15,7 +15,7 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    LoopMode, MAX_VOLUME, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
+    LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, draw_frame, draw_panel, format_duration,
     forward_track_index, insert_queue_next, is_supported_audio_path, load_volume, manage_queue,
     playback_controls, previous_track_index, progress_bar, restart_pass_order, save_volume,
     set_shuffle_order, shuffle_slice, toggle_all,
@@ -395,7 +395,7 @@ fn draw_player(
             tr("msg.track"),
             index + 1,
             tracks.len(),
-            tracks[index].display()
+            bold_text(&tracks[index].display().to_string())
         ),
         String::new(),
         format!(

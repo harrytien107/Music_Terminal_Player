@@ -4,9 +4,9 @@
     {
       "code": "vi",
       "name": "Tiếng Việt",
-      "version": 1,
+      "version": 2,
       "file": "vi.lang",
-      "sha256": "54ced1b38e770b9260d3d54a136f031a26f7be656b63b5733b63c058eeae5f47"
+      "sha256": "d038a3a4b74f3260d2e1933b3e9acddfc2c00c75d5e6e8cc12dc0806b957ce18"
     }
   ]
 }

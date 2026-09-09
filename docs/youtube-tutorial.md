@@ -20,7 +20,7 @@ If yt-dlp and FFmpeg are already installed, select `Use existing yt-dlp and FFmp
 
 ## Play YouTube audio
 
-1. Open `Play YouTube audio`.
+1. Open `Play YouTube audio`, or open `Quick play` to reach URL input faster.
 2. Select `Play YouTube URL or playlist`.
 3. Paste one of these:
    - One video URL.
@@ -68,14 +68,16 @@ The new tracks are added under `Next in queue` while current audio continues.
 
 Settings persist in `.music-terminal/youtube-sponsorblock.txt`. Playback continues normally when no SponsorBlock timestamp exists.
 
-## Check or update tools
+## Change, check, or update tools
 
 1. Open `Play YouTube audio`.
 2. Select `YouTube tools and updater`.
-3. Select `Check for tool updates`.
-4. If an update is available, select the yt-dlp, FFmpeg, or combined update action.
+3. Choose an action:
+   - `Use your own yt-dlp and FFmpeg` validates and saves a new executable-path or `PATH` pair.
+   - `Check for tool updates` checks the configured versions.
+   - An update action replaces one or both portable tools.
 
-The built-in updater changes only portable tools in the application-relative `tools` folder. It does not overwrite external or `PATH` installations.
+The player saves a custom pair only after both tools pass validation. The built-in updater changes only portable tools in the application-relative `tools` folder. It does not overwrite external or `PATH` installations.
 
 ## If playback fails
 

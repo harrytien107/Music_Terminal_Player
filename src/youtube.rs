@@ -19,8 +19,8 @@ use crate::audio_output::AudioOutput;
 use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_panel, format_duration,
-    forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_panel,
+    format_duration, forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
     playback_controls, previous_track_index, progress_bar, prompt, restart_pass_order, save_volume,
     select_menu, select_menu_from, set_shuffle_order,
 };
@@ -274,13 +274,7 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
         ];
         match select_menu(tr("msg.youtube_audio"), &items)? {
             Some(0) => {
-                let tools = load_or_prompt_tools()?;
-                let tracks = prompt_and_resolve_tracks(&tools)?;
-                if tracks.is_empty() {
-                    continue;
-                }
-                let sponsor_settings = load_sponsorblock_settings();
-                if play_youtube_tracks(tracks, &tools, &sponsor_settings)? == PlayerExit::Quit {
+                if play_youtube_url_or_playlist()? == PlayerExit::Quit {
                     return Ok(PlayerExit::Quit);
                 }
             }
@@ -290,6 +284,15 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
             _ => unreachable!(),
         }
     }
+}
+
+pub(crate) fn play_youtube_url_or_playlist() -> Result<PlayerExit> {
+    let tools = load_or_prompt_tools()?;
+    let tracks = prompt_and_resolve_tracks(&tools)?;
+    if tracks.is_empty() {
+        return Ok(PlayerExit::Back);
+    }
+    play_youtube_tracks(tracks, &tools, &load_sponsorblock_settings())
 }
 
 fn parse_sponsorblock_settings(text: &str) -> SponsorBlockSettings {
@@ -820,8 +823,19 @@ fn update_portable_ffmpeg(ffmpeg: &Path) -> Result<()> {
     install_staged_tool(ffmpeg, &download, &backup, "FFmpeg")
 }
 
+pub(crate) fn youtube_tool_menu_items() -> Vec<String> {
+    vec![
+        format!("⌕  {}", tr("msg.check_for_tool_updates")),
+        format!("✎  {}", tr("msg.use_your_own_yt_dlp_and_ffmpeg")),
+        format!("↓  {}", tr("msg.update_portable_yt_dlp_stable")),
+        format!("↓  {}", tr("msg.update_portable_ffmpeg_gyan_essentials")),
+        format!("↓  {}", tr("msg.update_both_portable_tools")),
+        format!("←  {}", tr("msg.back")),
+    ]
+}
+
 fn manage_youtube_tools() -> Result<()> {
-    let tools = match fs::read_to_string(TOOLS_FILE)
+    let mut tools = match fs::read_to_string(TOOLS_FILE)
         .ok()
         .and_then(|text| parse_youtube_tools(&text))
         .map(repair_portable_tool_paths)
@@ -865,20 +879,25 @@ fn manage_youtube_tools() -> Result<()> {
                 tr("msg.disabled_for_external_path_installations")
             }
         );
-        let items = vec![
-            format!("⌕  {}", tr("msg.check_for_tool_updates")),
-            format!("↓  {}", tr("msg.update_portable_yt_dlp_stable")),
-            format!("↓  {}", tr("msg.update_portable_ffmpeg_gyan_essentials")),
-            format!("↓  {}", tr("msg.update_both_portable_tools")),
-            format!("←  {}", tr("msg.back")),
-        ];
+        let items = youtube_tool_menu_items();
         match select_menu(&title, &items)? {
             Some(0) => {
                 clear_screen()?;
                 println!("{}", tr("msg.checking_stable_yt_dlp_and_ffmpeg_versions"));
                 updates = Some(check_tool_updates());
             }
-            Some(1) if portable_yt_dlp => {
+            Some(1) => {
+                let replacement = prompt_existing_tools()?;
+                validate_tool(&replacement.yt_dlp, "--version")
+                    .context("yt-dlp validation failed")?;
+                validate_tool(&replacement.ffmpeg, "-version")
+                    .context("FFmpeg validation failed")?;
+                fs::create_dir_all(DATA_DIR)?;
+                fs::write(TOOLS_FILE, serialize_youtube_tools(&replacement))?;
+                tools = replacement;
+                updates = None;
+            }
+            Some(2) if portable_yt_dlp => {
                 clear_screen()?;
                 println!(
                     "{}",
@@ -889,7 +908,7 @@ fn manage_youtube_tools() -> Result<()> {
                 println!("{}", tr("msg.yt_dlp_updated_successfully"));
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(1) => {
+            Some(2) => {
                 clear_screen()?;
                 println!(
                     "{}\n{}: {}",
@@ -899,7 +918,7 @@ fn manage_youtube_tools() -> Result<()> {
                 );
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(2) if portable_ffmpeg => {
+            Some(3) if portable_ffmpeg => {
                 clear_screen()?;
                 println!(
                     "{}",
@@ -910,7 +929,7 @@ fn manage_youtube_tools() -> Result<()> {
                 println!("{}", tr("msg.ffmpeg_updated_successfully"));
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(2) => {
+            Some(3) => {
                 clear_screen()?;
                 println!(
                     "{}\n{}: {}",
@@ -920,7 +939,7 @@ fn manage_youtube_tools() -> Result<()> {
                 );
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(3) if portable_yt_dlp && portable_ffmpeg => {
+            Some(4) if portable_yt_dlp && portable_ffmpeg => {
                 clear_screen()?;
                 println!(
                     "{}",
@@ -936,7 +955,7 @@ fn manage_youtube_tools() -> Result<()> {
                 println!("{}", tr("msg.yt_dlp_and_ffmpeg_updated_successfully"));
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(3) => {
+            Some(4) => {
                 clear_screen()?;
                 println!(
                     "{}",
@@ -944,7 +963,7 @@ fn manage_youtube_tools() -> Result<()> {
                 );
                 prompt(tr("msg.press_enter_to_go_back"))?;
             }
-            Some(4) | None => return Ok(()),
+            Some(5) | None => return Ok(()),
             _ => unreachable!(),
         }
     }
@@ -1388,7 +1407,7 @@ fn play_youtube_tracks(
                             "Track {}/{} | {}",
                             index + 1,
                             tracks.len(),
-                            tracks[index].title
+                            bold_text(&tracks[index].title)
                         ),
                         String::new(),
                         recovery_message(interruption, stream_failures).to_string(),
@@ -1877,7 +1896,7 @@ fn draw_youtube_player(
             tr("msg.track"),
             index + 1,
             tracks.len(),
-            tracks[index].title
+            bold_text(&tracks[index].title)
         ),
         String::new(),
         format!(

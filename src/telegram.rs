@@ -33,11 +33,11 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
-    format_duration, format_elapsed, forward_track_index, is_supported_audio_path, load_volume,
-    manage_queue, normalize_channel, playback_controls, previous_track_index, progress_bar, prompt,
-    restart_pass_order, safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice,
-    toggle_all,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
+    draw_panel, format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
+    load_volume, manage_queue, normalize_channel, playback_controls, previous_track_index,
+    progress_bar, prompt, restart_pass_order, safe_file_name, save_volume, select_menu,
+    set_shuffle_order, shuffle_slice, toggle_all,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -1535,7 +1535,7 @@ fn draw_telegram_player(
             tr("msg.track"),
             index + 1,
             tracks.len(),
-            tracks[index].name
+            bold_text(&tracks[index].name)
         ),
         String::new(),
         format!(

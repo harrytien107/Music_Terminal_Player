@@ -3,8 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::app::{
-    Playlist, collect_library_tracks, local_folder_label, parse_playlists,
-    selected_or_highlighted_channel_indexes, serialize_playlists,
+    Playlist, collect_library_tracks, launcher_items, local_folder_label, parse_playlists,
+    quick_play_items, selected_or_highlighted_channel_indexes, serialize_playlists,
 };
 use crate::audio_output::{DEVICE_UNAVAILABLE_MESSAGE, device_unavailable_error};
 use crate::i18n::{
@@ -20,13 +20,15 @@ use crate::telegram::{
     selectable_private_channel_matches, telegram_channel_label, telegram_format_hint,
 };
 use crate::util::{
-    LoopMode, fit_text, forward_track_index, insert_queue_next, is_supported_audio_path,
-    menu_quit_key, next_track_index, normalize_channel, parse_volume_settings, playback_controls,
-    previous_track_index, progress_bar, queue_window_start, restart_pass_order, safe_file_name,
-    set_shuffle_order, shuffle_slice, toggle_all, unqueue_next_item,
+    LoopMode, NORMAL_TEXT_COLOR, bold_key_bindings, bold_text, fit_text, forward_track_index,
+    insert_queue_next, is_supported_audio_path, menu_quit_key, next_track_index, normalize_channel,
+    parse_volume_settings, playback_controls, previous_track_index, progress_bar,
+    queue_window_start, restart_pass_order, safe_file_name, set_shuffle_order, shuffle_slice,
+    toggle_all, unqueue_next_item,
 };
 use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
+    youtube_tool_menu_items,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
@@ -58,6 +60,48 @@ fn menu_quit_keys_exclude_escape() {
     assert!(menu_quit_key(KeyCode::Char('q'), KeyModifiers::NONE));
     assert!(menu_quit_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(!menu_quit_key(KeyCode::Esc, KeyModifiers::NONE));
+}
+
+#[test]
+fn launcher_orders_actions_and_colors_source_entries() {
+    let items = launcher_items("logged in");
+    assert_eq!(
+        NORMAL_TEXT_COLOR,
+        crossterm::style::Color::Rgb {
+            r: 211,
+            g: 198,
+            b: 170
+        }
+    );
+    assert_eq!(items.len(), 10);
+    assert!(!items[0].contains("\x1b["));
+    assert!(items[1].contains("\x1b[38;5;9m"));
+    assert!(items[2].contains("\x1b[38;5;10m"));
+    assert!(items[3].contains("\x1b[38;5;14m"));
+    assert!(items[4].contains("Open playlists"));
+    assert!(!items[4].contains("\x1b["));
+    assert!(!items[4].contains("\r\n"));
+    assert!(items[5].contains("Sync and update Telegram channel"));
+    assert!(!items[5].contains("\x1b["));
+    assert!(items[6].contains("Login to Telegram · logged in"));
+    assert!(!items[6].contains("\x1b["));
+    assert!(items[7..].iter().all(|item| !item.contains("\x1b[")));
+}
+
+#[test]
+fn quick_play_and_youtube_tools_expose_direct_and_custom_actions() {
+    assert!(
+        quick_play_items()
+            .iter()
+            .any(|item| item.contains("Play YouTube URL or playlist"))
+    );
+    let tools = youtube_tool_menu_items();
+    assert_eq!(tools.len(), 6);
+    assert!(
+        tools
+            .iter()
+            .any(|item| item.contains("Use your own yt-dlp and FFmpeg"))
+    );
 }
 
 #[test]
@@ -96,7 +140,7 @@ fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].language, Language::Vietnamese);
     assert_eq!(catalog[0].name, "Tiếng Việt");
-    assert_eq!(catalog[0].version, 1);
+    assert_eq!(catalog[0].version, 2);
     assert_eq!(catalog[0].file, "vi.lang");
     assert_eq!(
         catalog[0].sha256,
@@ -376,6 +420,40 @@ fn player_progress_bar_is_bounded() {
 fn panel_text_is_padded_or_clipped() {
     assert_eq!(fit_text("song", 6), "song  ");
     assert_eq!(fit_text("long song", 6), "long …");
+}
+
+#[test]
+fn bold_text_markers_do_not_change_panel_width() {
+    assert_eq!(
+        fit_text(&bold_text("abcdefghij"), 6),
+        format!("{}…", bold_text("abcde"))
+    );
+    assert_eq!(
+        fit_text(&bold_text("song"), 8),
+        format!("{}    ", bold_text("song"))
+    );
+}
+
+#[test]
+fn only_key_binding_tokens_are_marked_bold() {
+    assert_eq!(
+        bold_key_bindings("[s]kip sponsors | [b] back | q/Ctrl+C quit"),
+        format!(
+            "{}kip sponsors | {} back | {} quit",
+            bold_text("[s]"),
+            bold_text("[b]"),
+            bold_text("q/Ctrl+C")
+        )
+    );
+    assert_eq!(
+        bold_key_bindings("Up/Down select | Enter confirm | Esc back"),
+        format!(
+            "{} select | {} confirm | {} back",
+            bold_text("Up/Down"),
+            bold_text("Enter"),
+            bold_text("Esc")
+        )
+    );
 }
 
 #[test]

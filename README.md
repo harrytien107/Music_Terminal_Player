@@ -19,8 +19,9 @@ A small terminal player for local libraries and online sources without the overh
 - Automatic YouTube recovery when the default audio output changes
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
 - Built-in offline English UI with optional, verified Vietnamese download and persistent selection
-- Unicode-aware terminal panels and queue columns
-- Portable or existing yt-dlp and FFmpeg setup with manual portable tool updates
+- Unicode-aware terminal panels, compact color-coded launcher actions, and queue columns
+- Portable or custom yt-dlp and FFmpeg setup with manual portable tool updates
+- Direct YouTube URL or playlist input from Quick play
 
 ## Installing
 Windows is supported. macOS and Linux support are planned.
@@ -29,7 +30,7 @@ Windows binaries are available in the [releases](https://github.com/harrytien107
 
 ## Tutorials
 
-New to Music Terminal Player? Start with the guide for the source you want to play:
+Don't know how to use? Start with the guide for the source you want to play:
 
 - [Local music tutorial](docs/local-tutorial.md) — add a music folder, play saved folders, and use playback controls.
 - [Telegram tutorial](docs/telegram-tutorial.md) — create API credentials, log in, synchronize channels, and stream or download music.

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::Stylize;
 use tokio::runtime;
 
 use crate::i18n::{
@@ -61,29 +62,32 @@ struct SavedLibrary {
     folders: Vec<PathBuf>,
 }
 
+pub(crate) fn launcher_items(telegram_status: &str) -> Vec<String> {
+    vec![
+        format!("▶  {}", tr("msg.quick_play")),
+        format!("{}", format!("▶  {}", tr("msg.play_youtube_audio")).red()),
+        format!("{}", format!("♫  {}", tr("msg.play_local_folder")).green()),
+        format!(
+            "{}",
+            format!("☁  {}", tr("msg.stream_telegram_channel")).cyan()
+        ),
+        format!("≡  {}", tr("msg.open_playlists")),
+        format!("↻  {}", tr("msg.sync_and_update_telegram_channel")),
+        format!("●  {} · {telegram_status}", tr("msg.login_to_telegram")),
+        format!("↓  {}", tr("msg.download_telegram_channel_to_music")),
+        format!("⚙  {}", tr("msg.language")),
+        format!("×  {}", tr("msg.quit")),
+    ]
+}
+
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
     loop {
-        let items = vec![
-            format!("▶  {}", tr("msg.quick_play")),
-            format!("▶  {}", tr("msg.play_youtube_audio")),
-            format!("♫  {}", tr("msg.play_local_folder")),
-            format!("☁  {}", tr("msg.stream_telegram_channel")),
-            format!("↻  {}", tr("msg.sync_and_update_telegram_channel")),
-            format!("↓  {}", tr("msg.download_telegram_channel_to_music")),
-            format!("≡  {}", tr("msg.open_playlists")),
-            format!("●  {}", tr("msg.login_to_telegram")),
-            format!("⚙  {}", tr("msg.language")),
-            format!("×  {}", tr("msg.quit")),
-        ];
-        let title = format!(
-            "╭──────────────────────────────────────╮\n\
-             │        MUSIC TERMINAL PLAYER         │\n\
-             ╰──────────────────────────────────────╯\n\
-             Telegram · {}",
-            telegram_login_status()
-        );
-        match select_menu(&title, &items)? {
+        let items = launcher_items(telegram_login_status());
+        let title = "╭──────────────────────────────────────╮\n\
+                     │        MUSIC TERMINAL PLAYER         │\n\
+                     ╰──────────────────────────────────────╯";
+        match select_menu(title, &items)? {
             Some(0) => {
                 if quick_play_menu(&library)? == PlayerExit::Quit {
                     return Ok(());
@@ -119,6 +123,11 @@ pub(crate) fn launch_menu() -> Result<()> {
                 }
             }
             Some(4) => {
+                if manage_playlists(&mut library)? == PlayerExit::Quit {
+                    return Ok(());
+                }
+            }
+            Some(5) => {
                 while let Some(channels) = choose_channel_to_sync(&mut library)? {
                     let total = channels.len();
                     let mut summary = Vec::with_capacity(total);
@@ -162,22 +171,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                     prompt(tr("msg.press_enter_to_continue"))?;
                 }
             }
-            Some(5) => {
-                if let Some(channel) =
-                    choose_saved_channel(&library, tr("msg.download_saved_telegram_channel"))?
-                {
-                    runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(download_channel(&channel, Path::new("music")))?;
-                }
-            }
-            Some(6) => {
-                if manage_playlists(&mut library)? == PlayerExit::Quit {
-                    return Ok(());
-                }
-            }
-            Some(7) => loop {
+            Some(6) => loop {
                 clear_screen()?;
                 let result = runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -198,6 +192,16 @@ pub(crate) fn launch_menu() -> Result<()> {
                     }
                 }
             },
+            Some(7) => {
+                if let Some(channel) =
+                    choose_saved_channel(&library, tr("msg.download_saved_telegram_channel"))?
+                {
+                    runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(download_channel(&channel, Path::new("music")))?;
+                }
+            }
             Some(8) => manage_language()?,
             Some(9) => return Ok(()),
             None => {}
@@ -276,12 +280,17 @@ fn manage_language() -> Result<()> {
     Ok(())
 }
 
-fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
-    let items = vec![
+pub(crate) fn quick_play_items() -> Vec<String> {
+    vec![
         format!("▶  {}", tr("msg.shuffle_telegram_library")),
         format!("♫  {}", tr("msg.shuffle_local_library")),
+        format!("▶  {}", tr("msg.play_youtube_url_or_playlist")),
         format!("←  {}", tr("msg.back")),
-    ];
+    ]
+}
+
+fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
+    let items = quick_play_items();
     loop {
         match select_menu(tr("msg.quick_play"), &items)? {
             Some(0) => {
@@ -304,7 +313,12 @@ fn quick_play_menu(library: &SavedLibrary) -> Result<PlayerExit> {
                     Err(error) => show_menu_error(&error)?,
                 }
             }
-            Some(2) | None => return Ok(PlayerExit::Back),
+            Some(2) => match crate::youtube::play_youtube_url_or_playlist() {
+                Ok(PlayerExit::Quit) => return Ok(PlayerExit::Quit),
+                Ok(PlayerExit::Back) => {}
+                Err(error) => show_menu_error(&error)?,
+            },
+            Some(3) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
         }
     }
@@ -1054,7 +1068,7 @@ pub(crate) fn serialize_playlists(playlists: &[Playlist]) -> String {
 
 fn telegram_login_status() -> &'static str {
     if Path::new(SESSION_FILE).exists() && Path::new(TELEGRAM_CREDENTIALS_FILE).exists() {
-        tr("msg.logged_in_saved_session")
+        tr("msg.logged_in")
     } else {
         tr("msg.not_logged_in")
     }
