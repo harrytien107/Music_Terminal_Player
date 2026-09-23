@@ -15,10 +15,10 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, draw_frame, draw_panel, format_duration,
+    LoopMode, MAX_VOLUME, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
     forward_track_index, insert_queue_next, is_supported_audio_path, load_volume, manage_queue,
-    playback_controls, previous_track_index, progress_bar, restart_pass_order, save_volume,
-    set_shuffle_order, shuffle_slice, toggle_all,
+    playback_controls, player_title_row, previous_track_index, progress_bar, restart_pass_order,
+    save_volume, set_shuffle_order, shuffle_slice, toggle_all,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -256,7 +256,7 @@ fn play_tracks_inner(
                     false,
                 )?;
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if key.modifiers.is_empty() => {
                 index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                 (sink, duration) = start_track(
                     output.stream(),
@@ -420,12 +420,11 @@ fn draw_player(
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
-        format!(
-            "{} {}/{} | {}",
+        player_title_row(
             tr("msg.track"),
-            index + 1,
+            index,
             tracks.len(),
-            bold_text(&local_track_label(&tracks[index]))
+            &local_track_label(&tracks[index]),
         ),
         String::new(),
         format!(

@@ -21,8 +21,8 @@ use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_panel,
     format_duration, forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
-    playback_controls, previous_track_index, progress_bar, prompt, restart_pass_order, save_volume,
-    select_menu, select_menu_from, set_shuffle_order,
+    playback_controls, player_title_row, previous_track_index, progress_bar, prompt,
+    restart_pass_order, save_volume, select_menu, select_menu_from, set_shuffle_order,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -127,8 +127,14 @@ struct YouTubePlayback {
     sink: Sink,
     ffmpeg: SharedChild,
     media_url: String,
+    bitrate_kbps: Option<u32>,
     offset: Duration,
     rate: f32,
+}
+
+struct ResolvedAudioStream {
+    url: String,
+    bitrate_kbps: Option<u32>,
 }
 
 impl YouTubePlayback {
@@ -1098,9 +1104,9 @@ fn parse_youtube_track_line(line: &str) -> Option<YouTubeTrack> {
 }
 
 fn youtube_stream_format() -> &'static str {
-    // ponytail: Progressive MP4 is less bandwidth-efficient than DASH, but its front-loaded index
-    // makes FFmpeg seeking reliable. Add a local segment cache if format 18 disappears broadly.
-    "18/bestaudio/best"
+    // Prefer audio-only Opus/AAC for quality, then fall back to progressive MP4 for compatibility.
+    // Keep itag 18 available because its front-loaded index has historically made seeking reliable.
+    "251/140/18/bestaudio/best"
 }
 
 fn youtube_extractor_args() -> &'static str {
@@ -1109,7 +1115,32 @@ fn youtube_extractor_args() -> &'static str {
     "youtube:player_client=android"
 }
 
-fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<String> {
+fn parse_resolved_audio_stream(line: &str) -> Option<ResolvedAudioStream> {
+    let mut fields = line.trim().splitn(3, '\t');
+    let format_id = fields.next()?;
+    let url = fields.next()?;
+    let abr = fields.next()?;
+    if url.is_empty() {
+        return None;
+    }
+    let bitrate_kbps = abr
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.round() as u32)
+        .or_else(|| match format_id {
+            "251" => Some(160),
+            "140" => Some(128),
+            "18" => Some(96),
+            _ => None,
+        });
+    Some(ResolvedAudioStream {
+        url: url.to_string(),
+        bitrate_kbps,
+    })
+}
+
+fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<ResolvedAudioStream> {
     let output = Command::new(&tools.yt_dlp)
         .args([
             "--no-warnings",
@@ -1118,7 +1149,8 @@ fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Strin
             youtube_extractor_args(),
             "--format",
             youtube_stream_format(),
-            "--get-url",
+            "--print",
+            "%(format_id)s\t%(url)s\t%(abr)s",
         ])
         .arg(&track.webpage_url)
         .stdin(Stdio::null())
@@ -1131,7 +1163,7 @@ fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Strin
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
+        .and_then(parse_resolved_audio_stream)
         .context("yt-dlp returned no direct audio stream URL")
 }
 
@@ -1199,6 +1231,7 @@ fn playback_from_url(
     stream: &OutputStream,
     tools: &YouTubeTools,
     media_url: String,
+    bitrate_kbps: Option<u32>,
     volume: f32,
     offset: Duration,
     rate: f32,
@@ -1215,6 +1248,7 @@ fn playback_from_url(
         sink,
         ffmpeg,
         media_url,
+        bitrate_kbps,
         offset,
         rate,
     })
@@ -1227,10 +1261,12 @@ fn start_track(
     volume: f32,
     rate: f32,
 ) -> Result<YouTubePlayback> {
+    let resolved = resolve_audio_url(tools, track)?;
     playback_from_url(
         stream,
         tools,
-        resolve_audio_url(tools, track)?,
+        resolved.url,
+        resolved.bitrate_kbps,
         volume,
         Duration::ZERO,
         rate,
@@ -1264,6 +1300,7 @@ fn restart_playback(
         stream,
         tools,
         playback.media_url.clone(),
+        playback.bitrate_kbps,
         volume,
         offset,
         rate,
@@ -1427,9 +1464,16 @@ fn play_youtube_tracks(
                                 },
                             )
                         } else {
-                            resolve_audio_url(tools, &tracks[index]).and_then(|media_url| {
+                            resolve_audio_url(tools, &tracks[index]).and_then(|resolved| {
                                 playback_from_url(
-                                    stream, tools, media_url, volume, offset, rate, paused,
+                                    stream,
+                                    tools,
+                                    resolved.url,
+                                    resolved.bitrate_kbps,
+                                    volume,
+                                    offset,
+                                    rate,
+                                    paused,
                                 )
                             })
                         }
@@ -1535,7 +1579,7 @@ fn play_youtube_tracks(
                             last_skipped = None;
                             media_controls.set_track(&tracks[index].title, "YouTube");
                         }
-                        KeyCode::Char('v') => {
+                        KeyCode::Char('v') if key.modifiers.is_empty() => {
                             index =
                                 previous_track_index(index, tracks.len(), &mut resume_after_replay);
                             changed_track = true;
@@ -1739,7 +1783,7 @@ fn play_youtube_tracks(
                 media_controls.set_track(&tracks[index].title, "YouTube");
                 media_controls.set_playing(true);
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if key.modifiers.is_empty() => {
                 index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
                 cache_sponsor_segments(&mut tracks[index], &categories_json);
                 last_skipped = None;
@@ -1891,25 +1935,23 @@ fn draw_youtube_player(
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
-        format!(
-            "{} {}/{} | {}",
-            tr("msg.track"),
-            index + 1,
-            tracks.len(),
-            bold_text(&tracks[index].title)
-        ),
+        player_title_row(tr("msg.track"), index, tracks.len(), &tracks[index].title),
         String::new(),
         format!(
-            "[{}] {}/{}",
+            "[{}] {}/{} · {:.2}x{}",
             progress_bar(elapsed, duration, 12),
             format_duration(elapsed),
-            total
+            total,
+            playback.rate,
+            playback
+                .bitrate_kbps
+                .map(|kbps| format!(" · {kbps} kbps"))
+                .unwrap_or_default()
         ),
         format!(
-            "{} · {:.0}% · {:.2}x · {} {} · {} {}",
+            "{} · {:.0}% · {} {} · {} {}",
             state,
             volume * 100.0,
-            playback.rate,
             tr("msg.shuffle"),
             if shuffle { tr("msg.on") } else { tr("msg.off") },
             tr("msg.loop"),
@@ -1949,13 +1991,14 @@ mod youtube_tests {
     use super::{
         PlaybackInterruption, SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment,
         YouTubeTools, compare_versions, install_staged_tool, installed_version, is_portable_ffmpeg,
-        is_portable_yt_dlp, logical_elapsed, parse_sponsor_segments, parse_sponsorblock_settings,
-        parse_youtube_track_line, parse_yt_dlp_release, playback_ended_early,
-        playback_interruption, portable_ffmpeg_update_paths, portable_tool_pair,
-        portable_yt_dlp_update_paths, recovery_message, relocated_portable_tools,
-        resume_gap_detected, seek_target, serialize_sponsorblock_settings, sponsor_skip_target,
-        sponsorblock_categories_json, stepped_rate, update_status, youtube_extractor_args,
-        youtube_playback_controls, youtube_stream_format,
+        is_portable_yt_dlp, logical_elapsed, parse_resolved_audio_stream, parse_sponsor_segments,
+        parse_sponsorblock_settings, parse_youtube_track_line, parse_yt_dlp_release,
+        playback_ended_early, playback_interruption, portable_ffmpeg_update_paths,
+        portable_tool_pair, portable_yt_dlp_update_paths, recovery_message,
+        relocated_portable_tools, resume_gap_detected, seek_target,
+        serialize_sponsorblock_settings, sponsor_skip_target, sponsorblock_categories_json,
+        stepped_rate, update_status, youtube_extractor_args, youtube_playback_controls,
+        youtube_stream_format,
     };
 
     #[test]
@@ -2018,8 +2061,24 @@ mod youtube_tests {
 
     #[test]
     fn youtube_stream_uses_android_client_and_classifies_recovery() {
-        assert_eq!(youtube_stream_format(), "18/bestaudio/best");
+        assert_eq!(youtube_stream_format(), "251/140/18/bestaudio/best");
         assert_eq!(youtube_extractor_args(), "youtube:player_client=android");
+        let resolved =
+            parse_resolved_audio_stream("251\thttps://example.test/audio\t146.721").unwrap();
+        assert_eq!(resolved.url, "https://example.test/audio");
+        assert_eq!(resolved.bitrate_kbps, Some(147));
+        assert_eq!(
+            parse_resolved_audio_stream("251\thttps://example.test/audio\tNA")
+                .unwrap()
+                .bitrate_kbps,
+            Some(160)
+        );
+        assert_eq!(
+            parse_resolved_audio_stream("140\thttps://example.test/audio\tNA")
+                .unwrap()
+                .bitrate_kbps,
+            Some(128)
+        );
         assert_eq!(
             playback_interruption(false, false, true),
             Some(PlaybackInterruption::Stream)

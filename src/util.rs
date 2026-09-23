@@ -963,6 +963,82 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
     value
 }
 
+pub(crate) fn marquee_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let widths = chars
+        .iter()
+        .map(|character| UnicodeWidthChar::width(*character).unwrap_or(0))
+        .collect::<Vec<_>>();
+    let total_width = widths.iter().sum::<usize>();
+
+    let mut suffix_width = 0usize;
+    let mut last_start = chars.len().saturating_sub(1);
+    for index in (0..chars.len()).rev() {
+        suffix_width += widths[index];
+        if suffix_width > width {
+            last_start = index + 1;
+            break;
+        }
+        last_start = index;
+    }
+
+    let positions = last_start + 1;
+    let step_ms = 200u128;
+    let pause_steps = 5usize;
+    let travel_steps = positions.saturating_sub(1);
+    let cycle_steps = pause_steps + travel_steps + pause_steps + travel_steps;
+    let now_steps = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / step_ms;
+    let phase = if cycle_steps == 0 {
+        0
+    } else {
+        (now_steps as usize) % cycle_steps
+    };
+    let start = if phase < pause_steps {
+        0
+    } else if phase < pause_steps + travel_steps {
+        phase - pause_steps + 1
+    } else if phase < pause_steps + travel_steps + pause_steps {
+        last_start
+    } else {
+        last_start.saturating_sub(phase - (pause_steps + travel_steps + pause_steps) + 1)
+    };
+
+    let mut rendered = String::new();
+    let mut used = 0usize;
+    for (character, character_width) in chars[start..].iter().zip(&widths[start..]) {
+        if used + *character_width > width {
+            break;
+        }
+        rendered.push(*character);
+        used += *character_width;
+    }
+    if start == last_start && used < width && total_width > width {
+        rendered.push_str(&" ".repeat(width - used));
+    }
+    rendered
+}
+
+pub(crate) fn player_title_row(label: &str, index: usize, total: usize, title: &str) -> String {
+    let prefix = format!("{label} {}/{} | ", index + 1, total);
+    let available =
+        usize::from(terminal::size().map(|size| size.0).unwrap_or(80)).saturating_sub(4);
+    let panel_width = 52usize.min(available.max(28));
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let title_width = panel_width.saturating_sub(prefix_width).max(1);
+    format!("{prefix}{}", bold_text(&marquee_text(title, title_width)))
+}
+
 pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
     let mut output = Vec::new();
     queue!(output, cursor::MoveTo(0, 0))?;

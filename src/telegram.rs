@@ -33,9 +33,9 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
-    draw_panel, format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
-    load_volume, manage_queue, normalize_channel, playback_controls, previous_track_index,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
+    format_duration, format_elapsed, forward_track_index, is_supported_audio_path, load_volume,
+    manage_queue, normalize_channel, playback_controls, player_title_row, previous_track_index,
     progress_bar, prompt, restart_pass_order, safe_file_name, save_volume, select_menu,
     set_shuffle_order, shuffle_slice, toggle_all,
 };
@@ -1091,7 +1091,7 @@ async fn play_telegram_tracks(
                     start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
                 update_telegram_media(&media_controls, &tracks[index], &active);
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if key.modifiers.is_empty() => {
                 let old_cache = active.cache_path.clone();
                 active.stop().await;
                 delete_cache_file(&old_cache)?;
@@ -1546,13 +1546,7 @@ fn draw_telegram_player(
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
     let mut rows = vec![
-        format!(
-            "{} {}/{} | {}",
-            tr("msg.track"),
-            index + 1,
-            tracks.len(),
-            bold_text(&tracks[index].name)
-        ),
+        player_title_row(tr("msg.track"), index, tracks.len(), &tracks[index].name),
         String::new(),
         format!(
             "[{}] {}/{}",
