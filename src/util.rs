@@ -1184,7 +1184,7 @@ pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) 
         .chain([UnicodeWidthStr::width(title)])
         .max()
         .unwrap_or(28);
-    let width = content.clamp(28, 52).min(available.max(28));
+    let width = content.clamp(28, 60).min(available.max(28));
     let mut frame = String::new();
     frame.push_str(&format!("┌{}┐\r\n", "─".repeat(width + 2)));
     frame.push_str(&format!("│ {} │\r\n", bold_text(&fit_text(title, width))));

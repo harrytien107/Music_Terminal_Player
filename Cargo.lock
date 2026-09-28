@@ -1112,8 +1112,10 @@ dependencies = [
 name = "music-terminal-player"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "crossterm",
+ "ctr",
  "grammers-client",
  "grammers-mtsender",
  "grammers-session",

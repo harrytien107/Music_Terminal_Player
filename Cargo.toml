@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+aes = "0.9.1"
 crossterm = "0.29"
+ctr = "0.10.1"
 grammers-client = "0.10"
 grammers-mtsender = "0.10"
 grammers-session = "0.10"

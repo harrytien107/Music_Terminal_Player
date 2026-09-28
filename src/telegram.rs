@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use aes::cipher::{KeyIvInit, StreamCipher};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use grammers_client::media::Media;
+use grammers_client::media::{Downloadable, Media};
 use grammers_client::peer::Peer;
 use grammers_client::tl;
 use grammers_client::{Client, SignInError};
@@ -16,6 +17,7 @@ use grammers_mtsender::{InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use rodio::{Decoder, OutputStream, Sink, Source};
+use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
@@ -31,10 +33,11 @@ use tokio::task::JoinHandle;
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
+use crate::local::collect_tracks;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
-    format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
+    DATA_DIR, LIBRARY_FILE, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame,
+    draw_panel, format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
     load_setting_bool, load_volume, manage_queue, normalize_channel, playback_controls,
     player_title_row, previous_track_index, progress_bar, prompt, restart_pass_order,
     safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
@@ -44,6 +47,8 @@ pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
 pub(crate) const TELEGRAM_CREDENTIALS_FILE: &str = ".music-terminal/telegram.credentials";
 const TELEGRAM_CACHE_DIR: &str = ".music-terminal/telegram-cache";
 const DOWNLOAD_CHUNK_BYTES: u64 = 512 * 1024;
+const FILE_MIGRATE_ERROR: i32 = 303;
+const CDN_RECOVERY_RETRIES: u8 = 5;
 const INITIAL_BUFFER_BYTES: u64 = 1024 * 1024;
 const TRACK_LIST_PAGE_SIZE: usize = 25;
 const PRIVATE_CHANNEL_PAGE_SIZE: usize = 20;
@@ -901,6 +906,7 @@ impl ActiveTelegramTrack {
     async fn stop(mut self) {
         self.shared.cancel();
         self.sink.stop();
+        drop(self.sink);
         if let Some(task) = self.download_task.take() {
             task.abort();
             let _ = task.await;
@@ -1204,11 +1210,11 @@ fn update_telegram_media(
 }
 
 fn delete_cache_file(path: &Path) -> Result<()> {
-    for attempt in 0..5 {
+    for attempt in 0..40 {
         match fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(_) if attempt < 4 => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) if attempt < 39 => std::thread::sleep(Duration::from_millis(100)),
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("failed to delete cache file {}", path.display()));
@@ -1219,11 +1225,11 @@ fn delete_cache_file(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn delete_cache_directory(path: &Path) -> Result<()> {
-    for attempt in 0..5 {
+    for attempt in 0..40 {
         match fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(_) if attempt < 4 => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) if attempt < 39 => std::thread::sleep(Duration::from_millis(100)),
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("failed to delete cache {}", path.display()));
@@ -1433,6 +1439,8 @@ async fn download_progressively(
     shared: Arc<SharedDownload>,
 ) -> Result<()> {
     let mut output = open_cache_for_write(&path)?;
+    let mut retry_offset = None;
+    let mut retry_count = 0u8;
     loop {
         let downloaded = {
             let state = shared.state.lock().map_err(lock_error)?;
@@ -1461,6 +1469,8 @@ async fn download_progressively(
                     state.downloaded += bytes.len() as u64;
                     state.reconnecting = false;
                     shared.changed.notify_all();
+                    retry_offset = None;
+                    retry_count = 0;
                 }
                 Ok(None) => {
                     output.flush()?;
@@ -1474,13 +1484,85 @@ async fn download_progressively(
                     shared.changed.notify_all();
                     return Ok(());
                 }
-                Err(error) if retryable_download_error(&error) => {
+                Err(error) if download_retry_delay(&error).is_some() => {
+                    if retry_offset == Some(downloaded) {
+                        retry_count = retry_count.saturating_add(1);
+                    } else {
+                        retry_offset = Some(downloaded);
+                        retry_count = 1;
+                    }
+                    if retry_count >= CDN_RECOVERY_RETRIES {
+                        {
+                            let mut state = shared.state.lock().map_err(lock_error)?;
+                            state.reconnecting = true;
+                            shared.changed.notify_all();
+                        }
+                        match recover_download_chunk(&client, &media, downloaded).await {
+                            Ok(bytes) if !bytes.is_empty() => {
+                                output.write_all(&bytes)?;
+                                output.flush()?;
+                                let mut state = shared.state.lock().map_err(lock_error)?;
+                                state.downloaded += bytes.len() as u64;
+                                state.reconnecting = false;
+                                let recovered_complete =
+                                    state.total.is_some_and(|total| state.downloaded >= total);
+                                if recovered_complete {
+                                    state.complete = true;
+                                    state.buffering = false;
+                                }
+                                shared.changed.notify_all();
+                                drop(state);
+                                retry_offset = None;
+                                retry_count = 0;
+                                if recovered_complete {
+                                    return Ok(());
+                                }
+                                break;
+                            }
+                            Ok(_) => {
+                                bail!(
+                                    "Telegram recovery returned no data at byte offset {downloaded}"
+                                );
+                            }
+                            Err(recovery_error) => {
+                                let total = shared.state.lock().map_err(lock_error)?.total;
+                                if let Some(local_path) =
+                                    find_local_repair_source(&media, total, &path, downloaded)?
+                                {
+                                    let mut local_file =
+                                        File::open(&local_path).with_context(|| {
+                                            format!(
+                                                "failed to open local Telegram recovery source {}",
+                                                local_path.display()
+                                            )
+                                        })?;
+                                    local_file.seek(SeekFrom::Start(downloaded))?;
+                                    io::copy(&mut local_file, &mut output)?;
+                                    output.flush()?;
+                                    let repaired_size = local_file.metadata()?.len();
+                                    let mut state = shared.state.lock().map_err(lock_error)?;
+                                    state.downloaded = repaired_size;
+                                    state.total = Some(repaired_size);
+                                    state.complete = true;
+                                    state.buffering = false;
+                                    state.reconnecting = false;
+                                    state.error = None;
+                                    shared.changed.notify_all();
+                                    return Ok(());
+                                }
+                                bail!(
+                                    "Telegram cannot read this file at byte offset {downloaded} after {retry_count} retries ({error}); recovery also failed: {recovery_error}"
+                                );
+                            }
+                        }
+                    }
+                    let delay = download_retry_delay(&error).unwrap_or(Duration::from_secs(2));
                     {
                         let mut state = shared.state.lock().map_err(lock_error)?;
                         state.reconnecting = true;
                         shared.changed.notify_all();
                     }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(delay).await;
                     break;
                 }
                 Err(error) => return Err(error.into()),
@@ -1489,11 +1571,286 @@ async fn download_progressively(
     }
 }
 
-fn retryable_download_error(error: &InvocationError) -> bool {
-    matches!(
-        error,
-        InvocationError::Io(_) | InvocationError::Transport(_) | InvocationError::Dropped
-    )
+fn find_local_repair_source(
+    media: &Media,
+    expected_size: Option<u64>,
+    cache_path: &Path,
+    downloaded: u64,
+) -> Result<Option<PathBuf>> {
+    let Some(expected_size) = expected_size else {
+        return Ok(None);
+    };
+    let Some(file_name) = media_file_name(media) else {
+        return Ok(None);
+    };
+    let library = match fs::read_to_string(LIBRARY_FILE) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    for folder in library
+        .lines()
+        .filter_map(|line| line.strip_prefix("folder\t"))
+        .map(PathBuf::from)
+    {
+        let Ok(tracks) = collect_tracks(&folder) else {
+            continue;
+        };
+        for track in tracks {
+            let matches_name = track
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&file_name));
+            if !matches_name {
+                continue;
+            }
+            let Ok(metadata) = track.metadata() else {
+                continue;
+            };
+            if metadata.len() != expected_size {
+                continue;
+            }
+            if downloaded > 0 && !local_file_matches_cache(&track, cache_path, downloaded)? {
+                continue;
+            }
+            return Ok(Some(track));
+        }
+    }
+    Ok(None)
+}
+
+fn local_file_matches_cache(local_path: &Path, cache_path: &Path, downloaded: u64) -> Result<bool> {
+    const VERIFY_BYTES: u64 = 64 * 1024;
+    let mut local = File::open(local_path)?;
+    let mut cache = File::open(cache_path)?;
+    let first_len = downloaded.min(VERIFY_BYTES) as usize;
+    let mut local_buf = vec![0u8; first_len];
+    let mut cache_buf = vec![0u8; first_len];
+    local.read_exact(&mut local_buf)?;
+    cache.read_exact(&mut cache_buf)?;
+    if local_buf != cache_buf {
+        return Ok(false);
+    }
+
+    if downloaded > VERIFY_BYTES {
+        let tail_start = downloaded.saturating_sub(VERIFY_BYTES);
+        local.seek(SeekFrom::Start(tail_start))?;
+        cache.seek(SeekFrom::Start(tail_start))?;
+        let tail_len = (downloaded - tail_start) as usize;
+        local_buf.resize(tail_len, 0);
+        cache_buf.resize(tail_len, 0);
+        local.read_exact(&mut local_buf)?;
+        cache.read_exact(&mut cache_buf)?;
+        if local_buf != cache_buf {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn recover_download_chunk(client: &Client, media: &Media, offset: u64) -> Result<Vec<u8>> {
+    let location = media
+        .to_raw_input_location()
+        .context("Telegram media has no raw file location")?;
+    let request = tl::functions::upload::GetFile {
+        precise: false,
+        cdn_supported: true,
+        location,
+        offset: offset as i64,
+        limit: DOWNLOAD_CHUNK_BYTES as i32,
+    };
+    let mut master_dc = None;
+
+    loop {
+        let response = match master_dc {
+            Some(dc) => client.invoke_in_dc(dc, &request).await,
+            None => client.invoke(&request).await,
+        };
+        match response {
+            Ok(tl::enums::upload::File::File(file)) => return Ok(file.bytes),
+            Ok(tl::enums::upload::File::CdnRedirect(redirect)) => {
+                return download_cdn_chunk(client, master_dc, &redirect, offset).await;
+            }
+            Err(InvocationError::Rpc(error)) if error.code == FILE_MIGRATE_ERROR => {
+                master_dc = Some(error.value.context("FILE_MIGRATE missing target DC")? as i32);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn download_cdn_chunk(
+    client: &Client,
+    master_dc: Option<i32>,
+    redirect: &tl::types::upload::FileCdnRedirect,
+    offset: u64,
+) -> Result<Vec<u8>> {
+    let request = tl::functions::upload::GetCdnFile {
+        file_token: redirect.file_token.clone(),
+        offset: offset as i64,
+        limit: DOWNLOAD_CHUNK_BYTES as i32,
+    };
+
+    let encrypted = loop {
+        match client.invoke_in_dc(redirect.dc_id, &request).await? {
+            tl::enums::upload::CdnFile::File(file) => break file.bytes,
+            tl::enums::upload::CdnFile::ReuploadNeeded(needed) => {
+                let reupload = tl::functions::upload::ReuploadCdnFile {
+                    file_token: redirect.file_token.clone(),
+                    request_token: needed.request_token,
+                };
+                match master_dc {
+                    Some(dc) => {
+                        client.invoke_in_dc(dc, &reupload).await?;
+                    }
+                    None => {
+                        client.invoke(&reupload).await?;
+                    }
+                }
+            }
+        }
+    };
+
+    let mut decrypted = encrypted;
+    decrypt_cdn_bytes(
+        &redirect.encryption_key,
+        &redirect.encryption_iv,
+        offset,
+        &mut decrypted,
+    )?;
+
+    let mut hashes = redirect.file_hashes.clone();
+    if !cdn_hashes_cover(&hashes, offset, decrypted.len()) {
+        let request = tl::functions::upload::GetCdnFileHashes {
+            file_token: redirect.file_token.clone(),
+            offset: offset as i64,
+        };
+        hashes = match master_dc {
+            Some(dc) => client.invoke_in_dc(dc, &request).await?,
+            None => client.invoke(&request).await?,
+        };
+    }
+    verify_cdn_hashes(&hashes, offset, &decrypted)?;
+    Ok(decrypted)
+}
+
+fn decrypt_cdn_bytes(key: &[u8], iv: &[u8], offset: u64, bytes: &mut [u8]) -> Result<()> {
+    if key.len() != 32 || iv.len() != 16 {
+        bail!("Telegram CDN returned an invalid AES-256 key or IV");
+    }
+    let counter = u32::try_from(offset / 16).context("Telegram CDN offset is too large")?;
+    let mut adjusted_iv = iv.to_vec();
+    adjusted_iv[12..16].copy_from_slice(&counter.to_be_bytes());
+    let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, &adjusted_iv)
+        .map_err(|_| anyhow::anyhow!("Telegram CDN AES-CTR initialization failed"))?;
+    cipher.apply_keystream(bytes);
+    Ok(())
+}
+
+fn cdn_hashes_cover(hashes: &[tl::enums::FileHash], offset: u64, len: usize) -> bool {
+    let end = offset.saturating_add(len as u64);
+    let mut cursor = offset;
+    while cursor < end {
+        let Some(hash) = hashes.iter().find_map(|hash| match hash {
+            tl::enums::FileHash::Hash(hash) if hash.offset == cursor as i64 => Some(hash),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if hash.limit <= 0 {
+            return false;
+        }
+        cursor = cursor.saturating_add(hash.limit as u64);
+    }
+    cursor == end
+}
+
+fn verify_cdn_hashes(hashes: &[tl::enums::FileHash], offset: u64, bytes: &[u8]) -> Result<()> {
+    let end = offset.saturating_add(bytes.len() as u64);
+    let mut cursor = offset;
+    while cursor < end {
+        let hash = hashes
+            .iter()
+            .find_map(|hash| match hash {
+                tl::enums::FileHash::Hash(hash) if hash.offset == cursor as i64 => Some(hash),
+                _ => None,
+            })
+            .with_context(|| format!("Telegram CDN hash missing at byte offset {cursor}"))?;
+        let limit: usize = hash
+            .limit
+            .try_into()
+            .context("Telegram CDN hash has invalid length")?;
+        let relative: usize = (cursor - offset)
+            .try_into()
+            .context("Telegram CDN hash offset is too large")?;
+        let part = bytes
+            .get(relative..relative.saturating_add(limit))
+            .context("Telegram CDN hash range exceeds downloaded data")?;
+        let digest = Sha256::digest(part);
+        if digest.as_slice() != hash.hash.as_slice() {
+            bail!("Telegram CDN SHA-256 mismatch at byte offset {cursor}");
+        }
+        cursor = cursor.saturating_add(limit as u64);
+    }
+    if cursor != end {
+        bail!("Telegram CDN hash coverage does not match downloaded data");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cdn_tests {
+    use super::*;
+
+    #[test]
+    fn cdn_ctr_round_trip_respects_offset() {
+        let key = [0x42u8; 32];
+        let iv = [0x24u8; 16];
+        let offset = 512 * 1024;
+        let original = b"telegram cdn recovery".to_vec();
+        let mut encrypted = original.clone();
+        decrypt_cdn_bytes(&key, &iv, offset, &mut encrypted).unwrap();
+        assert_ne!(encrypted, original);
+        decrypt_cdn_bytes(&key, &iv, offset, &mut encrypted).unwrap();
+        assert_eq!(encrypted, original);
+    }
+
+    #[test]
+    fn cdn_hash_verification_accepts_exact_coverage_and_rejects_tampering() {
+        let bytes = b"0123456789abcdef";
+        let hash = tl::enums::FileHash::Hash(tl::types::FileHash {
+            offset: 4096,
+            limit: bytes.len() as i32,
+            hash: Sha256::digest(bytes).to_vec(),
+        });
+        let hashes = vec![hash];
+        assert!(cdn_hashes_cover(&hashes, 4096, bytes.len()));
+        verify_cdn_hashes(&hashes, 4096, bytes).unwrap();
+
+        let mut tampered = bytes.to_vec();
+        tampered[0] ^= 1;
+        assert!(verify_cdn_hashes(&hashes, 4096, &tampered).is_err());
+    }
+}
+
+fn download_retry_delay(error: &InvocationError) -> Option<Duration> {
+    match error {
+        InvocationError::Io(_) | InvocationError::Transport(_) | InvocationError::Dropped => {
+            Some(Duration::from_secs(2))
+        }
+        InvocationError::Rpc(error) if error.code == 420 => Some(Duration::from_secs(
+            error.value.unwrap_or(2).clamp(1, 60) as u64,
+        )),
+        InvocationError::Rpc(error)
+            if error.code >= 500
+                || error.code <= -500
+                || error.name.eq_ignore_ascii_case("Timeout") =>
+        {
+            Some(Duration::from_secs(2))
+        }
+        _ => None,
+    }
 }
 
 fn open_cache_for_read(path: &Path) -> io::Result<File> {
@@ -1525,7 +1882,7 @@ fn draw_telegram_player(
     warning: Option<&str>,
 ) -> Result<()> {
     let state = shared.state.lock().map_err(lock_error)?;
-    let playback = if warning.is_some() {
+    let playback = if warning.is_some() || state.error.is_some() {
         tr("msg.cannot_play")
     } else if sink.is_paused() {
         tr("msg.paused")
@@ -1539,7 +1896,12 @@ fn draw_telegram_player(
     let progress = state
         .total
         .filter(|total| *total > 0)
-        .map(|total| format!("{:.0}%", state.downloaded as f64 * 100.0 / total as f64))
+        .map(|total| {
+            format!(
+                "{:.0}%",
+                (state.downloaded as f64 * 100.0 / total as f64).min(100.0)
+            )
+        })
         .unwrap_or_else(|| format!("{} KiB", state.downloaded / 1024));
     let elapsed = sink.get_pos();
     let total = duration
@@ -1568,6 +1930,12 @@ fn draw_telegram_player(
     ];
     if let Some(warning) = warning {
         rows.push(format!("{}: {warning}", tr("msg.warning")));
+        rows.push(String::new());
+    } else if let Some(error) = state.error.as_deref() {
+        rows.push(format!(
+            "{}: Telegram download failed: {error}",
+            tr("msg.warning")
+        ));
         rows.push(String::new());
     }
     if load_setting_bool("playback.key_bindings", true) {
