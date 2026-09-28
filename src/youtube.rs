@@ -20,9 +20,10 @@ use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_panel,
-    format_duration, forward_track_index, insert_queue_next, load_volume, manage_queue_with_adder,
-    playback_controls, player_title_row, previous_track_index, progress_bar, prompt,
-    restart_pass_order, save_volume, select_menu, select_menu_from, set_shuffle_order,
+    format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_volume,
+    manage_queue_with_adder, playback_controls, player_title_row, previous_track_index,
+    progress_bar, prompt, prompt_or_escape, restart_pass_order, save_volume, select_menu,
+    select_menu_from, set_shuffle_order,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -275,7 +276,7 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
         let items = vec![
             format!("▶  {}", tr("msg.play_youtube_url_or_playlist")),
             format!("✓  {}", tr("msg.sponsorblock_categories")),
-            format!("⚙  {}", tr("msg.youtube_tools_and_updater")),
+            format!("◇  {}", tr("msg.youtube_tools_and_updater")),
             format!("←  {}", tr("msg.back")),
         ];
         match select_menu(tr("msg.youtube_audio"), &items)? {
@@ -996,17 +997,38 @@ pub(crate) fn serialize_youtube_tools(tools: &YouTubeTools) -> String {
 }
 
 fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> {
-    clear_screen()?;
-    println!(
-        "{}",
-        tr("msg.youtube_audio_tutor_paste_one_url_multiple_space")
-    );
-    let input = prompt(tr("msg.url_s"))?;
-    let urls = parse_youtube_urls(&input)?;
-    if urls.is_empty() {
-        return Ok(Vec::new());
+    let mut error = None::<String>;
+    loop {
+        clear_screen()?;
+        println!(
+            "{}",
+            tr("msg.youtube_audio_tutor_paste_one_url_multiple_space")
+        );
+        println!("{}", tr("msg.esc_back"));
+        if let Some(error) = &error {
+            println!("\n{}: {error}", tr("msg.invalid_youtube_url"));
+        }
+
+        let Some(input) = prompt_or_escape(tr("msg.url_s"))? else {
+            return Ok(Vec::new());
+        };
+        if input.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let urls = match parse_youtube_urls(&input) {
+            Ok(urls) => urls,
+            Err(parse_error) => {
+                error = Some(format!("{parse_error:#}"));
+                continue;
+            }
+        };
+
+        match resolve_tracks(tools, &urls) {
+            Ok(tracks) => return Ok(tracks),
+            Err(resolve_error) => error = Some(format!("{resolve_error:#}")),
+        }
     }
-    resolve_tracks(tools, &urls)
 }
 
 pub(crate) fn parse_youtube_urls(input: &str) -> Result<Vec<String>> {
@@ -1967,7 +1989,9 @@ fn draw_youtube_player(
             tr("msg.a_add_next_url_or_playlist")
         ),
     ];
-    rows.extend(youtube_playback_controls());
+    if load_setting_bool("playback.key_bindings", true) {
+        rows.extend(youtube_playback_controls());
+    }
     draw_panel(stdout, "Music Terminal Player · YouTube", &rows)
 }
 

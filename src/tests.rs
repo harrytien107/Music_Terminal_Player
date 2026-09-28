@@ -32,6 +32,7 @@ use crate::youtube::{
     youtube_tool_menu_items,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::style::Stylize;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use sha2::{Digest, Sha256};
 
@@ -84,10 +85,10 @@ fn launcher_orders_actions_and_colors_source_entries() {
         }
     );
     assert_eq!(items.len(), 10);
-    assert!(!items[0].contains("\x1b["));
-    assert!(items[1].contains("\x1b[38;5;9m"));
-    assert!(items[2].contains("\x1b[38;5;10m"));
-    assert!(items[3].contains("\x1b[38;5;14m"));
+    assert_eq!(items[0], format!("{}", "▶  Quick play".white()));
+    assert_eq!(items[1], format!("{}", "▶  Play YouTube audio".red()));
+    assert_eq!(items[2], format!("{}", "♫  Play local folder".green()));
+    assert_eq!(items[3], format!("{}", "♫  Stream Telegram channel".cyan()));
     assert!(items[4].contains("Open playlists"));
     assert!(!items[4].contains("\x1b["));
     assert!(!items[4].contains("\r\n"));
@@ -150,7 +151,7 @@ fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].language, Language::Vietnamese);
     assert_eq!(catalog[0].name, "Tiếng Việt");
-    assert_eq!(catalog[0].version, 3);
+    assert_eq!(catalog[0].version, 9);
     assert_eq!(catalog[0].file, "vi.lang");
     assert_eq!(
         catalog[0].sha256,
@@ -457,10 +458,10 @@ fn only_key_binding_tokens_are_marked_bold() {
         )
     );
     assert_eq!(
-        bold_key_bindings("Up/Down select | Enter confirm | Esc back"),
+        bold_key_bindings("↑/↓ select | Enter confirm | Esc back"),
         format!(
             "{} select | {} confirm | {} back",
-            bold_text("Up/Down"),
+            bold_text("↑/↓"),
             bold_text("Enter"),
             bold_text("Esc")
         )

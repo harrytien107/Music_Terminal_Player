@@ -23,8 +23,9 @@ use crate::telegram::{
     telegram_channel_label, telegram_client,
 };
 use crate::util::{
-    LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, clear_screen, draw_frame, normalize_channel,
-    prompt, select_menu, toggle_all,
+    LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
+    fit_text, load_setting_bool, normalize_channel, prompt, save_setting_bool, select_menu,
+    select_menu_from, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,43 +64,145 @@ struct SavedLibrary {
     folders: Vec<PathBuf>,
 }
 
-pub(crate) fn launcher_items(telegram_status: &str) -> Vec<String> {
-    vec![
-        format!("▶  {}", tr("msg.quick_play")),
-        format!("{}", format!("▶  {}", tr("msg.play_youtube_audio")).red()),
-        format!("{}", format!("♫  {}", tr("msg.play_local_folder")).green()),
-        format!(
-            "{}",
-            format!("☁  {}", tr("msg.stream_telegram_channel")).cyan()
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LauncherAction {
+    QuickPlay,
+    YouTube,
+    Local,
+    Telegram,
+    Playlists,
+    SyncTelegram,
+    LoginTelegram,
+    DownloadTelegram,
+    Settings,
+    Quit,
+}
+
+const MENU_VISIBILITY_SETTINGS: &[(LauncherAction, &str)] = &[
+    (LauncherAction::QuickPlay, "menu.quick_play"),
+    (LauncherAction::YouTube, "menu.youtube"),
+    (LauncherAction::Local, "menu.local"),
+    (LauncherAction::Telegram, "menu.telegram"),
+    (LauncherAction::Playlists, "menu.playlists"),
+    (LauncherAction::SyncTelegram, "menu.sync_telegram"),
+    (LauncherAction::LoginTelegram, "menu.login_telegram"),
+    (LauncherAction::DownloadTelegram, "menu.download_telegram"),
+    (LauncherAction::Quit, "menu.quit"),
+];
+
+fn launcher_action_label(action: LauncherAction) -> &'static str {
+    match action {
+        LauncherAction::QuickPlay => tr("msg.quick_play"),
+        LauncherAction::YouTube => tr("msg.play_youtube_audio"),
+        LauncherAction::Local => tr("msg.play_local_folder"),
+        LauncherAction::Telegram => tr("msg.stream_telegram_channel"),
+        LauncherAction::Playlists => tr("msg.open_playlists"),
+        LauncherAction::SyncTelegram => tr("msg.sync_and_update_telegram_channel"),
+        LauncherAction::LoginTelegram => tr("msg.login_to_telegram"),
+        LauncherAction::DownloadTelegram => tr("msg.download_telegram_channel_to_music"),
+        LauncherAction::Quit => tr("msg.quit"),
+        LauncherAction::Settings => tr("msg.settings"),
+    }
+}
+fn launcher_entries(telegram_status: &str) -> Vec<(LauncherAction, String)> {
+    let all = [
+        (
+            LauncherAction::QuickPlay,
+            "menu.quick_play",
+            format!("{}", format!("▶  {}", tr("msg.quick_play")).white()),
         ),
-        format!("≡  {}", tr("msg.open_playlists")),
-        format!("↻  {}", tr("msg.sync_and_update_telegram_channel")),
-        format!("●  {} · {telegram_status}", tr("msg.login_to_telegram")),
-        format!("↓  {}", tr("msg.download_telegram_channel_to_music")),
-        format!("⚙  {}", tr("msg.language")),
-        format!("×  {}", tr("msg.quit")),
-    ]
+        (
+            LauncherAction::YouTube,
+            "menu.youtube",
+            format!("{}", format!("▶  {}", tr("msg.play_youtube_audio")).red()),
+        ),
+        (
+            LauncherAction::Local,
+            "menu.local",
+            format!("{}", format!("♫  {}", tr("msg.play_local_folder")).green()),
+        ),
+        (
+            LauncherAction::Telegram,
+            "menu.telegram",
+            format!(
+                "{}",
+                format!("♫  {}", tr("msg.stream_telegram_channel")).cyan()
+            ),
+        ),
+        (
+            LauncherAction::Playlists,
+            "menu.playlists",
+            format!("≡  {}", tr("msg.open_playlists")),
+        ),
+        (
+            LauncherAction::SyncTelegram,
+            "menu.sync_telegram",
+            format!("↻  {}", tr("msg.sync_and_update_telegram_channel")),
+        ),
+        (
+            LauncherAction::LoginTelegram,
+            "menu.login_telegram",
+            format!("●  {} · {telegram_status}", tr("msg.login_to_telegram")),
+        ),
+        (
+            LauncherAction::DownloadTelegram,
+            "menu.download_telegram",
+            format!("↓  {}", tr("msg.download_telegram_channel_to_music")),
+        ),
+        (
+            LauncherAction::Settings,
+            "",
+            format!("◇  {}", tr("msg.settings")),
+        ),
+        (
+            LauncherAction::Quit,
+            "menu.quit",
+            format!("×  {}", tr("msg.quit")),
+        ),
+    ];
+    all.into_iter()
+        .filter(|(action, key, _)| {
+            *action == LauncherAction::Settings || load_setting_bool(key, true)
+        })
+        .map(|(action, _, label)| (action, label))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn launcher_items(telegram_status: &str) -> Vec<String> {
+    launcher_entries(telegram_status)
+        .into_iter()
+        .map(|(_, label)| label)
+        .collect()
 }
 
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
     loop {
-        let items = launcher_items(telegram_login_status());
+        let entries = launcher_entries(telegram_login_status());
+        let items = entries
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>();
         let title = "╭──────────────────────────────────────╮\n\
                      │        MUSIC TERMINAL PLAYER         │\n\
                      ╰──────────────────────────────────────╯";
-        match select_menu(title, &items)? {
-            Some(0) => {
+        let Some(selected) = select_menu(title, &items)? else {
+            continue;
+        };
+
+        match entries[selected].0 {
+            LauncherAction::QuickPlay => {
                 if quick_play_menu(&library)? == PlayerExit::Quit {
                     return Ok(());
                 }
             }
-            Some(1) => match crate::youtube::play_youtube() {
+            LauncherAction::YouTube => match crate::youtube::play_youtube() {
                 Ok(PlayerExit::Quit) => return Ok(()),
                 Ok(PlayerExit::Back) => {}
                 Err(error) => show_menu_error(&error)?,
             },
-            Some(2) => {
+            LauncherAction::Local => {
                 while let Some(path) = choose_local_folder(&mut library)? {
                     match play_local_folder(&path) {
                         Ok(PlayerExit::Quit) => return Ok(()),
@@ -108,9 +211,9 @@ pub(crate) fn launch_menu() -> Result<()> {
                     }
                 }
             }
-            Some(3) => {
+            LauncherAction::Telegram => {
                 while let Some((label, catalog)) =
-                    choose_telegram_catalog(&library, tr("msg.stream_telegram_channel"))?
+                    choose_telegram_catalog(&mut library, tr("msg.stream_telegram_channel"))?
                 {
                     let result = runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -123,12 +226,12 @@ pub(crate) fn launch_menu() -> Result<()> {
                     }
                 }
             }
-            Some(4) => {
+            LauncherAction::Playlists => {
                 if manage_playlists(&mut library)? == PlayerExit::Quit {
                     return Ok(());
                 }
             }
-            Some(5) => {
+            LauncherAction::SyncTelegram => {
                 while let Some(channels) = choose_channel_to_sync(&mut library)? {
                     let total = channels.len();
                     let mut summary = Vec::with_capacity(total);
@@ -172,7 +275,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                     prompt(tr("msg.press_enter_to_continue"))?;
                 }
             }
-            Some(6) => loop {
+            LauncherAction::LoginTelegram => loop {
                 clear_screen()?;
                 let result = runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -193,7 +296,7 @@ pub(crate) fn launch_menu() -> Result<()> {
                     }
                 }
             },
-            Some(7) => {
+            LauncherAction::DownloadTelegram => {
                 if let Some(channel) =
                     choose_saved_channel(&library, tr("msg.download_saved_telegram_channel"))?
                 {
@@ -203,14 +306,123 @@ pub(crate) fn launch_menu() -> Result<()> {
                         .block_on(download_channel(&channel, Path::new("music")))?;
                 }
             }
-            Some(8) => manage_language()?,
-            Some(9) => return Ok(()),
-            None => {}
+            LauncherAction::Settings => manage_settings()?,
+            LauncherAction::Quit => return Ok(()),
+        }
+    }
+}
+
+fn manage_settings() -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let telegram_icons = load_setting_bool("telegram.channel_icons", true);
+        let playback_key_bindings = load_setting_bool("playback.key_bindings", true);
+        let items = vec![
+            format!("{} {}", fit_text("≡", 2), tr("msg.main_menu_visibility")),
+            format!(
+                "{} {}: {}",
+                fit_text("♫", 2),
+                tr("msg.telegram_channel_icons"),
+                if telegram_icons {
+                    tr("msg.on")
+                } else {
+                    tr("msg.off")
+                }
+            ),
+            format!(
+                "{} {}: {}",
+                fit_text("⌘", 2),
+                tr("msg.playback_key_bindings"),
+                if playback_key_bindings {
+                    tr("msg.on")
+                } else {
+                    tr("msg.off")
+                }
+            ),
+            format!("{} {}", fit_text("A", 2), tr("msg.language")),
+            format!("{} {}", fit_text("←", 2), tr("msg.back")),
+        ];
+        match select_menu_from(tr("msg.settings"), &items, selected)? {
+            Some(0) => {
+                selected = 0;
+                manage_main_menu_visibility()?;
+            }
+            Some(1) => {
+                selected = 1;
+                save_setting_bool("telegram.channel_icons", !telegram_icons)?;
+            }
+            Some(2) => {
+                selected = 2;
+                save_setting_bool("playback.key_bindings", !playback_key_bindings)?;
+            }
+            Some(3) => {
+                selected = 3;
+                manage_language()?;
+            }
+            Some(4) | None => return Ok(()),
             _ => unreachable!(),
         }
     }
 }
 
+fn manage_main_menu_visibility() -> Result<()> {
+    let raw = RawMode::new()?;
+    let mut selected = 0usize;
+    let mut stdout = io::stdout();
+    loop {
+        let mut items = MENU_VISIBILITY_SETTINGS
+            .iter()
+            .map(|(action, key)| {
+                format!(
+                    "[{}] {}",
+                    if load_setting_bool(key, true) {
+                        "x"
+                    } else {
+                        " "
+                    },
+                    launcher_action_label(*action)
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(format!("←  {}", tr("msg.back")));
+
+        let mut frame = format!("{}\r\n\r\n", bold_text(tr("msg.main_menu_visibility")));
+        for (index, item) in items.iter().enumerate() {
+            frame.push_str(&format!(
+                "{} {item}\r\n",
+                if index == selected { ">" } else { " " }
+            ));
+        }
+        frame.push_str("\r\n[Space] toggle | ↑/↓ move | [Esc] back");
+        draw_frame(&mut stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(items.len() - 1),
+            KeyCode::Down => selected = (selected + 1) % items.len(),
+            KeyCode::Char(' ') if selected < MENU_VISIBILITY_SETTINGS.len() => {
+                let (_, key) = MENU_VISIBILITY_SETTINGS[selected];
+                save_setting_bool(key, !load_setting_bool(key, true))?;
+            }
+            KeyCode::Char(' ') | KeyCode::Enter if selected == MENU_VISIBILITY_SETTINGS.len() => {
+                drop(raw);
+                clear_screen()?;
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                drop(raw);
+                clear_screen()?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
 fn manage_language() -> Result<()> {
     let catalog = fetch_language_catalog();
     let vietnamese = catalog.as_ref().ok().and_then(|languages| {
@@ -355,7 +567,7 @@ fn save_library(library: &SavedLibrary) -> Result<()> {
 }
 
 fn choose_telegram_catalog(
-    library: &SavedLibrary,
+    library: &mut SavedLibrary,
     title: &str,
 ) -> Result<Option<(String, Vec<TelegramCatalogEntry>)>> {
     const PAGE_SIZE: usize = 20;
@@ -370,6 +582,15 @@ fn choose_telegram_catalog(
     let mut stdout = io::stdout();
     let mut selected_row = 0usize;
     let mut selected = HashSet::new();
+    let mut track_counts = library
+        .channels
+        .iter()
+        .map(|channel| {
+            channel_catalog(channel)
+                .map(|tracks| tracks.len())
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
     loop {
         let start = selected_row
             .saturating_sub(PAGE_SIZE / 2)
@@ -385,7 +606,7 @@ fn choose_telegram_catalog(
         for (offset, channel) in library.channels[start..end].iter().enumerate() {
             let channel_index = start + offset;
             frame.push_str(&format!(
-                "{} [{}] {}\r\n",
+                "{} [{}] {} - {} {}\r\n",
                 if channel_index == selected_row {
                     ">"
                 } else {
@@ -396,10 +617,13 @@ fn choose_telegram_catalog(
                 } else {
                     " "
                 },
-                telegram_channel_label(channel)
+                telegram_channel_label(channel),
+                track_counts[channel_index],
+                tr("msg.tracks")
             ));
         }
         frame.push_str(tr("msg.space_toggle_ctrl_a_toggle_all_up_down"));
+        frame.push_str(tr("msg.shift_up_down_reorder"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -409,6 +633,39 @@ fn choose_telegram_catalog(
             continue;
         }
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && selected_row > 0 => {
+                let other = selected_row - 1;
+                library.channels.swap(selected_row, other);
+                track_counts.swap(selected_row, other);
+                let current_selected = selected.remove(&selected_row);
+                let other_selected = selected.remove(&other);
+                if current_selected {
+                    selected.insert(other);
+                }
+                if other_selected {
+                    selected.insert(selected_row);
+                }
+                selected_row = other;
+                save_library(library)?;
+            }
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && selected_row + 1 < library.channels.len() =>
+            {
+                let other = selected_row + 1;
+                library.channels.swap(selected_row, other);
+                track_counts.swap(selected_row, other);
+                let current_selected = selected.remove(&selected_row);
+                let other_selected = selected.remove(&other);
+                if current_selected {
+                    selected.insert(other);
+                }
+                if other_selected {
+                    selected.insert(selected_row);
+                }
+                selected_row = other;
+                save_library(library)?;
+            }
             KeyCode::Up => {
                 selected_row = selected_row
                     .checked_sub(1)
@@ -665,7 +922,7 @@ fn forget_channel(library: &mut SavedLibrary) -> Result<()> {
             ));
         }
         frame.push_str(
-            "\r\n[Space] toggle | [Ctrl+A] toggle all | Up/Down/Page Up/Page Down scroll | [Enter] forget | [Esc] cancel",
+            "\r\n[Space] toggle | [Ctrl+A] toggle all | ↑/↓ scroll | [Enter] forget | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -748,38 +1005,119 @@ fn play_local_folder(path: &Path) -> Result<PlayerExit> {
 
 fn choose_local_folder(library: &mut SavedLibrary) -> Result<Option<PathBuf>> {
     loop {
-        let mut items: Vec<_> = library
+        let mut track_counts = library
             .folders
             .iter()
-            .map(|folder| format!("♫  {}", local_folder_label(folder)))
-            .collect();
-        let folder_count = items.len();
-        items.extend([
-            format!("＋  {}", tr("msg.add_folder")),
-            format!("−  {}", tr("msg.forget_location")),
-            format!("←  {}", tr("msg.back")),
-        ]);
-        match select_menu(tr("msg.local_folders"), &items)? {
-            Some(index) if index < folder_count => {
-                return Ok(Some(library.folders[index].clone()));
+            .map(|folder| {
+                collect_tracks(folder)
+                    .map(|tracks| tracks.len())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let raw = RawMode::new()?;
+        let mut stdout = io::stdout();
+        let mut selected = 0usize;
+        loop {
+            let folder_count = library.folders.len();
+            let mut items = library
+                .folders
+                .iter()
+                .enumerate()
+                .map(|(index, folder)| {
+                    format!(
+                        "♫  {} - {} {}",
+                        local_folder_label(folder),
+                        track_counts[index],
+                        tr("msg.tracks")
+                    )
+                })
+                .collect::<Vec<_>>();
+            items.extend([
+                format!("＋  {}", tr("msg.add_folder")),
+                format!("−  {}", tr("msg.forget_location")),
+                format!("←  {}", tr("msg.back")),
+            ]);
+
+            let mut frame = format!("{}\r\n\r\n", bold_text(tr("msg.local_folders")));
+            for (index, item) in items.iter().enumerate() {
+                frame.push_str(&format!(
+                    "{} {item}\r\n",
+                    if index == selected { ">" } else { " " }
+                ));
             }
-            Some(index) if index == folder_count => {
-                clear_screen()?;
-                let input = prompt(tr("msg.folder_path"))?;
-                let path = fs::canonicalize(input.trim())
-                    .with_context(|| format!("folder not found: {}", input.trim()))?;
-                if !path.is_dir() {
-                    bail!("not a folder: {}", path.display());
-                }
-                if !library.folders.contains(&path) {
-                    library.folders.push(path);
+            frame.push_str(tr("msg.up_down_enter_esc"));
+            frame.push_str(tr("msg.shift_up_down_reorder"));
+            draw_frame(&mut stdout, &frame)?;
+
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Up
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && selected > 0
+                        && selected < folder_count =>
+                {
+                    let other = selected - 1;
+                    library.folders.swap(selected, other);
+                    track_counts.swap(selected, other);
+                    selected = other;
                     save_library(library)?;
                 }
+                KeyCode::Down
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && selected + 1 < folder_count =>
+                {
+                    let other = selected + 1;
+                    library.folders.swap(selected, other);
+                    track_counts.swap(selected, other);
+                    selected = other;
+                    save_library(library)?;
+                }
+                KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(items.len() - 1),
+                KeyCode::Down => selected = (selected + 1) % items.len(),
+                KeyCode::Enter if selected < folder_count => {
+                    let path = library.folders[selected].clone();
+                    drop(raw);
+                    clear_screen()?;
+                    return Ok(Some(path));
+                }
+                KeyCode::Enter if selected == folder_count => {
+                    drop(raw);
+                    clear_screen()?;
+                    let input = prompt(tr("msg.folder_path"))?;
+                    let path = fs::canonicalize(input.trim())
+                        .with_context(|| format!("folder not found: {}", input.trim()))?;
+                    if !path.is_dir() {
+                        bail!("not a folder: {}", path.display());
+                    }
+                    if !library.folders.contains(&path) {
+                        library.folders.push(path);
+                        save_library(library)?;
+                    }
+                    break;
+                }
+                KeyCode::Enter if selected == folder_count + 1 => {
+                    drop(raw);
+                    clear_screen()?;
+                    forget_folder(library)?;
+                    break;
+                }
+                KeyCode::Enter if selected == folder_count + 2 => {
+                    drop(raw);
+                    clear_screen()?;
+                    return Ok(None);
+                }
+                KeyCode::Esc => {
+                    drop(raw);
+                    clear_screen()?;
+                    return Ok(None);
+                }
+                _ => {}
             }
-            Some(index) if index == folder_count + 1 => {
-                forget_folder(library)?;
-            }
-            Some(_) | None => return Ok(None),
         }
     }
 }

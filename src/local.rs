@@ -16,9 +16,9 @@ use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     LoopMode, MAX_VOLUME, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
-    forward_track_index, insert_queue_next, is_supported_audio_path, load_volume, manage_queue,
-    playback_controls, player_title_row, previous_track_index, progress_bar, restart_pass_order,
-    save_volume, set_shuffle_order, shuffle_slice, toggle_all,
+    forward_track_index, insert_queue_next, is_supported_audio_path, load_setting_bool,
+    load_volume, manage_queue, playback_controls, player_title_row, previous_track_index,
+    progress_bar, restart_pass_order, save_volume, set_shuffle_order, shuffle_slice, toggle_all,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -447,7 +447,9 @@ fn draw_player(
     if can_add_tracks {
         rows.push(tr("msg.a_add_youtube_url_or_playlist").to_string());
     }
-    rows.extend(playback_controls());
+    if load_setting_bool("playback.key_bindings", true) {
+        rows.extend(playback_controls());
+    }
     draw_panel(stdout, &format!("Music Terminal Player · {title}"), &rows)
 }
 

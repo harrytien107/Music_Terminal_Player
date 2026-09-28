@@ -34,10 +34,10 @@ use crate::i18n::tr;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
-    format_duration, format_elapsed, forward_track_index, is_supported_audio_path, load_volume,
-    manage_queue, normalize_channel, playback_controls, player_title_row, previous_track_index,
-    progress_bar, prompt, restart_pass_order, safe_file_name, save_volume, select_menu,
-    set_shuffle_order, shuffle_slice, toggle_all,
+    format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
+    load_setting_bool, load_volume, manage_queue, normalize_channel, playback_controls,
+    player_title_row, previous_track_index, progress_bar, prompt, restart_pass_order,
+    safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -1570,7 +1570,9 @@ fn draw_telegram_player(
         rows.push(format!("{}: {warning}", tr("msg.warning")));
         rows.push(String::new());
     }
-    rows.extend(playback_controls());
+    if load_setting_bool("playback.key_bindings", true) {
+        rows.extend(playback_controls());
+    }
     draw_panel(stdout, "Music Terminal Player · Telegram", &rows)
 }
 
@@ -1648,7 +1650,7 @@ pub(crate) async fn choose_private_channel(
         for (offset, &channel_index) in matches[start..end].iter().enumerate() {
             let (title, id, _) = &channels[channel_index];
             frame.push_str(&format!(
-                "{} [{}] 🔒 {}  [channel {}]\r\n",
+                "{} [{}] {}{}  [channel {}]\r\n",
                 if start + offset == selected_row {
                     ">"
                 } else {
@@ -1659,6 +1661,11 @@ pub(crate) async fn choose_private_channel(
                 } else {
                     " "
                 },
+                if load_setting_bool("telegram.channel_icons", true) {
+                    "🔒 "
+                } else {
+                    ""
+                },
                 title,
                 id
             ));
@@ -1667,7 +1674,7 @@ pub(crate) async fn choose_private_channel(
             frame.push_str(tr("msg.no_matching_private_channels"));
         }
         frame.push_str(
-            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | Up/Down/Page Up/Page Down scroll | [Enter] sync | [Esc] cancel",
+            "\r\nType to search | [Ctrl+Space] toggle | [Ctrl+A] all matches | ↑/↓ scroll | [Enter] sync | [Esc] cancel",
         );
         draw_frame(&mut stdout, &frame)?;
 
@@ -1928,9 +1935,23 @@ pub(crate) fn normalize_channel_identity(channel: &str) -> String {
 }
 
 pub(crate) fn telegram_channel_label(channel: &str) -> String {
+    let show_icons = load_setting_bool("telegram.channel_icons", true);
     parse_private_channel(channel)
-        .map(|(_, label)| format!("🔒 {label}"))
-        .unwrap_or_else(|| format!("@{}", normalize_channel(channel)))
+        .map(|(_, label)| {
+            if show_icons {
+                format!("🔒 {label}")
+            } else {
+                label
+            }
+        })
+        .unwrap_or_else(|| {
+            let label = format!("@{}", normalize_channel(channel));
+            if show_icons {
+                format!("🌐 {label}")
+            } else {
+                label
+            }
+        })
 }
 
 pub(crate) fn private_channel_identity(peer: PeerRef, label: &str) -> String {

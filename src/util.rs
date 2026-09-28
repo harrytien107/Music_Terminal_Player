@@ -138,12 +138,55 @@ pub(crate) fn parse_volume_settings(text: &str) -> f32 {
 }
 
 pub(crate) fn save_volume(volume: f32) -> Result<()> {
+    save_setting_value("volume", &format!("{:.2}", volume.clamp(0.0, MAX_VOLUME)))
+}
+
+fn load_setting_value(key: &str) -> Option<String> {
+    fs::read_to_string(SETTINGS_FILE).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            let (found_key, value) = line.split_once('=')?;
+            (found_key.trim() == key).then(|| value.trim().to_string())
+        })
+    })
+}
+
+fn save_setting_value(key: &str, value: &str) -> Result<()> {
     fs::create_dir_all(DATA_DIR)?;
-    fs::write(
-        SETTINGS_FILE,
-        format!("volume={:.2}\n", volume.clamp(0.0, MAX_VOLUME)),
-    )?;
+    let existing = fs::read_to_string(SETTINGS_FILE).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        if line
+            .split_once('=')
+            .is_some_and(|(found_key, _)| found_key.trim() == key)
+        {
+            if !replaced {
+                lines.push(format!("{key}={value}"));
+                replaced = true;
+            }
+        } else if !line.trim().is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(format!("{key}={value}"));
+    }
+    fs::write(SETTINGS_FILE, format!("{}\n", lines.join("\n")))?;
     Ok(())
+}
+
+pub(crate) fn load_setting_bool(key: &str, default: bool) -> bool {
+    load_setting_value(key)
+        .and_then(|value| match value.as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+pub(crate) fn save_setting_bool(key: &str, value: bool) -> Result<()> {
+    save_setting_value(key, if value { "true" } else { "false" })
 }
 
 pub(crate) fn normalize_channel(channel: &str) -> String {
@@ -197,6 +240,57 @@ pub(crate) fn prompt(message: &str) -> Result<String> {
     Ok(line)
 }
 
+pub(crate) fn prompt_or_escape(message: &str) -> Result<Option<String>> {
+    print!("{message}");
+    io::stdout().flush()?;
+    let _raw = RawMode::new()?;
+    let mut value = String::new();
+    let mut stdout = io::stdout();
+    loop {
+        match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Enter => {
+                    write!(stdout, "\r\n")?;
+                    stdout.flush()?;
+                    return Ok(Some(value));
+                }
+                KeyCode::Esc => {
+                    write!(stdout, "\r\n")?;
+                    stdout.flush()?;
+                    return Ok(None);
+                }
+                KeyCode::Backspace => {
+                    if value.pop().is_some() {
+                        queue!(
+                            stdout,
+                            cursor::MoveLeft(1),
+                            terminal::Clear(ClearType::UntilNewLine)
+                        )?;
+                        stdout.flush()?;
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    value.push(character);
+                    write!(stdout, "{character}")?;
+                    stdout.flush()?;
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                let text = text.replace(['\r', '\n'], " ");
+                value.push_str(&text);
+                write!(stdout, "{text}")?;
+                stdout.flush()?;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn menu_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
     code == KeyCode::Char('q')
         || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
@@ -212,7 +306,6 @@ fn is_key_binding(token: &str) -> bool {
         "Ctrl+Space"
             | "Ctrl+A"
             | "Up/Down"
-            | "Up/Down/Page Up/Page Down"
             | "Left/Right"
             | "Enter"
             | "Esc"
@@ -241,7 +334,7 @@ fn is_key_binding(token: &str) -> bool {
 
 pub(crate) fn bold_key_bindings(text: &str) -> String {
     const KEYS: &[&str] = &[
-        "Up/Down/Page Up/Page Down",
+        "↑/↓",
         "Up/Down",
         "Left/Right",
         "Ctrl+Space",
