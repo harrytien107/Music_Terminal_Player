@@ -12,6 +12,7 @@ A small terminal player for local libraries and online sources without the overh
 
 - Local file and folder playback
 - Telegram public- and private-channel synchronization, streaming, and offline download
+- Resilient Telegram progressive streaming with transient-error retry, migration/CDN recovery, integrity checks, and a verified local-file repair fallback
 - Combined multi-channel Telegram queues
 - YouTube video and playlist audio streaming without saving complete media files
 - YouTube seeking, 0.5x–2.0x speed control, and persistent per-category SponsorBlock auto-skip settings

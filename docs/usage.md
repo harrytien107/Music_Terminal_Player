@@ -128,7 +128,7 @@ From `Stream Telegram channel`, choose one or multiple saved channels. Use `Spac
 
 Playback options include `Recently added`, which orders selected-channel tracks by newest Telegram publish time first. Equal timestamps use channel then message ID. Catalogs created before this feature have no publish times and sort last until synchronized again.
 
-If a Telegram upload is corrupt or uses an unsupported format, the player shows a short warning and keeps the queue open. Press `p`, `Space`, or `n` to continue manually with the next queued track.
+If a Telegram upload is corrupt, unsupported, or the progressive download ultimately fails, the player shows `cannot play`, keeps the queue open, and displays the download error as a warning. It does not automatically skip the failed track. Press `n` to continue manually with the next queued track.
 
 Inside a player, `b` and `Esc` return one level to the immediate playback-options menu. Back from Telegram playback options returns to channel selection; Back from local playback returns to local-folder selection. Use each parent menu's Back action to continue toward the launcher.
 
@@ -141,9 +141,13 @@ cargo run -- stream "@public_channel_username"
 
 CLI Telegram commands continue to accept public usernames. Private channels are selected and saved through the launcher because they do not have public usernames.
 
-Streaming resolves only the current track and downloads sequential 512 KiB chunks into `.music-terminal/telegram-cache`. Playback starts after roughly 1 MiB is available. Temporary network errors retry from the next chunk. The player displays buffering, reconnecting, and cache progress states.
+Streaming resolves only the current track and normally downloads sequential 512 KiB chunks into `.music-terminal/telegram-cache`. Playback starts after roughly 1 MiB is available. Transport failures, Telegram 5xx/timeout responses, and bounded RPC 420 waits are treated as retryable. The player displays buffering, reconnecting, and cache progress states, and cache progress is capped at 100%.
 
-The previous track's cache file is deleted on track changes. Returning to the launcher or quitting cleans active cache files. Stale cache is removed when Telegram streaming starts again.
+If the same byte offset fails repeatedly, the player attempts a lower-level Telegram recovery after five failures. Recovery follows `FILE_MIGRATE` responses and Telegram CDN redirects, handles CDN re-upload requests, decrypts CDN bytes with AES-256-CTR, and verifies recovered ranges against Telegram SHA-256 hashes before appending them to the cache.
+
+If Telegram still cannot provide the failed range, the player can repair the stream from a matching audio file in one of the saved local-library folders. This fallback is intentionally strict: the filename and total size must match, and the beginning plus the tail of the already-downloaded cache are compared against the local candidate before its remaining bytes are used. The source local file is never modified. If no verified candidate exists, the Telegram error is shown in the player and the track remains stopped until you choose another action.
+
+The previous track's cache file is deleted on track changes. Returning to the launcher or quitting cleans active cache files. Stale cache is removed when Telegram streaming starts again. On Windows, cache cleanup retries for several seconds so short-lived decoder/file-handle locks can be released cleanly.
 
 `All synchronized channels` combines saved catalogs into one queue while retaining channel identity internally for playback. Player and queue labels show song names without channel prefixes.
 
@@ -201,11 +205,11 @@ Player data lives under `.music-terminal`, which is ignored by Git. It contains 
 
 ## Terminal UI notes
 
-Long and wide Unicode song names are clipped to panel and queue widths. Menus, search screens, queues, and players redraw in place with Crossterm. No full TUI framework is used.
+Long and wide Unicode song names are clipped to panel and queue widths. Shared player panels can expand to 60 terminal cells before clipping, giving status and warning text more room. Menus, search screens, queues, and players redraw in place with Crossterm. No full TUI framework is used.
 
 Current limits:
 
 - Windows is supported; macOS and Linux support are planned.
-- Telegram streaming uses sequential chunks rather than random byte-range requests.
+- Normal Telegram streaming uses sequential 512 KiB chunks; direct failed-range requests are reserved for recovery.
 - Only the active Telegram track is buffered.
 - Shuffle order is in memory and resets when leaving the player.
