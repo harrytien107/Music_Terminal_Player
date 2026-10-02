@@ -143,9 +143,9 @@ CLI Telegram commands continue to accept public usernames. Private channels are 
 
 Streaming resolves only the current track and normally downloads sequential 512 KiB chunks into `.music-terminal/telegram-cache`. Playback starts after roughly 1 MiB is available. Transport failures, Telegram 5xx/timeout responses, and bounded RPC 420 waits are treated as retryable. The player displays buffering, reconnecting, and cache progress states, and cache progress is capped at 100%.
 
-If the same byte offset fails repeatedly, the player attempts a lower-level Telegram recovery after five failures. Recovery follows `FILE_MIGRATE` responses and Telegram CDN redirects, handles CDN re-upload requests, decrypts CDN bytes with AES-256-CTR, and verifies recovered ranges against Telegram SHA-256 hashes before appending them to the cache.
+If the same byte offset fails repeatedly, the player re-fetches the Telegram message to obtain a fresh media/file reference and retries the failed range through Telegram's sequential file downloader. Recovery starts at 512 KiB; if Telegram offers a CDN redirect from a healthy range, the player can use the CDN token for the failed range, decrypt the bytes, and verify Telegram's SHA-256 hashes. Otherwise it steps down through valid aligned master-DC ranges to 4 KiB. File-DC migration and authorization routing remain handled through Telegram.
 
-If Telegram still cannot provide the failed range, the player can repair the stream from a matching audio file in one of the saved local-library folders. This fallback is intentionally strict: the filename and total size must match, and the beginning plus the tail of the already-downloaded cache are compared against the local candidate before its remaining bytes are used. The source local file is never modified. If no verified candidate exists, the Telegram error is shown in the player and the track remains stopped until you choose another action.
+Recovery is Telegram-only: local library files are never substituted for failed Telegram bytes. Failed recovery details are appended to `.music-terminal/telegram-recovery.log` without credentials or session contents. If Telegram still cannot provide the range, the error is shown in the player and the track remains stopped until you choose another action.
 
 The previous track's cache file is deleted on track changes. Returning to the launcher or quitting cleans active cache files. Stale cache is removed when Telegram streaming starts again. On Windows, cache cleanup retries for several seconds so short-lived decoder/file-handle locks can be released cleanly.
 
@@ -158,6 +158,8 @@ Download a synchronized channel into a local folder:
 ```powershell
 cargo run -- download public_channel_username .\music
 ```
+
+Offline downloads use the same sequential aligned-range recovery instead of `grammers-client`'s preallocated concurrent downloader. Data is written contiguously to `<song>.part` and the final filename is created only after all declared bytes have arrived. A failed or interrupted `.part` file is retained and resumed, so a server timeout cannot leave a full-sized file containing unwritten zero-filled ranges that looks complete. If one Telegram document remains unavailable after recovery, the channel download reports that track as failed and continues with the remaining songs; the incomplete `.part` stays available for a later resume attempt.
 
 The download action updates the catalog, skips existing files, and reports progress. Play the result with local playback.
 
@@ -210,6 +212,6 @@ Long and wide Unicode song names are clipped to panel and queue widths. Shared p
 Current limits:
 
 - Windows is supported; macOS and Linux support are planned.
-- Normal Telegram streaming uses sequential 512 KiB chunks; direct failed-range requests are reserved for recovery.
+- Normal Telegram streaming uses sequential 512 KiB chunks; failed ranges retry with progressively smaller aligned chunks.
 - Only the active Telegram track is buffered.
 - Shuffle order is in memory and resets when leaving the player.

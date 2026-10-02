@@ -151,7 +151,7 @@ fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].language, Language::Vietnamese);
     assert_eq!(catalog[0].name, "Tiếng Việt");
-    assert_eq!(catalog[0].version, 9);
+    assert_eq!(catalog[0].version, 10);
     assert_eq!(catalog[0].file, "vi.lang");
     assert_eq!(
         catalog[0].sha256,

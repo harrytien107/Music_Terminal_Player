@@ -33,11 +33,10 @@ use tokio::task::JoinHandle;
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
-use crate::local::collect_tracks;
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LIBRARY_FILE, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame,
-    draw_panel, format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
+    format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
     load_setting_bool, load_volume, manage_queue, normalize_channel, playback_controls,
     player_title_row, previous_track_index, progress_bar, prompt, restart_pass_order,
     safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
@@ -46,6 +45,7 @@ use crate::util::{
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
 pub(crate) const TELEGRAM_CREDENTIALS_FILE: &str = ".music-terminal/telegram.credentials";
 const TELEGRAM_CACHE_DIR: &str = ".music-terminal/telegram-cache";
+const TELEGRAM_RECOVERY_LOG: &str = ".music-terminal/telegram-recovery.log";
 const DOWNLOAD_CHUNK_BYTES: u64 = 512 * 1024;
 const FILE_MIGRATE_ERROR: i32 = 303;
 const CDN_RECOVERY_RETRIES: u8 = 5;
@@ -59,6 +59,8 @@ struct TelegramTrack {
     media: Media,
     size: Option<u64>,
     cache_path: PathBuf,
+    peer: PeerRef,
+    message_id: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1250,7 +1252,7 @@ async fn start_catalog_track(
     fs::create_dir_all(&cache_dir)?;
     let peer = resolve_channel(client, channel).await?;
     let message = client
-        .get_messages_by_id(peer, &[entry.message_id])
+        .get_messages_by_id(peer.clone(), &[entry.message_id])
         .await?
         .into_iter()
         .next()
@@ -1281,6 +1283,8 @@ async fn start_catalog_track(
             safe_file_name(&entry.name)
         )),
         media,
+        peer,
+        message_id: entry.message_id,
     };
     start_telegram_track(client, stream, &track, volume).await
 }
@@ -1312,11 +1316,14 @@ async fn start_telegram_track(
         File::create(&track.cache_path)?;
         let client = client.clone();
         let media = track.media.clone();
+        let peer = track.peer.clone();
+        let message_id = track.message_id;
         let path = track.cache_path.clone();
         let download = Arc::clone(&shared);
         download_task = Some(tokio::spawn(async move {
             if let Err(error) =
-                download_progressively(client, media, path, Arc::clone(&download)).await
+                download_progressively(client, media, peer, message_id, path, Arc::clone(&download))
+                    .await
                 && let Ok(mut state) = download.state.lock()
             {
                 state.error = Some(error.to_string());
@@ -1434,13 +1441,16 @@ async fn wait_for_download(shared: &SharedDownload) -> Result<()> {
 
 async fn download_progressively(
     client: Client,
-    media: Media,
+    mut media: Media,
+    peer: PeerRef,
+    message_id: i32,
     path: PathBuf,
     shared: Arc<SharedDownload>,
 ) -> Result<()> {
     let mut output = open_cache_for_write(&path)?;
     let mut retry_offset = None;
     let mut retry_count = 0u8;
+    let mut chunk_bytes = DOWNLOAD_CHUNK_BYTES;
     loop {
         let downloaded = {
             let state = shared.state.lock().map_err(lock_error)?;
@@ -1449,12 +1459,17 @@ async fn download_progressively(
             }
             state.downloaded
         };
-        let skipped_chunks: i32 = (downloaded / DOWNLOAD_CHUNK_BYTES)
+        if downloaded % chunk_bytes != 0 {
+            bail!(
+                "Telegram resume offset {downloaded} is not aligned to the active chunk size {chunk_bytes}"
+            );
+        }
+        let skipped_chunks: i32 = (downloaded / chunk_bytes)
             .try_into()
             .context("Telegram track is too large to resume")?;
         let mut download = client
             .iter_download(&media)
-            .chunk_size(DOWNLOAD_CHUNK_BYTES as i32)
+            .chunk_size(chunk_bytes as i32)
             .skip_chunks(skipped_chunks);
 
         loop {
@@ -1497,15 +1512,26 @@ async fn download_progressively(
                             state.reconnecting = true;
                             shared.changed.notify_all();
                         }
-                        match recover_download_chunk(&client, &media, downloaded).await {
-                            Ok(bytes) if !bytes.is_empty() => {
-                                output.write_all(&bytes)?;
+                        match recover_download_chunk(
+                            &client,
+                            &peer,
+                            message_id,
+                            &media,
+                            downloaded,
+                            chunk_bytes,
+                        )
+                        .await
+                        {
+                            Ok(recovered) if !recovered.bytes.is_empty() => {
+                                output.write_all(&recovered.bytes)?;
                                 output.flush()?;
+                                media = recovered.media;
+                                chunk_bytes = recovered.chunk_bytes.min(DOWNLOAD_CHUNK_BYTES);
                                 let mut state = shared.state.lock().map_err(lock_error)?;
-                                state.downloaded += bytes.len() as u64;
+                                state.downloaded += recovered.bytes.len() as u64;
                                 state.reconnecting = false;
-                                let recovered_complete =
-                                    state.total.is_some_and(|total| state.downloaded >= total);
+                                let recovered_complete = recovered.reached_end
+                                    || state.total.is_some_and(|total| state.downloaded >= total);
                                 if recovered_complete {
                                     state.complete = true;
                                     state.buffering = false;
@@ -1525,33 +1551,8 @@ async fn download_progressively(
                                 );
                             }
                             Err(recovery_error) => {
-                                let total = shared.state.lock().map_err(lock_error)?.total;
-                                if let Some(local_path) =
-                                    find_local_repair_source(&media, total, &path, downloaded)?
-                                {
-                                    let mut local_file =
-                                        File::open(&local_path).with_context(|| {
-                                            format!(
-                                                "failed to open local Telegram recovery source {}",
-                                                local_path.display()
-                                            )
-                                        })?;
-                                    local_file.seek(SeekFrom::Start(downloaded))?;
-                                    io::copy(&mut local_file, &mut output)?;
-                                    output.flush()?;
-                                    let repaired_size = local_file.metadata()?.len();
-                                    let mut state = shared.state.lock().map_err(lock_error)?;
-                                    state.downloaded = repaired_size;
-                                    state.total = Some(repaired_size);
-                                    state.complete = true;
-                                    state.buffering = false;
-                                    state.reconnecting = false;
-                                    state.error = None;
-                                    shared.changed.notify_all();
-                                    return Ok(());
-                                }
                                 bail!(
-                                    "Telegram cannot read this file at byte offset {downloaded} after {retry_count} retries ({error}); recovery also failed: {recovery_error}"
+                                    "Telegram cannot read this file at byte offset {downloaded} after {retry_count} retries ({error}); Telegram-only recovery also failed: {recovery_error}"
                                 );
                             }
                         }
@@ -1571,143 +1572,214 @@ async fn download_progressively(
     }
 }
 
-fn find_local_repair_source(
-    media: &Media,
-    expected_size: Option<u64>,
-    cache_path: &Path,
-    downloaded: u64,
-) -> Result<Option<PathBuf>> {
-    let Some(expected_size) = expected_size else {
-        return Ok(None);
-    };
-    let Some(file_name) = media_file_name(media) else {
-        return Ok(None);
-    };
-    let library = match fs::read_to_string(LIBRARY_FILE) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
+struct RecoveredTelegramChunk {
+    bytes: Vec<u8>,
+    media: Media,
+    chunk_bytes: u64,
+    reached_end: bool,
+}
 
-    for folder in library
-        .lines()
-        .filter_map(|line| line.strip_prefix("folder\t"))
-        .map(PathBuf::from)
+async fn refresh_download_media(client: &Client, peer: &PeerRef, message_id: i32) -> Result<Media> {
+    let message = client
+        .get_messages_by_id(peer.clone(), &[message_id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .context("Telegram message disappeared while refreshing the download")?;
+    let media = message
+        .media()
+        .context("Telegram message no longer contains downloadable media")?;
+    if !is_audio_media(&media) {
+        bail!("Telegram message no longer contains audio media");
+    }
+    Ok(media)
+}
+
+fn append_recovery_diagnostic(message: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TELEGRAM_RECOVERY_LOG)
     {
-        let Ok(tracks) = collect_tracks(&folder) else {
-            continue;
-        };
-        for track in tracks {
-            let matches_name = track
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(&file_name));
-            if !matches_name {
-                continue;
-            }
-            let Ok(metadata) = track.metadata() else {
-                continue;
-            };
-            if metadata.len() != expected_size {
-                continue;
-            }
-            if downloaded > 0 && !local_file_matches_cache(&track, cache_path, downloaded)? {
-                continue;
-            }
-            return Ok(Some(track));
-        }
+        let _ = writeln!(file, "{message}");
     }
-    Ok(None)
 }
 
-fn local_file_matches_cache(local_path: &Path, cache_path: &Path, downloaded: u64) -> Result<bool> {
-    const VERIFY_BYTES: u64 = 64 * 1024;
-    let mut local = File::open(local_path)?;
-    let mut cache = File::open(cache_path)?;
-    let first_len = downloaded.min(VERIFY_BYTES) as usize;
-    let mut local_buf = vec![0u8; first_len];
-    let mut cache_buf = vec![0u8; first_len];
-    local.read_exact(&mut local_buf)?;
-    cache.read_exact(&mut cache_buf)?;
-    if local_buf != cache_buf {
-        return Ok(false);
-    }
+const TELEGRAM_FILE_WINDOW_BYTES: u64 = 1024 * 1024;
+// Match grammers-client's normal sequential downloader. Its public downloader
+// caps upload.getFile requests at 512 KiB, which also stays comfortably below
+// grammers-mtproto's message-container ceiling once MTProto/TL overhead is added.
+const MAX_SAFE_RECOVERY_CHUNK_BYTES: u64 = 512 * 1024;
+const MIN_RECOVERY_CHUNK_BYTES: u64 = 4 * 1024;
 
-    if downloaded > VERIFY_BYTES {
-        let tail_start = downloaded.saturating_sub(VERIFY_BYTES);
-        local.seek(SeekFrom::Start(tail_start))?;
-        cache.seek(SeekFrom::Start(tail_start))?;
-        let tail_len = (downloaded - tail_start) as usize;
-        local_buf.resize(tail_len, 0);
-        cache_buf.resize(tail_len, 0);
-        local.read_exact(&mut local_buf)?;
-        cache.read_exact(&mut cache_buf)?;
-        if local_buf != cache_buf {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+fn recovery_chunk_sizes(preferred: u64, offset: u64) -> Vec<u64> {
+    const CANDIDATE_KIB: &[u64] = &[512, 256, 128, 64, 32, 16, 8, 4];
+
+    let offset_in_window = offset % TELEGRAM_FILE_WINDOW_BYTES;
+    let window_remaining = TELEGRAM_FILE_WINDOW_BYTES - offset_in_window;
+    let max_chunk = preferred
+        .max(MIN_RECOVERY_CHUNK_BYTES)
+        .min(MAX_SAFE_RECOVERY_CHUNK_BYTES)
+        .min(window_remaining);
+
+    CANDIDATE_KIB
+        .iter()
+        .map(|kib| kib * 1024)
+        .filter(|size| *size <= max_chunk && offset % *size == 0)
+        .collect()
 }
 
-async fn recover_download_chunk(client: &Client, media: &Media, offset: u64) -> Result<Vec<u8>> {
+fn media_dc_id(media: &Media) -> Option<i32> {
+    match media {
+        Media::Document(document) => match document.raw.document.as_ref()? {
+            tl::enums::Document::Document(raw) => Some(raw.dc_id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn download_direct_recovery_chunk(
+    client: &Client,
+    media: &Media,
+    offset: u64,
+    chunk_bytes: u64,
+) -> Result<Vec<u8>> {
+    if offset % MIN_RECOVERY_CHUNK_BYTES != 0
+        || chunk_bytes % MIN_RECOVERY_CHUNK_BYTES != 0
+        || chunk_bytes > MAX_SAFE_RECOVERY_CHUNK_BYTES
+        || offset % chunk_bytes != 0
+    {
+        bail!("Telegram recovery range does not satisfy upload.getFile alignment rules");
+    }
+    let end = offset
+        .checked_add(chunk_bytes.saturating_sub(1))
+        .context("Telegram recovery range overflow")?;
+    if offset / TELEGRAM_FILE_WINDOW_BYTES != end / TELEGRAM_FILE_WINDOW_BYTES {
+        bail!("Telegram recovery range crosses a 1 MiB boundary");
+    }
+
+    let chunk_size: i32 = chunk_bytes
+        .try_into()
+        .context("Telegram recovery chunk is too large")?;
+    let chunk_index: i32 = (offset / chunk_bytes)
+        .try_into()
+        .context("Telegram recovery offset is too large")?;
+    let mut download = client
+        .iter_download(media)
+        .chunk_size(chunk_size)
+        .skip_chunks(chunk_index);
+
+    match download.next().await {
+        Ok(bytes) => Ok(bytes.unwrap_or_default()),
+        Err(primary_error) if chunk_bytes == MAX_SAFE_RECOVERY_CHUNK_BYTES => {
+            match download_cdn_bootstrap_chunk(client, media, offset, chunk_bytes).await {
+                Ok(bytes) => Ok(bytes),
+                Err(cdn_error) => bail!(
+                    "sequential request failed: {primary_error}; CDN bootstrap recovery failed: {cdn_error:#}"
+                ),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn download_cdn_bootstrap_chunk(
+    client: &Client,
+    media: &Media,
+    offset: u64,
+    chunk_bytes: u64,
+) -> Result<Vec<u8>> {
     let location = media
         .to_raw_input_location()
         .context("Telegram media has no raw file location")?;
-    let request = tl::functions::upload::GetFile {
-        precise: false,
-        cdn_supported: true,
-        location,
-        offset: offset as i64,
-        limit: DOWNLOAD_CHUNK_BYTES as i32,
-    };
-    let mut master_dc = None;
+    let media_size = media.size().map(|size| size as u64);
+    let mut probe_offsets = vec![
+        0,
+        offset.saturating_sub(TELEGRAM_FILE_WINDOW_BYTES),
+        offset.saturating_add(TELEGRAM_FILE_WINDOW_BYTES),
+    ];
+    probe_offsets.sort_unstable();
+    probe_offsets.dedup();
+    if let Some(size) = media_size {
+        probe_offsets.retain(|probe| *probe < size);
+    }
 
-    loop {
-        let response = match master_dc {
-            Some(dc) => client.invoke_in_dc(dc, &request).await,
-            None => client.invoke(&request).await,
+    let mut errors = Vec::new();
+    for probe_offset in probe_offsets {
+        let mut master_dc = media_dc_id(media).context("Telegram media has no document DC")?;
+        let request = tl::functions::upload::GetFile {
+            precise: false,
+            cdn_supported: true,
+            location: location.clone(),
+            offset: probe_offset as i64,
+            limit: MAX_SAFE_RECOVERY_CHUNK_BYTES as i32,
         };
-        match response {
-            Ok(tl::enums::upload::File::File(file)) => return Ok(file.bytes),
-            Ok(tl::enums::upload::File::CdnRedirect(redirect)) => {
-                return download_cdn_chunk(client, master_dc, &redirect, offset).await;
+
+        loop {
+            match client.invoke_in_dc(master_dc, &request).await {
+                Ok(tl::enums::upload::File::CdnRedirect(redirect)) => {
+                    append_recovery_diagnostic(&format!(
+                        "offset={offset} CDN bootstrap succeeded via probe={probe_offset} master_dc={master_dc} cdn_dc={}",
+                        redirect.dc_id
+                    ));
+                    return download_cdn_chunk(client, master_dc, &redirect, offset, chunk_bytes)
+                        .await;
+                }
+                Ok(tl::enums::upload::File::File(_)) => {
+                    errors.push(format!(
+                        "probe {probe_offset}: master DC returned file bytes"
+                    ));
+                    break;
+                }
+                Err(InvocationError::Rpc(error)) if error.code == FILE_MIGRATE_ERROR => {
+                    master_dc = error
+                        .value
+                        .context("FILE_MIGRATE missing target DC")?
+                        .try_into()
+                        .context("FILE_MIGRATE returned an invalid target DC")?;
+                }
+                Err(error) => {
+                    errors.push(format!("probe {probe_offset}: {error}"));
+                    break;
+                }
             }
-            Err(InvocationError::Rpc(error)) if error.code == FILE_MIGRATE_ERROR => {
-                master_dc = Some(error.value.context("FILE_MIGRATE missing target DC")? as i32);
-            }
-            Err(error) => return Err(error.into()),
         }
     }
+
+    bail!(
+        "Telegram did not provide a usable CDN redirect: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn download_cdn_chunk(
     client: &Client,
-    master_dc: Option<i32>,
+    master_dc: i32,
     redirect: &tl::types::upload::FileCdnRedirect,
     offset: u64,
+    chunk_bytes: u64,
 ) -> Result<Vec<u8>> {
     let request = tl::functions::upload::GetCdnFile {
         file_token: redirect.file_token.clone(),
         offset: offset as i64,
-        limit: DOWNLOAD_CHUNK_BYTES as i32,
+        limit: chunk_bytes as i32,
     };
 
     let encrypted = loop {
         match client.invoke_in_dc(redirect.dc_id, &request).await? {
             tl::enums::upload::CdnFile::File(file) => break file.bytes,
             tl::enums::upload::CdnFile::ReuploadNeeded(needed) => {
-                let reupload = tl::functions::upload::ReuploadCdnFile {
-                    file_token: redirect.file_token.clone(),
-                    request_token: needed.request_token,
-                };
-                match master_dc {
-                    Some(dc) => {
-                        client.invoke_in_dc(dc, &reupload).await?;
-                    }
-                    None => {
-                        client.invoke(&reupload).await?;
-                    }
-                }
+                client
+                    .invoke_in_dc(
+                        master_dc,
+                        &tl::functions::upload::ReuploadCdnFile {
+                            file_token: redirect.file_token.clone(),
+                            request_token: needed.request_token,
+                        },
+                    )
+                    .await?;
             }
         }
     };
@@ -1722,14 +1794,15 @@ async fn download_cdn_chunk(
 
     let mut hashes = redirect.file_hashes.clone();
     if !cdn_hashes_cover(&hashes, offset, decrypted.len()) {
-        let request = tl::functions::upload::GetCdnFileHashes {
-            file_token: redirect.file_token.clone(),
-            offset: offset as i64,
-        };
-        hashes = match master_dc {
-            Some(dc) => client.invoke_in_dc(dc, &request).await?,
-            None => client.invoke(&request).await?,
-        };
+        hashes = client
+            .invoke_in_dc(
+                master_dc,
+                &tl::functions::upload::GetCdnFileHashes {
+                    file_token: redirect.file_token.clone(),
+                    offset: offset as i64,
+                },
+            )
+            .await?;
     }
     verify_cdn_hashes(&hashes, offset, &decrypted)?;
     Ok(decrypted)
@@ -1799,8 +1872,131 @@ fn verify_cdn_hashes(hashes: &[tl::enums::FileHash], offset: u64, bytes: &[u8]) 
     Ok(())
 }
 
+fn partial_download_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+async fn download_media_resilient(client: &Client, media: &Media, dest: &Path) -> Result<()> {
+    let expected_size = media
+        .size()
+        .map(|size| size as u64)
+        .context("Telegram media does not report a file size")?;
+    let part_path = partial_download_path(dest);
+    let mut downloaded = fs::metadata(&part_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    if downloaded > expected_size || (downloaded < expected_size && downloaded % 4096 != 0) {
+        let _ = fs::remove_file(&part_path);
+        downloaded = 0;
+    }
+
+    let mut output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path)
+        .with_context(|| format!("failed to open {}", part_path.display()))?;
+
+    while downloaded < expected_size {
+        let mut recovered = None;
+        let mut errors = Vec::new();
+        for chunk_bytes in recovery_chunk_sizes(1024 * 1024, downloaded) {
+            match download_direct_recovery_chunk(client, media, downloaded, chunk_bytes).await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    recovered = Some((bytes, chunk_bytes));
+                    break;
+                }
+                Ok(_) => errors.push(format!("{} KiB: empty response", chunk_bytes / 1024)),
+                Err(error) => errors.push(format!("{} KiB: {error:#}", chunk_bytes / 1024)),
+            }
+        }
+
+        let (bytes, requested) = recovered.with_context(|| {
+            format!(
+                "Telegram media-DC download failed at byte offset {downloaded}: {}",
+                errors.join(" | ")
+            )
+        })?;
+        if bytes.len() > requested as usize {
+            bail!("Telegram returned more data than requested");
+        }
+        output.write_all(&bytes)?;
+        output.flush()?;
+        downloaded = downloaded.saturating_add(bytes.len() as u64);
+        if downloaded > expected_size {
+            bail!("Telegram returned more bytes than the declared media size");
+        }
+        if bytes.len() < requested as usize && downloaded < expected_size && downloaded % 4096 != 0
+        {
+            bail!(
+                "Telegram returned a short non-final chunk ending at unaligned byte offset {downloaded}"
+            );
+        }
+    }
+
+    output.sync_all()?;
+    drop(output);
+    fs::rename(&part_path, dest).with_context(|| {
+        format!(
+            "failed to finalize Telegram download {} -> {}",
+            part_path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn recover_download_chunk(
+    client: &Client,
+    peer: &PeerRef,
+    message_id: i32,
+    current_media: &Media,
+    offset: u64,
+    preferred_chunk_bytes: u64,
+) -> Result<RecoveredTelegramChunk> {
+    let refreshed_media = match refresh_download_media(client, peer, message_id).await {
+        Ok(media) => media,
+        Err(error) => {
+            append_recovery_diagnostic(&format!("offset={offset} refresh_media failed: {error:#}"));
+            current_media.clone()
+        }
+    };
+    let dc_id = media_dc_id(&refreshed_media);
+    let chunk_sizes = recovery_chunk_sizes(preferred_chunk_bytes, offset);
+    let mut errors = Vec::new();
+
+    for chunk_bytes in chunk_sizes.iter().copied() {
+        match download_direct_recovery_chunk(client, &refreshed_media, offset, chunk_bytes).await {
+            Ok(bytes) if !bytes.is_empty() => {
+                let reached_end = bytes.len() < chunk_bytes as usize;
+                return Ok(RecoveredTelegramChunk {
+                    bytes,
+                    media: refreshed_media,
+                    chunk_bytes,
+                    reached_end,
+                });
+            }
+            Ok(_) => errors.push(format!("{} KiB: empty response", chunk_bytes / 1024)),
+            Err(error) => {
+                let detail = format!("{} KiB: {error:#}", chunk_bytes / 1024);
+                append_recovery_diagnostic(&format!(
+                    "offset={offset} dc={} {detail}",
+                    dc_id.map_or_else(|| "unknown".to_string(), |dc| dc.to_string())
+                ));
+                errors.push(detail);
+            }
+        }
+    }
+
+    bail!(
+        "master media DC recovery failed at byte offset {offset}: {}",
+        errors.join(" | ")
+    )
+}
 #[cfg(test)]
-mod cdn_tests {
+mod recovery_tests {
     use super::*;
 
     #[test]
@@ -1831,6 +2027,45 @@ mod cdn_tests {
         let mut tampered = bytes.to_vec();
         tampered[0] ^= 1;
         assert!(verify_cdn_hashes(&hashes, 4096, &tampered).is_err());
+    }
+
+    #[test]
+    fn recovery_chunk_sizes_step_down_without_losing_alignment() {
+        assert_eq!(
+            recovery_chunk_sizes(1024 * 1024, 72 * 1024 * 1024),
+            vec![
+                512 * 1024,
+                256 * 1024,
+                128 * 1024,
+                64 * 1024,
+                32 * 1024,
+                16 * 1024,
+                8 * 1024,
+                4 * 1024
+            ]
+        );
+        assert_eq!(
+            recovery_chunk_sizes(128 * 1024, 72 * 1024 * 1024 + 64 * 1024),
+            vec![64 * 1024, 32 * 1024, 16 * 1024, 8 * 1024, 4 * 1024]
+        );
+        assert_eq!(
+            recovery_chunk_sizes(1024 * 1024, 72 * 1024 * 1024 + 512 * 1024),
+            vec![
+                512 * 1024,
+                256 * 1024,
+                128 * 1024,
+                64 * 1024,
+                32 * 1024,
+                16 * 1024,
+                8 * 1024,
+                4 * 1024
+            ]
+        );
+        assert!(
+            recovery_chunk_sizes(1024 * 1024, 72 * 1024 * 1024)
+                .into_iter()
+                .all(|size| size < 1_044_448)
+        );
     }
 }
 
@@ -2196,7 +2431,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
     let mut pending = Vec::new();
     let mut message_count = 0usize;
     let mut document_count = 0usize;
-    let mut messages = client.iter_messages(peer);
+    let mut messages = client.iter_messages(peer.clone());
 
     println!("{} {label}...", tr("msg.scanning_all_songs_in"));
     while let Some(message) = messages.next().await? {
@@ -2223,7 +2458,7 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
             let safe_name = safe_file_name(&name);
             let dest = folder.join(format!("{}-{}", message.id(), safe_name));
             if !dest.exists() {
-                pending.push((media, dest));
+                pending.push((message.id(), media, dest));
             }
         }
     }
@@ -2249,7 +2484,8 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
     };
 
     let download_total = pending.len();
-    for (index, (media, dest)) in pending.into_iter().enumerate() {
+    let mut failed_downloads = 0usize;
+    for (index, (message_id, media, dest)) in pending.into_iter().enumerate() {
         println!(
             "[{}/{}] Downloading {} | download time {}",
             index + 1,
@@ -2257,15 +2493,36 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
             dest.display(),
             format_elapsed(started.elapsed().saturating_sub(scan_time))
         );
-        client.download_media(&media, &dest).await?;
+        let media = refresh_download_media(&client, &peer, message_id)
+            .await
+            .unwrap_or(media);
+        if let Err(error) = download_media_resilient(&client, &media, &dest).await {
+            failed_downloads += 1;
+            let part_path = partial_download_path(&dest);
+            eprintln!(
+                "[FAILED] {} | {error:#} | partial kept at {}",
+                dest.display(),
+                part_path.display()
+            );
+        }
     }
 
-    println!(
-        "Download complete. Channel songs: {total_songs}, downloaded: {download_total}, download time: {}. Folder: {}. Song list: {}",
-        format_elapsed(started.elapsed().saturating_sub(scan_time)),
-        folder.display(),
-        catalog_path.display()
-    );
+    let downloaded = download_total.saturating_sub(failed_downloads);
+    if failed_downloads == 0 {
+        println!(
+            "Download complete. Channel songs: {total_songs}, downloaded: {downloaded}, download time: {}. Folder: {}. Song list: {}",
+            format_elapsed(started.elapsed().saturating_sub(scan_time)),
+            folder.display(),
+            catalog_path.display()
+        );
+    } else {
+        println!(
+            "Download finished with failures. Channel songs: {total_songs}, downloaded: {downloaded}, failed: {failed_downloads}, download time: {}. Incomplete .part files were kept for resume. Folder: {}. Song list: {}",
+            format_elapsed(started.elapsed().saturating_sub(scan_time)),
+            folder.display(),
+            catalog_path.display()
+        );
+    }
     Ok(())
 }
 

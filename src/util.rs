@@ -141,7 +141,7 @@ pub(crate) fn save_volume(volume: f32) -> Result<()> {
     save_setting_value("volume", &format!("{:.2}", volume.clamp(0.0, MAX_VOLUME)))
 }
 
-fn load_setting_value(key: &str) -> Option<String> {
+pub(crate) fn load_setting_value(key: &str) -> Option<String> {
     fs::read_to_string(SETTINGS_FILE).ok().and_then(|text| {
         text.lines().find_map(|line| {
             let (found_key, value) = line.split_once('=')?;
@@ -150,7 +150,7 @@ fn load_setting_value(key: &str) -> Option<String> {
     })
 }
 
-fn save_setting_value(key: &str, value: &str) -> Result<()> {
+pub(crate) fn save_setting_value(key: &str, value: &str) -> Result<()> {
     fs::create_dir_all(DATA_DIR)?;
     let existing = fs::read_to_string(SETTINGS_FILE).unwrap_or_default();
     let mut lines = Vec::new();

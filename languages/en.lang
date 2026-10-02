@@ -188,7 +188,7 @@ msg.yt_dlp_executable_path=yt-dlp executable path:
 msg.yt_dlp_updated_successfully=yt-dlp updated successfully.
 
 msg.settings=Settings
-msg.main_menu_visibility=Main menu visibility
+msg.main_menu_visibility=Main menu visibility & reorder
 msg.telegram_channel_icons=Telegram channel icons
 msg.esc_back=Press Esc to go back.
 msg.invalid_youtube_url=Invalid YouTube URL

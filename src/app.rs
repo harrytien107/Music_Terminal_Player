@@ -24,8 +24,8 @@ use crate::telegram::{
 };
 use crate::util::{
     LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
-    fit_text, load_setting_bool, normalize_channel, prompt, save_setting_bool, select_menu,
-    select_menu_from, toggle_all,
+    fit_text, load_setting_bool, load_setting_value, normalize_channel, prompt, save_setting_bool,
+    save_setting_value, select_menu, select_menu_from, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +89,45 @@ const MENU_VISIBILITY_SETTINGS: &[(LauncherAction, &str)] = &[
     (LauncherAction::DownloadTelegram, "menu.download_telegram"),
     (LauncherAction::Quit, "menu.quit"),
 ];
+
+const MAIN_MENU_ORDER_SETTING: &str = "menu.order";
+
+fn main_menu_order() -> Vec<(LauncherAction, &'static str)> {
+    let saved = load_setting_value(MAIN_MENU_ORDER_SETTING);
+    let mut ordered = Vec::with_capacity(MENU_VISIBILITY_SETTINGS.len());
+
+    if let Some(saved) = saved {
+        for saved_key in saved
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            if let Some(&(action, key)) = MENU_VISIBILITY_SETTINGS
+                .iter()
+                .find(|(_, key)| *key == saved_key)
+                && !ordered.iter().any(|(_, existing_key)| *existing_key == key)
+            {
+                ordered.push((action, key));
+            }
+        }
+    }
+
+    for &(action, key) in MENU_VISIBILITY_SETTINGS {
+        if !ordered.iter().any(|(_, existing_key)| *existing_key == key) {
+            ordered.push((action, key));
+        }
+    }
+    ordered
+}
+
+fn save_main_menu_order(order: &[(LauncherAction, &str)]) -> Result<()> {
+    let value = order
+        .iter()
+        .map(|(_, key)| *key)
+        .collect::<Vec<_>>()
+        .join(",");
+    save_setting_value(MAIN_MENU_ORDER_SETTING, &value)
+}
 
 fn launcher_action_label(action: LauncherAction) -> &'static str {
     match action {
@@ -160,12 +199,33 @@ fn launcher_entries(telegram_status: &str) -> Vec<(LauncherAction, String)> {
             format!("×  {}", tr("msg.quit")),
         ),
     ];
-    all.into_iter()
-        .filter(|(action, key, _)| {
-            *action == LauncherAction::Settings || load_setting_bool(key, true)
-        })
-        .map(|(action, _, label)| (action, label))
-        .collect()
+    let mut entries = Vec::with_capacity(all.len());
+    let mut settings = None;
+    let mut configurable = Vec::with_capacity(MENU_VISIBILITY_SETTINGS.len());
+    for entry in all {
+        if entry.0 == LauncherAction::Settings {
+            settings = Some((entry.0, entry.2));
+        } else {
+            configurable.push(entry);
+        }
+    }
+
+    for (action, key) in main_menu_order() {
+        if action == LauncherAction::Quit
+            && let Some(settings_entry) = settings.take()
+        {
+            entries.push(settings_entry);
+        }
+        if load_setting_bool(key, true)
+            && let Some((_, _, label)) = configurable.iter().find(|(item, _, _)| *item == action)
+        {
+            entries.push((action, label.clone()));
+        }
+    }
+    if let Some(settings_entry) = settings {
+        entries.push(settings_entry);
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -369,8 +429,9 @@ fn manage_main_menu_visibility() -> Result<()> {
     let raw = RawMode::new()?;
     let mut selected = 0usize;
     let mut stdout = io::stdout();
+    let mut order = main_menu_order();
     loop {
-        let mut items = MENU_VISIBILITY_SETTINGS
+        let mut items = order
             .iter()
             .map(|(action, key)| {
                 format!(
@@ -394,6 +455,7 @@ fn manage_main_menu_visibility() -> Result<()> {
             ));
         }
         frame.push_str("\r\n[Space] toggle | ↑/↓ move | [Esc] back");
+        frame.push_str(tr("msg.shift_up_down_reorder"));
         draw_frame(&mut stdout, &frame)?;
 
         let Event::Key(key) = event::read()? else {
@@ -403,13 +465,29 @@ fn manage_main_menu_visibility() -> Result<()> {
             continue;
         }
         match key.code {
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && selected > 0
+                    && selected < order.len() =>
+            {
+                order.swap(selected, selected - 1);
+                selected -= 1;
+                save_main_menu_order(&order)?;
+            }
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::SHIFT) && selected + 1 < order.len() =>
+            {
+                order.swap(selected, selected + 1);
+                selected += 1;
+                save_main_menu_order(&order)?;
+            }
             KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(items.len() - 1),
             KeyCode::Down => selected = (selected + 1) % items.len(),
-            KeyCode::Char(' ') if selected < MENU_VISIBILITY_SETTINGS.len() => {
-                let (_, key) = MENU_VISIBILITY_SETTINGS[selected];
+            KeyCode::Char(' ') if selected < order.len() => {
+                let (_, key) = order[selected];
                 save_setting_bool(key, !load_setting_bool(key, true))?;
             }
-            KeyCode::Char(' ') | KeyCode::Enter if selected == MENU_VISIBILITY_SETTINGS.len() => {
+            KeyCode::Char(' ') | KeyCode::Enter if selected == order.len() => {
                 drop(raw);
                 clear_screen()?;
                 return Ok(());

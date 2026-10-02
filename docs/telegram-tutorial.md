@@ -65,9 +65,9 @@ Playback begins after enough of the current track has downloaded into the tempor
 
 Normal playback downloads the current track progressively in 512 KiB chunks. Short-lived network or Telegram server failures show `reconnecting` while the player retries the same position.
 
-After repeated failures at one byte offset, recovery becomes more aggressive automatically. The player can follow Telegram file-migration and CDN redirects, decrypt CDN data, and verify Telegram's SHA-256 chunk hashes before continuing the cache.
+After repeated failures at one byte offset, recovery becomes more aggressive automatically. The player refreshes the Telegram message, retries an aligned 512 KiB range, and can use Telegram's CDN path when the server offers a redirect. If no CDN path is available, it progressively retries smaller aligned master-DC ranges down to 4 KiB.
 
-If Telegram still cannot return that range, the player checks your saved local music folders for a matching copy of the track. A local file is used only when its filename and full size match and the already-downloaded cache matches the candidate at verification points near the beginning and end of the partial file. The local source file is not changed; only the temporary Telegram cache is completed from it.
+Recovery stays Telegram-only. If Telegram still cannot return that range, the player reports `cannot play` and keeps the current track selected instead of substituting bytes from a local music file.
 
 If recovery still fails, the player changes to `cannot play`, shows the Telegram download error, and keeps the queue open instead of automatically skipping. Press `n` when you want to move to the next track.
 
@@ -117,7 +117,7 @@ The first selected song starts immediately. Other selected songs appear under `N
 4. Wait for the downloads to finish.
 5. Play the downloaded files through `Play local folder`.
 
-Existing files are skipped.
+Existing completed files are skipped. New offline downloads are written to a `.part` file and renamed only after the declared Telegram file size has been received; an interrupted `.part` file is resumed on the next download attempt. If one document still cannot be read from Telegram, that track is reported as failed, its `.part` is kept, and the channel download continues with the remaining songs.
 
 ## If Telegram does not work
 
@@ -127,6 +127,6 @@ Existing files are skipped.
 - Synchronize the channel before trying to stream it.
 - If you changed Telegram accounts, forget and add private channels again.
 - If one audio upload is corrupt, unsupported, or ends with a Telegram download warning, press `n` to continue to another track. The player intentionally does not auto-skip failed tracks.
-- If you already have the exact same file locally and want it to be eligible for automatic repair, make sure its folder has been added under `Play local folder`; the fallback only searches saved local-library folders.
+- For a file that repeatedly fails at one byte range, the player refreshes the Telegram media reference and retries progressively smaller aligned Telegram ranges. Local files are never substituted for Telegram data.
 
 For every option and command, see the [full usage guide](usage.md).

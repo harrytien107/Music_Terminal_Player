@@ -188,7 +188,7 @@ msg.yt_dlp_executable_path=Đường dẫn yt-dlp:
 msg.yt_dlp_updated_successfully=Đã cập nhật yt-dlp thành công.
 
 msg.settings=Cài đặt
-msg.main_menu_visibility=Hiển thị menu chính
+msg.main_menu_visibility=Hiển thị & đổi thứ tự menu chính
 msg.telegram_channel_icons=Biểu tượng kênh Telegram
 msg.esc_back=Nhấn Esc để quay lại.
 msg.invalid_youtube_url=URL YouTube không hợp lệ
