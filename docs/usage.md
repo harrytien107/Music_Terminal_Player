@@ -55,10 +55,17 @@ If the catalog is unavailable, English and installed valid packs remain selectab
 - `r`: toggle shuffle for unplayed tracks; `Next in queue` keeps its manual order
 - `l`: cycle loop mode through `off`, `all`, and `one`
 - `u`: open the editable playback queue
-- `b` / `Esc`: return to the previous menu; `Esc` at the launcher keeps the player open
+- `b`: open live Lyrics settings during local or Telegram playback; return from YouTube playback
+- `y`: show or hide embedded lyrics during local or Telegram playback
+- `Page Up` / `Page Down`: scroll plain, unsynchronized lyrics
+- `Esc`: return to the previous menu; `Esc` at the launcher keeps the player open
 - `q` / `Ctrl+C`: quit completely from a player or menu; the launcher's `Quit` option also exits
 
 The player displays the current local song, Telegram song, or YouTube video title in bold. The queue has bold `Now playing`, `Next in queue`, and `Next from track list` column headings. Use `Up` / `Down` to select, `Enter` to play, `Delete` to unqueue a selected `Next in queue` item, `a` to add next, and `Esc` to close. Delete does nothing in `Now playing` or `Next from track list`. Unqueueing leaves an existing track-list copy in place; a unique queued item returns to the end of `Next from track list`. Local and Telegram queues use existing-track search. YouTube prompts for another URL or playlist. Audio continues while the queue is open, and automatic track changes keep the queue open. In on-screen control hints, only key tokens such as `[s]`, `Enter`, or `q/Ctrl+C` are bold; action words remain normal.
+
+Local and Telegram players read lyrics embedded in the audio file metadata. Standard timestamped LRC follows playback, bolds the current line, and marks it with `>`. Enhanced LRC word timestamps such as `<00:21.347>` are hidden from the displayed text and bold the current word inside the marked row. Plain lyrics can be scrolled with `Page Up` and `Page Down`. Long lines wrap at word boundaries; scripts without spaces wrap safely by Unicode character.
+
+Open `Lyrics settings` from the main Settings menu or press `b` during Local or Telegram playback. The in-player editor leaves playback and Telegram downloading active. It can show or hide lyrics, place the panel beside or below the player, align rows left or center, and independently color active synchronized rows, inactive synchronized rows, and plain lyrics. Pressing `y` toggles visibility directly, including while the editor is open. A beside panel falls back below the player if the terminal is too narrow. Telegram lyrics may appear only after the full temporary file is cached when its metadata is stored at the end of the file. The player does not search online for lyrics.
 
 A track-list entry is consumed once per playback pass. Duplicate entries remain separate plays, a manually queued copy is an extra play, and manual Previous may replay an entry without changing automatic forward progress. Loop Off stops after the remaining channel or track list is exhausted. Loop All starts a new full pass only after exhaustion. Loop One repeats only the current track. Toggling shuffle changes only the unplayed `Next from track list` tail; the current track, already consumed tracks, and manually ordered `Next in queue` entries do not move.
 

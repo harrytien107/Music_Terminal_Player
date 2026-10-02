@@ -104,10 +104,15 @@ The first selected song starts immediately. Other selected songs appear under `N
 | `r` | Toggle shuffle |
 | `l` | Change loop mode |
 | `u` | Open the queue |
+| `b` | Open live Lyrics settings |
+| `y` | Show or hide embedded lyrics |
+| `Page Up` / `Page Down` | Scroll plain lyrics |
 | `Up` / `Down` | Change volume by 10% |
 | `Left` / `Right` | Change volume by 1% |
-| `b` or `Esc` | Return to the previous menu |
+| `Esc` | Return to the previous menu |
 | `q` or `Ctrl+C` | Quit completely |
+
+The player reads lyrics from the Telegram audio file metadata. Timestamped LRC lyrics follow playback automatically, with `>` marking the current row. Enhanced LRC can also follow and bold the current word, while plain lyrics use manual scrolling. Long lines wrap without splitting normal words. Press `b` to change visibility, position, alignment, and synchronized or plain lyric colors while playback and downloading continue. Lyrics may appear after the complete track is cached when its metadata is stored at the end of the file.
 
 ## Download a channel for offline local playback
 

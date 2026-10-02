@@ -13,12 +13,15 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
+use crate::lyrics::{Lyrics, read_embedded_lyrics};
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    LoopMode, MAX_VOLUME, PlayerExit, RawMode, draw_frame, draw_panel, format_duration,
-    forward_track_index, insert_queue_next, is_supported_audio_path, load_setting_bool,
-    load_volume, manage_queue, playback_controls, player_title_row, previous_track_index,
-    progress_bar, restart_pass_order, save_volume, set_shuffle_order, shuffle_slice, toggle_all,
+    LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
+    draw_frame, draw_player_panels, format_duration, forward_track_index, insert_queue_next,
+    is_supported_audio_path, load_setting_bool, load_volume, manage_queue,
+    playback_controls_with_lyrics, playback_key_bindings_hint, player_title_row,
+    previous_track_index, progress_bar, restart_pass_order, save_setting_bool, save_volume,
+    set_shuffle_order, shuffle_slice, toggle_all, toggle_playback_key_bindings,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -100,9 +103,14 @@ fn play_tracks_inner(
     let mut volume = load_volume();
     let mut shuffle = initially_shuffled;
     let mut loop_mode = LoopMode::Off;
+    let mut lyrics_visible = load_setting_bool("playback.lyrics", true);
+    let mut lyrics_settings = None;
+    let mut lyrics_scroll = 0usize;
+    let mut lyrics_index = index;
     let mut duration;
     let mut sink;
-    (sink, duration) = start_track(
+    let mut lyrics;
+    (sink, duration, lyrics) = start_track(
         output.stream(),
         &media_controls,
         &tracks[index],
@@ -111,6 +119,10 @@ fn play_tracks_inner(
     )?;
 
     loop {
+        if lyrics_index != index {
+            lyrics_scroll = 0;
+            lyrics_index = index;
+        }
         if output.is_lost() {
             sink.stop();
             return Err(device_unavailable_error());
@@ -143,7 +155,7 @@ fn play_tracks_inner(
                         play_next -= 1;
                     }
                     index = next;
-                    (sink, duration) = start_track(
+                    (sink, duration, lyrics) = start_track(
                         output.stream(),
                         &media_controls,
                         &tracks[index],
@@ -153,7 +165,7 @@ fn play_tracks_inner(
                 }
                 MediaCommand::Previous => {
                     index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
-                    (sink, duration) = start_track(
+                    (sink, duration, lyrics) = start_track(
                         output.stream(),
                         &media_controls,
                         &tracks[index],
@@ -176,6 +188,10 @@ fn play_tracks_inner(
             shuffle,
             loop_mode,
             add_tracks.is_some(),
+            lyrics.as_ref(),
+            lyrics_scroll,
+            lyrics_visible,
+            lyrics_settings.as_ref(),
         )?;
 
         if sink.empty() {
@@ -195,7 +211,7 @@ fn play_tracks_inner(
                 play_next -= 1;
             }
             index = next;
-            (sink, duration) = start_track(
+            (sink, duration, lyrics) = start_track(
                 output.stream(),
                 &media_controls,
                 &tracks[index],
@@ -219,9 +235,28 @@ fn play_tracks_inner(
             return Ok(PlayerExit::Quit);
         }
 
+        if let Some(editor) = lyrics_settings.as_mut() {
+            match editor.handle_key(key.code, key.modifiers, lyrics_visible)? {
+                LyricsEditorResult::Visibility(visible) => {
+                    lyrics_visible = visible;
+                    continue;
+                }
+                LyricsEditorResult::Close => {
+                    lyrics_settings = None;
+                    continue;
+                }
+                LyricsEditorResult::Handled => continue,
+                LyricsEditorResult::Pass => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => return Ok(PlayerExit::Quit),
-            KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
+            KeyCode::Char('b') => {
+                lyrics_settings = Some(LyricsSettingsEditor::new());
+            }
+            KeyCode::Char('/') => toggle_playback_key_bindings()?,
+            KeyCode::Esc => return Ok(PlayerExit::Back),
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if sink.is_paused() {
                     sink.play();
@@ -248,7 +283,7 @@ fn play_tracks_inner(
                     play_next -= 1;
                 }
                 index = next;
-                (sink, duration) = start_track(
+                (sink, duration, lyrics) = start_track(
                     output.stream(),
                     &media_controls,
                     &tracks[index],
@@ -258,7 +293,7 @@ fn play_tracks_inner(
             }
             KeyCode::Char('v') if key.modifiers.is_empty() => {
                 index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
-                (sink, duration) = start_track(
+                (sink, duration, lyrics) = start_track(
                     output.stream(),
                     &media_controls,
                     &tracks[index],
@@ -277,6 +312,16 @@ fn play_tracks_inner(
                 save_volume(volume)?;
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
+            KeyCode::Char('y') => {
+                lyrics_visible = !lyrics_visible;
+                save_setting_bool("playback.lyrics", lyrics_visible)?;
+            }
+            KeyCode::PageUp if lyrics_visible => {
+                lyrics_scroll = lyrics_scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown if lyrics_visible => {
+                lyrics_scroll = lyrics_scroll.saturating_add(5);
+            }
             KeyCode::Char('r') => {
                 resume_after_replay = None;
                 shuffle = !shuffle;
@@ -333,7 +378,7 @@ fn play_tracks_inner(
                         play_next -= 1;
                     }
                     index = next;
-                    (sink, duration) = start_track(
+                    (sink, duration, lyrics) = start_track(
                         output.stream(),
                         &media_controls,
                         &tracks[index],
@@ -345,7 +390,7 @@ fn play_tracks_inner(
                 if edit.restart {
                     resume_after_replay = None;
                     play_next = 0;
-                    (sink, duration) = start_track(
+                    (sink, duration, lyrics) = start_track(
                         output.stream(),
                         &media_controls,
                         &tracks[index],
@@ -376,7 +421,8 @@ fn start_track(
     path: &Path,
     volume: f32,
     paused: bool,
-) -> Result<(Sink, Option<Duration>)> {
+) -> Result<(Sink, Option<Duration>, Option<Lyrics>)> {
+    let lyrics = read_embedded_lyrics(path).ok().flatten();
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let decoder =
         Decoder::try_from(file).with_context(|| format!("failed to decode {}", path.display()))?;
@@ -395,7 +441,7 @@ fn start_track(
     if paused {
         sink.pause();
     }
-    Ok((sink, duration))
+    Ok((sink, duration, lyrics))
 }
 
 fn draw_player(
@@ -409,6 +455,10 @@ fn draw_player(
     shuffle: bool,
     loop_mode: LoopMode,
     can_add_tracks: bool,
+    lyrics: Option<&Lyrics>,
+    lyrics_scroll: usize,
+    lyrics_visible: bool,
+    lyrics_settings: Option<&LyricsSettingsEditor>,
 ) -> Result<()> {
     let state = if sink.is_paused() {
         tr("msg.paused")
@@ -448,9 +498,19 @@ fn draw_player(
         rows.push(tr("msg.a_add_youtube_url_or_playlist").to_string());
     }
     if load_setting_bool("playback.key_bindings", true) {
-        rows.extend(playback_controls());
+        rows.push(playback_key_bindings_hint());
+        rows.extend(playback_controls_with_lyrics());
     }
-    draw_panel(stdout, &format!("Music Terminal Player · {title}"), &rows)
+    draw_player_panels(
+        stdout,
+        &format!("Music Terminal Player · {title}"),
+        &rows,
+        lyrics,
+        elapsed,
+        lyrics_scroll,
+        lyrics_visible,
+        lyrics_settings,
+    )
 }
 
 pub(crate) fn local_track_label(path: &Path) -> String {

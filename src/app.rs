@@ -24,8 +24,8 @@ use crate::telegram::{
 };
 use crate::util::{
     LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
-    fit_text, load_setting_bool, load_setting_value, normalize_channel, prompt, save_setting_bool,
-    save_setting_value, select_menu, select_menu_from, toggle_all,
+    fit_text, load_setting_bool, load_setting_value, manage_lyrics_settings, normalize_channel,
+    prompt, save_setting_bool, save_setting_value, select_menu, select_menu_from, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +78,77 @@ enum LauncherAction {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherColor {
+    Default,
+    White,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+impl LauncherColor {
+    const ALL: [Self; 8] = [
+        Self::Default,
+        Self::White,
+        Self::Red,
+        Self::Green,
+        Self::Yellow,
+        Self::Blue,
+        Self::Magenta,
+        Self::Cyan,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::White => "white",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Blue => "blue",
+            Self::Magenta => "magenta",
+            Self::Cyan => "cyan",
+        }
+    }
+
+    fn from_key(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| color.key() == value)
+            .unwrap_or(Self::Default)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => tr("msg.default_warm"),
+            Self::White => tr("msg.white"),
+            Self::Red => tr("msg.red"),
+            Self::Green => tr("msg.green"),
+            Self::Yellow => tr("msg.yellow"),
+            Self::Blue => tr("msg.blue"),
+            Self::Magenta => tr("msg.magenta"),
+            Self::Cyan => tr("msg.cyan"),
+        }
+    }
+
+    fn paint(self, text: String) -> String {
+        match self {
+            Self::Default => text,
+            Self::White => format!("{}", text.white()),
+            Self::Red => format!("{}", text.red()),
+            Self::Green => format!("{}", text.green()),
+            Self::Yellow => format!("{}", text.yellow()),
+            Self::Blue => format!("{}", text.blue()),
+            Self::Magenta => format!("{}", text.magenta()),
+            Self::Cyan => format!("{}", text.cyan()),
+        }
+    }
+}
+
 const MENU_VISIBILITY_SETTINGS: &[(LauncherAction, &str)] = &[
     (LauncherAction::QuickPlay, "menu.quick_play"),
     (LauncherAction::YouTube, "menu.youtube"),
@@ -91,6 +162,39 @@ const MENU_VISIBILITY_SETTINGS: &[(LauncherAction, &str)] = &[
 ];
 
 const MAIN_MENU_ORDER_SETTING: &str = "menu.order";
+
+fn launcher_color_setting(action: LauncherAction) -> Option<&'static str> {
+    match action {
+        LauncherAction::QuickPlay => Some("menu.color.quick_play"),
+        LauncherAction::YouTube => Some("menu.color.youtube"),
+        LauncherAction::Local => Some("menu.color.local"),
+        LauncherAction::Telegram => Some("menu.color.telegram"),
+        LauncherAction::Playlists => Some("menu.color.playlists"),
+        LauncherAction::SyncTelegram => Some("menu.color.sync_telegram"),
+        LauncherAction::LoginTelegram => Some("menu.color.login_telegram"),
+        LauncherAction::DownloadTelegram => Some("menu.color.download_telegram"),
+        LauncherAction::Quit => Some("menu.color.quit"),
+        LauncherAction::Settings => None,
+    }
+}
+
+fn launcher_default_color(action: LauncherAction) -> LauncherColor {
+    match action {
+        LauncherAction::QuickPlay => LauncherColor::White,
+        LauncherAction::YouTube => LauncherColor::Red,
+        LauncherAction::Local => LauncherColor::Green,
+        LauncherAction::Telegram => LauncherColor::Cyan,
+        _ => LauncherColor::Default,
+    }
+}
+
+fn launcher_color(action: LauncherAction) -> LauncherColor {
+    launcher_color_setting(action)
+        .and_then(load_setting_value)
+        .as_deref()
+        .map(LauncherColor::from_key)
+        .unwrap_or_else(|| launcher_default_color(action))
+}
 
 fn main_menu_order() -> Vec<(LauncherAction, &'static str)> {
     let saved = load_setting_value(MAIN_MENU_ORDER_SETTING);
@@ -148,25 +252,22 @@ fn launcher_entries(telegram_status: &str) -> Vec<(LauncherAction, String)> {
         (
             LauncherAction::QuickPlay,
             "menu.quick_play",
-            format!("{}", format!("▶  {}", tr("msg.quick_play")).white()),
+            format!("▶  {}", tr("msg.quick_play")),
         ),
         (
             LauncherAction::YouTube,
             "menu.youtube",
-            format!("{}", format!("▶  {}", tr("msg.play_youtube_audio")).red()),
+            format!("▶  {}", tr("msg.play_youtube_audio")),
         ),
         (
             LauncherAction::Local,
             "menu.local",
-            format!("{}", format!("♫  {}", tr("msg.play_local_folder")).green()),
+            format!("♫  {}", tr("msg.play_local_folder")),
         ),
         (
             LauncherAction::Telegram,
             "menu.telegram",
-            format!(
-                "{}",
-                format!("♫  {}", tr("msg.stream_telegram_channel")).cyan()
-            ),
+            format!("♫  {}", tr("msg.stream_telegram_channel")),
         ),
         (
             LauncherAction::Playlists,
@@ -206,7 +307,7 @@ fn launcher_entries(telegram_status: &str) -> Vec<(LauncherAction, String)> {
         if entry.0 == LauncherAction::Settings {
             settings = Some((entry.0, entry.2));
         } else {
-            configurable.push(entry);
+            configurable.push((entry.0, entry.1, launcher_color(entry.0).paint(entry.2)));
         }
     }
 
@@ -399,6 +500,7 @@ fn manage_settings() -> Result<()> {
                     tr("msg.off")
                 }
             ),
+            format!("{} {}", fit_text("▭", 2), tr("msg.lyrics_settings")),
             format!("{} {}", fit_text("A", 2), tr("msg.language")),
             format!("{} {}", fit_text("←", 2), tr("msg.back")),
         ];
@@ -417,9 +519,13 @@ fn manage_settings() -> Result<()> {
             }
             Some(3) => {
                 selected = 3;
+                manage_lyrics_settings()?;
+            }
+            Some(4) => {
+                selected = 4;
                 manage_language()?;
             }
-            Some(4) | None => return Ok(()),
+            Some(5) | None => return Ok(()),
             _ => unreachable!(),
         }
     }
@@ -434,14 +540,16 @@ fn manage_main_menu_visibility() -> Result<()> {
         let mut items = order
             .iter()
             .map(|(action, key)| {
+                let color = launcher_color(*action);
                 format!(
-                    "[{}] {}",
+                    "[{}] {}  {}",
                     if load_setting_bool(key, true) {
                         "x"
                     } else {
                         " "
                     },
-                    launcher_action_label(*action)
+                    fit_text(launcher_action_label(*action), 40),
+                    color.paint(color.label().to_string())
                 )
             })
             .collect::<Vec<_>>();
@@ -454,7 +562,7 @@ fn manage_main_menu_visibility() -> Result<()> {
                 if index == selected { ">" } else { " " }
             ));
         }
-        frame.push_str("\r\n[Space] toggle | ↑/↓ move | [Esc] back");
+        frame.push_str(tr("msg.main_menu_visibility_controls"));
         frame.push_str(tr("msg.shift_up_down_reorder"));
         draw_frame(&mut stdout, &frame)?;
 
@@ -487,6 +595,9 @@ fn manage_main_menu_visibility() -> Result<()> {
                 let (_, key) = order[selected];
                 save_setting_bool(key, !load_setting_bool(key, true))?;
             }
+            KeyCode::Enter if selected < order.len() => {
+                manage_main_menu_color(order[selected].0, &mut stdout)?;
+            }
             KeyCode::Char(' ') | KeyCode::Enter if selected == order.len() => {
                 drop(raw);
                 clear_screen()?;
@@ -497,6 +608,62 @@ fn manage_main_menu_visibility() -> Result<()> {
                 clear_screen()?;
                 return Ok(());
             }
+            _ => {}
+        }
+    }
+}
+
+fn manage_main_menu_color(action: LauncherAction, stdout: &mut io::Stdout) -> Result<()> {
+    let Some(setting_key) = launcher_color_setting(action) else {
+        return Ok(());
+    };
+    let current = launcher_color(action);
+    let mut selected = LauncherColor::ALL
+        .iter()
+        .position(|color| *color == current)
+        .unwrap_or(0);
+    loop {
+        let title = format!(
+            "{} {}",
+            launcher_action_label(action),
+            tr("msg.color").to_lowercase()
+        );
+        let mut frame = format!("{}\r\n\r\n", bold_text(&title));
+        for (index, color) in LauncherColor::ALL.into_iter().enumerate() {
+            frame.push_str(&format!(
+                "{} {}\r\n",
+                if index == selected { ">" } else { " " },
+                color.paint(color.label().to_string())
+            ));
+        }
+        frame.push_str(&format!(
+            "{} ← {}\r\n",
+            if selected == LauncherColor::ALL.len() {
+                ">"
+            } else {
+                " "
+            },
+            tr("msg.back")
+        ));
+        frame.push_str(tr("msg.up_down_enter_esc"));
+        draw_frame(stdout, &frame)?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => {
+                selected = selected.checked_sub(1).unwrap_or(LauncherColor::ALL.len());
+            }
+            KeyCode::Down => selected = (selected + 1) % (LauncherColor::ALL.len() + 1),
+            KeyCode::Enter if selected < LauncherColor::ALL.len() => {
+                save_setting_value(setting_key, LauncherColor::ALL[selected].key())?;
+                return Ok(());
+            }
+            KeyCode::Enter | KeyCode::Esc => return Ok(()),
             _ => {}
         }
     }

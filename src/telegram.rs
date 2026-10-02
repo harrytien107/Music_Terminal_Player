@@ -33,13 +33,16 @@ use tokio::task::JoinHandle;
 
 use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
+use crate::lyrics::{Lyrics, read_embedded_lyrics};
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, clear_screen, draw_frame, draw_panel,
-    format_duration, format_elapsed, forward_track_index, is_supported_audio_path,
-    load_setting_bool, load_volume, manage_queue, normalize_channel, playback_controls,
-    player_title_row, previous_track_index, progress_bar, prompt, restart_pass_order,
-    safe_file_name, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
+    DATA_DIR, LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
+    clear_screen, draw_frame, draw_player_panels, format_duration, format_elapsed,
+    forward_track_index, is_supported_audio_path, load_setting_bool, load_volume, manage_queue,
+    normalize_channel, playback_controls_with_lyrics, playback_key_bindings_hint, player_title_row,
+    previous_track_index, progress_bar, prompt, restart_pass_order, safe_file_name,
+    save_setting_bool, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
+    toggle_playback_key_bindings,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -898,6 +901,8 @@ const DECODE_WARNING: &str = "Cannot decode this track. Press p, Space, or n for
 struct ActiveTelegramTrack {
     sink: Sink,
     duration: Option<Duration>,
+    lyrics: Option<Lyrics>,
+    lyrics_checked_complete: bool,
     cache_path: PathBuf,
     shared: Arc<SharedDownload>,
     download_task: Option<JoinHandle<()>>,
@@ -937,10 +942,18 @@ async fn play_telegram_tracks(
     let mut resume_after_replay = None;
     let mut play_next = initial_play_next.min(tracks.len().saturating_sub(1));
     let mut loop_mode = LoopMode::Off;
+    let mut lyrics_visible = load_setting_bool("playback.lyrics", true);
+    let mut lyrics_settings = None;
+    let mut lyrics_scroll = 0usize;
+    let mut lyrics_index = index;
     let mut active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
     update_telegram_media(&media_controls, &tracks[index], &active);
 
     loop {
+        if lyrics_index != index {
+            lyrics_scroll = 0;
+            lyrics_index = index;
+        }
         if output.is_lost() {
             active.stop().await;
             delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
@@ -998,6 +1011,12 @@ async fn play_telegram_tracks(
             continue;
         }
 
+        let complete = active.shared.state.lock().map_err(lock_error)?.complete;
+        if complete && !active.lyrics_checked_complete {
+            active.lyrics = read_embedded_lyrics(&active.cache_path).ok().flatten();
+            active.lyrics_checked_complete = true;
+        }
+
         draw_telegram_player(
             &mut stdout,
             &tracks,
@@ -1009,9 +1028,12 @@ async fn play_telegram_tracks(
             &active.shared,
             loop_mode,
             active.warning,
+            active.lyrics.as_ref(),
+            lyrics_scroll,
+            lyrics_visible,
+            lyrics_settings.as_ref(),
         )?;
 
-        let complete = active.shared.state.lock().map_err(lock_error)?.complete;
         if active.warning.is_none() && complete && active.sink.empty() {
             let Some((next, new_pass, advance_queue)) = forward_track_index(
                 index,
@@ -1053,13 +1075,32 @@ async fn play_telegram_tracks(
             return Ok(PlayerExit::Quit);
         }
 
+        if let Some(editor) = lyrics_settings.as_mut() {
+            match editor.handle_key(key.code, key.modifiers, lyrics_visible)? {
+                LyricsEditorResult::Visibility(visible) => {
+                    lyrics_visible = visible;
+                    continue;
+                }
+                LyricsEditorResult::Close => {
+                    lyrics_settings = None;
+                    continue;
+                }
+                LyricsEditorResult::Handled => continue,
+                LyricsEditorResult::Pass => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 active.stop().await;
                 delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
                 return Ok(PlayerExit::Quit);
             }
-            KeyCode::Char('b') | KeyCode::Esc => {
+            KeyCode::Char('b') => {
+                lyrics_settings = Some(LyricsSettingsEditor::new());
+            }
+            KeyCode::Char('/') => toggle_playback_key_bindings()?,
+            KeyCode::Esc => {
                 active.stop().await;
                 delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
                 return Ok(PlayerExit::Back);
@@ -1119,6 +1160,16 @@ async fn play_telegram_tracks(
                 save_volume(volume)?;
             }
             KeyCode::Char('l') => loop_mode = loop_mode.cycle(),
+            KeyCode::Char('y') => {
+                lyrics_visible = !lyrics_visible;
+                save_setting_bool("playback.lyrics", lyrics_visible)?;
+            }
+            KeyCode::PageUp if lyrics_visible => {
+                lyrics_scroll = lyrics_scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown if lyrics_visible => {
+                lyrics_scroll = lyrics_scroll.saturating_add(5);
+            }
             KeyCode::Char('r') => {
                 resume_after_replay = None;
                 shuffle = !shuffle;
@@ -1354,6 +1405,7 @@ async fn start_telegram_track(
         position: 0,
         shared: Arc::clone(&shared),
     };
+    let lyrics = read_embedded_lyrics(&track.cache_path).ok().flatten();
     let sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
     let mut warning = None;
@@ -1399,6 +1451,8 @@ async fn start_telegram_track(
     Ok(ActiveTelegramTrack {
         sink,
         duration,
+        lyrics,
+        lyrics_checked_complete: cache_complete,
         cache_path: track.cache_path.clone(),
         shared,
         download_task,
@@ -2115,6 +2169,10 @@ fn draw_telegram_player(
     shared: &SharedDownload,
     loop_mode: LoopMode,
     warning: Option<&str>,
+    lyrics: Option<&Lyrics>,
+    lyrics_scroll: usize,
+    lyrics_visible: bool,
+    lyrics_settings: Option<&LyricsSettingsEditor>,
 ) -> Result<()> {
     let state = shared.state.lock().map_err(lock_error)?;
     let playback = if warning.is_some() || state.error.is_some() {
@@ -2174,9 +2232,19 @@ fn draw_telegram_player(
         rows.push(String::new());
     }
     if load_setting_bool("playback.key_bindings", true) {
-        rows.extend(playback_controls());
+        rows.push(playback_key_bindings_hint());
+        rows.extend(playback_controls_with_lyrics());
     }
-    draw_panel(stdout, "Music Terminal Player · Telegram", &rows)
+    draw_player_panels(
+        stdout,
+        "Music Terminal Player · Telegram",
+        &rows,
+        lyrics,
+        elapsed,
+        lyrics_scroll,
+        lyrics_visible,
+        lyrics_settings,
+    )
 }
 
 pub(crate) async fn sync_catalog(channel: &str) -> Result<()> {

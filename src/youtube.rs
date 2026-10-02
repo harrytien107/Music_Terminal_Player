@@ -21,9 +21,9 @@ use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_panel,
     format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_volume,
-    manage_queue_with_adder, playback_controls, player_title_row, previous_track_index,
-    progress_bar, prompt, prompt_or_escape, restart_pass_order, save_volume, select_menu,
-    select_menu_from, set_shuffle_order,
+    manage_queue_with_adder, playback_controls, playback_key_bindings_hint, player_title_row,
+    previous_track_index, progress_bar, prompt, prompt_or_escape, restart_pass_order, save_volume,
+    select_menu, select_menu_from, set_shuffle_order, toggle_playback_key_bindings,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -1572,6 +1572,7 @@ fn play_youtube_tracks(
                     match key.code {
                         KeyCode::Char('q') => return Ok(PlayerExit::Quit),
                         KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
+                        KeyCode::Char('/') => toggle_playback_key_bindings()?,
                         KeyCode::Char('p') | KeyCode::Char(' ') if stream_failures >= 3 => {
                             stream_failures = 0;
                         }
@@ -1766,6 +1767,7 @@ fn play_youtube_tracks(
         match key.code {
             KeyCode::Char('q') => return Ok(PlayerExit::Quit),
             KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
+            KeyCode::Char('/') => toggle_playback_key_bindings()?,
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if playback.is_paused() {
                     playback.play();
@@ -1990,6 +1992,7 @@ fn draw_youtube_player(
         ),
     ];
     if load_setting_bool("playback.key_bindings", true) {
+        rows.push(playback_key_bindings_hint());
         rows.extend(youtube_playback_controls());
     }
     draw_panel(stdout, "Music Terminal Player · YouTube", &rows)

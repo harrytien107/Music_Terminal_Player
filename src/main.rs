@@ -8,6 +8,7 @@ mod app;
 mod audio_output;
 mod i18n;
 mod local;
+mod lyrics;
 mod media_controls;
 mod telegram;
 #[cfg(test)]

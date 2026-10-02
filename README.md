@@ -1,8 +1,9 @@
 # Music Terminal Player
 
-Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, or stream YouTube audio through yt-dlp and FFmpeg.
+Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, display embedded synchronized lyrics, or stream YouTube audio through yt-dlp and FFmpeg.
 
 ![Music Terminal Player Telegram playback](docs/media/example1.png)
+
 
 ## Why?
 
@@ -19,15 +20,22 @@ A small terminal player for local libraries and online sources without the overh
 - Windows media controls with track metadata and Play, Pause, Next, and Previous actions
 - Automatic YouTube recovery when the default audio output changes
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
+- Configurable embedded lyrics for local and Telegram tracks, including line-synchronized LRC and word-synchronized Enhanced LRC
 - Built-in offline English UI with optional, verified Vietnamese download and persistent selection
 - Unicode-aware terminal panels, compact color-coded launcher actions, and queue columns
 - Portable or custom yt-dlp and FFmpeg setup with manual portable tool updates
 - Direct YouTube URL or playlist input from Quick play
 
+### Lyrics support for local files and telegram
+
+Local and Telegram tracks can display embedded plain lyrics, synchronized LRC, and word-synchronized Enhanced LRC directly beside or below the player.
+
+![Music Terminal Player synchronized lyrics](docs/media/example2.png)
+
 ## Installing
 Windows is supported. macOS and Linux support are planned.
 
-Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.0.4)
+Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.0.9)
 
 ## Tutorials
 

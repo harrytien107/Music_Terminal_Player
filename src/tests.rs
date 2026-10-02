@@ -23,9 +23,9 @@ use crate::telegram::{
 use crate::util::{
     LoopMode, NORMAL_TEXT_COLOR, bold_key_bindings, bold_text, fit_text, forward_track_index,
     insert_queue_next, is_supported_audio_path, menu_quit_key, next_track_index, normalize_channel,
-    parse_volume_settings, playback_controls, previous_track_index, progress_bar,
-    queue_window_start, restart_pass_order, safe_file_name, set_shuffle_order, shuffle_slice,
-    toggle_all, unqueue_next_item,
+    parse_volume_settings, playback_controls, playback_controls_with_lyrics, previous_track_index,
+    progress_bar, queue_window_start, restart_pass_order, safe_file_name, set_shuffle_order,
+    shuffle_slice, toggle_all, unqueue_next_item,
 };
 use crate::youtube::{
     YouTubeTools, parse_youtube_tools, parse_youtube_urls, serialize_youtube_tools,
@@ -151,7 +151,7 @@ fn repository_language_catalog_matches_the_flat_vietnamese_pack() {
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].language, Language::Vietnamese);
     assert_eq!(catalog[0].name, "Tiếng Việt");
-    assert_eq!(catalog[0].version, 10);
+    assert_eq!(catalog[0].version, 16);
     assert_eq!(catalog[0].file, "vi.lang");
     assert_eq!(
         catalog[0].sha256,
@@ -466,15 +466,24 @@ fn only_key_binding_tokens_are_marked_bold() {
             bold_text("Esc")
         )
     );
+    assert_eq!(
+        bold_key_bindings("Lyrics: shown ([y] show/hide lyrics)"),
+        format!("Lyrics: shown ({} show/hide lyrics)", bold_text("[y]"))
+    );
 }
 
 #[test]
 fn playback_control_table_has_aligned_rows() {
-    let rows = playback_controls();
+    let rows = playback_controls_with_lyrics();
     let width = rows[0].chars().count();
     assert!(rows.iter().all(|row| row.chars().count() == width));
     assert!(rows.join("\n").contains("[p] play/pause"));
-    assert!(!rows.join("\n").contains("lyrics"));
+    assert!(rows.join("\n").contains("[b] lyrics"));
+    assert!(!rows.join("\n").contains("[y] lyrics"));
+
+    let youtube_rows = playback_controls();
+    assert!(youtube_rows.join("\n").contains("[b] menu"));
+    assert!(!youtube_rows.join("\n").contains("[y] lyrics"));
 }
 
 #[test]

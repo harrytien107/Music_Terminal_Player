@@ -10,6 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use anyhow::Result;
 
 use crate::i18n::tr;
+use crate::lyrics::Lyrics;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, ClearType};
@@ -17,6 +18,14 @@ use crossterm::{cursor, execute, queue};
 
 const BOLD_START: char = '\u{1}';
 const BOLD_END: char = '\u{2}';
+const COLOR_WHITE: char = '\u{3}';
+const COLOR_RED: char = '\u{4}';
+const COLOR_GREEN: char = '\u{5}';
+const COLOR_YELLOW: char = '\u{6}';
+const COLOR_BLUE: char = '\u{7}';
+const COLOR_MAGENTA: char = '\u{8}';
+const COLOR_CYAN: char = '\u{b}';
+const COLOR_DEFAULT: char = '\u{c}';
 
 pub(crate) const NORMAL_TEXT_COLOR: Color = Color::Rgb {
     r: 0xd3,
@@ -36,6 +45,293 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 pub(crate) enum PlayerExit {
     Back,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LyricColor {
+    Default,
+    White,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+impl LyricColor {
+    const ALL: [Self; 8] = [
+        Self::Default,
+        Self::White,
+        Self::Red,
+        Self::Green,
+        Self::Yellow,
+        Self::Blue,
+        Self::Magenta,
+        Self::Cyan,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::White => "white",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Blue => "blue",
+            Self::Magenta => "magenta",
+            Self::Cyan => "cyan",
+        }
+    }
+
+    fn from_key(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| color.key() == value)
+            .unwrap_or(Self::Default)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => tr("msg.default_warm"),
+            Self::White => tr("msg.white"),
+            Self::Red => tr("msg.red"),
+            Self::Green => tr("msg.green"),
+            Self::Yellow => tr("msg.yellow"),
+            Self::Blue => tr("msg.blue"),
+            Self::Magenta => tr("msg.magenta"),
+            Self::Cyan => tr("msg.cyan"),
+        }
+    }
+
+    fn marker(self) -> char {
+        match self {
+            Self::Default => COLOR_DEFAULT,
+            Self::White => COLOR_WHITE,
+            Self::Red => COLOR_RED,
+            Self::Green => COLOR_GREEN,
+            Self::Yellow => COLOR_YELLOW,
+            Self::Blue => COLOR_BLUE,
+            Self::Magenta => COLOR_MAGENTA,
+            Self::Cyan => COLOR_CYAN,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LyricColorTarget {
+    Active,
+    Inactive,
+    Plain,
+}
+
+impl LyricColorTarget {
+    fn setting_key(self) -> &'static str {
+        match self {
+            Self::Active => "lyrics.color.active",
+            Self::Inactive => "lyrics.color.inactive",
+            Self::Plain => "lyrics.color.plain",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => tr("msg.active_synchronized_lyric_color"),
+            Self::Inactive => tr("msg.inactive_synchronized_lyric_color"),
+            Self::Plain => tr("msg.plain_lyrics_color"),
+        }
+    }
+}
+
+pub(crate) enum LyricsEditorResult {
+    Handled,
+    Close,
+    Visibility(bool),
+    Pass,
+}
+
+pub(crate) struct LyricsSettingsEditor {
+    selected: usize,
+    color_target: Option<LyricColorTarget>,
+    color_selected: usize,
+}
+
+impl LyricsSettingsEditor {
+    pub(crate) fn new() -> Self {
+        Self {
+            selected: 0,
+            color_target: None,
+            color_selected: 0,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        self.color_target
+            .map(LyricColorTarget::label)
+            .unwrap_or_else(|| tr("msg.lyrics_settings"))
+    }
+
+    fn rows(&self, lyrics_visible: bool) -> Vec<String> {
+        if self.color_target.is_some() {
+            let mut rows = LyricColor::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, color)| {
+                    let label = color_text(color.label(), color);
+                    format!(
+                        "{} {label}",
+                        if index == self.color_selected {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.push(format!(
+                "{} ← {}",
+                if self.color_selected == LyricColor::ALL.len() {
+                    ">"
+                } else {
+                    " "
+                },
+                tr("msg.back")
+            ));
+            return rows;
+        }
+
+        let position = if load_setting_value("lyrics.position").as_deref() == Some("below") {
+            tr("msg.below_player")
+        } else {
+            tr("msg.next_to_player")
+        };
+        let alignment = if load_setting_value("lyrics.alignment").as_deref() == Some("center") {
+            tr("msg.center")
+        } else {
+            tr("msg.left")
+        };
+        let active = lyric_color_setting(LyricColorTarget::Active);
+        let inactive = lyric_color_setting(LyricColorTarget::Inactive);
+        let plain = lyric_color_setting(LyricColorTarget::Plain);
+        let items = [
+            format!(
+                "{}: {}  {}",
+                tr("msg.lyrics"),
+                if lyrics_visible {
+                    tr("msg.shown")
+                } else {
+                    tr("msg.hidden")
+                },
+                tr("msg.y_show_hide_lyrics")
+            ),
+            format!("{}: {position}", tr("msg.lyrics_position")),
+            format!("{}: {alignment}", tr("msg.lyrics_alignment")),
+            format!(
+                "{}: {}",
+                tr("msg.active_synchronized_lyric_color"),
+                color_text(active.label(), active)
+            ),
+            format!(
+                "{}: {}",
+                tr("msg.inactive_synchronized_lyric_color"),
+                color_text(inactive.label(), inactive)
+            ),
+            format!(
+                "{}: {}",
+                tr("msg.plain_lyrics_color"),
+                color_text(plain.label(), plain)
+            ),
+            format!("← {}", tr("msg.back")),
+        ];
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!("{} {item}", if index == self.selected { ">" } else { " " })
+            })
+            .collect()
+    }
+
+    pub(crate) fn handle_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        lyrics_visible: bool,
+    ) -> Result<LyricsEditorResult> {
+        if code == KeyCode::Char('y') && modifiers.is_empty() {
+            let visible = !lyrics_visible;
+            save_setting_bool("playback.lyrics", visible)?;
+            return Ok(LyricsEditorResult::Visibility(visible));
+        }
+
+        if let Some(target) = self.color_target {
+            match code {
+                KeyCode::Up => {
+                    self.color_selected = self
+                        .color_selected
+                        .checked_sub(1)
+                        .unwrap_or(LyricColor::ALL.len());
+                }
+                KeyCode::Down => {
+                    self.color_selected = (self.color_selected + 1) % (LyricColor::ALL.len() + 1);
+                }
+                KeyCode::Enter if self.color_selected < LyricColor::ALL.len() => {
+                    save_setting_value(
+                        target.setting_key(),
+                        LyricColor::ALL[self.color_selected].key(),
+                    )?;
+                    self.color_target = None;
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => {
+                    self.color_target = None;
+                }
+                _ => return Ok(LyricsEditorResult::Pass),
+            }
+            return Ok(LyricsEditorResult::Handled);
+        }
+
+        match code {
+            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(6),
+            KeyCode::Down => self.selected = (self.selected + 1) % 7,
+            KeyCode::Enter => match self.selected {
+                0 => {
+                    let visible = !lyrics_visible;
+                    save_setting_bool("playback.lyrics", visible)?;
+                    return Ok(LyricsEditorResult::Visibility(visible));
+                }
+                1 => {
+                    let below = load_setting_value("lyrics.position").as_deref() == Some("below");
+                    save_setting_value("lyrics.position", if below { "side" } else { "below" })?;
+                }
+                2 => {
+                    let centered =
+                        load_setting_value("lyrics.alignment").as_deref() == Some("center");
+                    save_setting_value(
+                        "lyrics.alignment",
+                        if centered { "left" } else { "center" },
+                    )?;
+                }
+                3..=5 => {
+                    let target = match self.selected {
+                        3 => LyricColorTarget::Active,
+                        4 => LyricColorTarget::Inactive,
+                        _ => LyricColorTarget::Plain,
+                    };
+                    let current = lyric_color_setting(target);
+                    self.color_selected = LyricColor::ALL
+                        .iter()
+                        .position(|color| *color == current)
+                        .unwrap_or(0);
+                    self.color_target = Some(target);
+                }
+                6 => return Ok(LyricsEditorResult::Close),
+                _ => unreachable!(),
+            },
+            KeyCode::Esc | KeyCode::Char('b') => return Ok(LyricsEditorResult::Close),
+            _ => return Ok(LyricsEditorResult::Pass),
+        }
+        Ok(LyricsEditorResult::Handled)
+    }
 }
 
 pub(crate) struct QueueEdit {
@@ -300,6 +596,35 @@ pub(crate) fn bold_text(text: &str) -> String {
     format!("{BOLD_START}{text}{BOLD_END}")
 }
 
+fn lyric_color_setting(target: LyricColorTarget) -> LyricColor {
+    load_setting_value(target.setting_key())
+        .as_deref()
+        .map(LyricColor::from_key)
+        .unwrap_or(LyricColor::Default)
+}
+
+fn color_text(text: &str, color: LyricColor) -> String {
+    format!("{}{text}{COLOR_DEFAULT}", color.marker())
+}
+
+fn marker_color(marker: char) -> Option<Color> {
+    match marker {
+        COLOR_WHITE => Some(Color::White),
+        COLOR_RED => Some(Color::Red),
+        COLOR_GREEN => Some(Color::Green),
+        COLOR_YELLOW => Some(Color::Yellow),
+        COLOR_BLUE => Some(Color::Blue),
+        COLOR_MAGENTA => Some(Color::Magenta),
+        COLOR_CYAN => Some(Color::Cyan),
+        COLOR_DEFAULT => Some(NORMAL_TEXT_COLOR),
+        _ => None,
+    }
+}
+
+fn is_style_marker(character: char) -> bool {
+    matches!(character, BOLD_START | BOLD_END) || marker_color(character).is_some()
+}
+
 fn is_key_binding(token: &str) -> bool {
     matches!(
         token,
@@ -318,6 +643,7 @@ fn is_key_binding(token: &str) -> bool {
             | "+/-"
             | "←/→"
             | ",/."
+            | "/"
             | "↑/↓"
             | "a"
             | "b"
@@ -329,6 +655,7 @@ fn is_key_binding(token: &str) -> bool {
             | "s"
             | "u"
             | "v"
+            | "y"
     )
 }
 
@@ -354,6 +681,7 @@ pub(crate) fn bold_key_bindings(text: &str) -> String {
         "v",
         "r",
         "l",
+        "y",
     ];
 
     let mut output = String::with_capacity(text.len() + 16);
@@ -468,6 +796,35 @@ pub(crate) fn select_menu_from(
                 return Ok(None);
             }
             _ => {}
+        }
+    }
+}
+
+pub(crate) fn manage_lyrics_settings() -> Result<()> {
+    let _raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut editor = LyricsSettingsEditor::new();
+    let mut lyrics_visible = load_setting_bool("playback.lyrics", true);
+    loop {
+        draw_panel(&mut stdout, editor.title(), &editor.rows(lyrics_visible))?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if menu_quit_key(key.code, key.modifiers) {
+            drop(_raw);
+            clear_screen()?;
+            std::process::exit(0);
+        }
+        match editor.handle_key(key.code, key.modifiers, lyrics_visible)? {
+            LyricsEditorResult::Visibility(visible) => lyrics_visible = visible,
+            LyricsEditorResult::Close => {
+                clear_screen()?;
+                return Ok(());
+            }
+            LyricsEditorResult::Handled | LyricsEditorResult::Pass => {}
         }
     }
 }
@@ -962,6 +1319,23 @@ where
 }
 
 pub(crate) fn playback_controls() -> Vec<String> {
+    playback_controls_with_middle(tr("msg.b_menu"))
+}
+
+pub(crate) fn playback_controls_with_lyrics() -> Vec<String> {
+    playback_controls_with_middle(tr("msg.b_lyrics_settings"))
+}
+
+pub(crate) fn playback_key_bindings_hint() -> String {
+    bold_key_bindings(tr("msg.hide_playback_key_bindings"))
+}
+
+pub(crate) fn toggle_playback_key_bindings() -> Result<()> {
+    let visible = !load_setting_bool("playback.key_bindings", true);
+    save_setting_bool("playback.key_bindings", visible)
+}
+
+fn playback_controls_with_middle(middle: &str) -> Vec<String> {
     const CELL_WIDTH: usize = 14;
     let controls = [
         [
@@ -970,7 +1344,7 @@ pub(crate) fn playback_controls() -> Vec<String> {
             tr("msg.n_next"),
         ],
         [tr("msg.r_shuffle"), tr("msg.l_loop"), tr("msg.u_queue")],
-        [tr("msg.volume"), tr("msg.b_menu"), tr("msg.q_quit")],
+        [tr("msg.volume"), middle, tr("msg.q_quit")],
     ];
 
     let border = |left, middle, right| {
@@ -1019,7 +1393,7 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
     }
     let visible_width = text
         .chars()
-        .filter(|character| !matches!(*character, BOLD_START | BOLD_END))
+        .filter(|character| !is_style_marker(*character))
         .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
         .sum::<usize>();
     if visible_width <= width {
@@ -1030,6 +1404,7 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
     let mut value = String::new();
     let mut used = 0usize;
     let mut bold = false;
+    let mut colored = false;
     for character in text.chars() {
         if character == BOLD_START {
             bold = true;
@@ -1038,6 +1413,11 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
         }
         if character == BOLD_END {
             bold = false;
+            value.push(character);
+            continue;
+        }
+        if marker_color(character).is_some() {
+            colored = character != COLOR_DEFAULT;
             value.push(character);
             continue;
         }
@@ -1050,6 +1430,9 @@ pub(crate) fn fit_text(text: &str, width: usize) -> String {
     }
     if bold {
         value.push(BOLD_END);
+    }
+    if colored {
+        value.push(COLOR_DEFAULT);
     }
     value.push('…');
     value.push_str(&" ".repeat(width.saturating_sub(used + 1)));
@@ -1152,15 +1535,17 @@ pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
             line.to_string()
         };
         let styled_line = bold_key_bindings(&line);
-        for part in styled_line.split_inclusive([BOLD_START, BOLD_END]) {
-            if let Some(text) = part.strip_suffix(BOLD_START) {
-                output.write_all(text.as_bytes())?;
-                queue!(output, SetAttribute(Attribute::Bold))?;
-            } else if let Some(text) = part.strip_suffix(BOLD_END) {
-                output.write_all(text.as_bytes())?;
-                queue!(output, SetAttribute(Attribute::NormalIntensity))?;
-            } else {
-                output.write_all(part.as_bytes())?;
+        for character in styled_line.chars() {
+            match character {
+                BOLD_START => queue!(output, SetAttribute(Attribute::Bold))?,
+                BOLD_END => queue!(output, SetAttribute(Attribute::NormalIntensity))?,
+                marker if marker_color(marker).is_some() => {
+                    queue!(output, SetForegroundColor(marker_color(marker).unwrap()))?
+                }
+                character => {
+                    let mut encoded = [0; 4];
+                    output.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+                }
             }
         }
     }
@@ -1195,6 +1580,171 @@ pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) 
     frame.push_str(&format!("└{}┘", "─".repeat(width + 2)));
 
     draw_frame(stdout, &frame)
+}
+
+pub(crate) fn draw_player_panels(
+    stdout: &mut io::Stdout,
+    title: &str,
+    rows: &[String],
+    lyrics: Option<&Lyrics>,
+    elapsed: Duration,
+    lyrics_scroll: usize,
+    show_lyrics: bool,
+    lyrics_editor: Option<&LyricsSettingsEditor>,
+) -> Result<()> {
+    if !show_lyrics && lyrics_editor.is_none() {
+        return draw_panel(stdout, title, rows);
+    }
+
+    let terminal_width = usize::from(terminal::size().map(|size| size.0).unwrap_or(80));
+    let left_content = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .chain([UnicodeWidthStr::width(title)])
+        .max()
+        .unwrap_or(28)
+        .clamp(28, 60);
+    let left_width = left_content.min(terminal_width.saturating_sub(4).max(28));
+    let prefer_side = load_setting_value("lyrics.position").as_deref() != Some("below");
+    let center_lyrics = load_setting_value("lyrics.alignment").as_deref() == Some("center");
+    let minimum_right_width = if lyrics_editor.is_some() { 36 } else { 24 };
+    let side_by_side =
+        prefer_side && terminal_width >= left_width + 4 + 1 + minimum_right_width + 4;
+    let lyrics_width = if side_by_side {
+        terminal_width
+            .saturating_sub(left_width + 9)
+            .clamp(minimum_right_width, 60)
+    } else {
+        left_width
+    };
+    let (right_title, mut right_rows, center_right) = if let Some(editor) = lyrics_editor {
+        (editor.title(), editor.rows(show_lyrics), false)
+    } else {
+        (
+            tr("msg.lyrics"),
+            render_lyrics_panel_rows(
+                lyrics,
+                lyrics_width,
+                rows.len().max(5),
+                elapsed,
+                lyrics_scroll,
+            ),
+            center_lyrics,
+        )
+    };
+    let mut left_rows = rows.to_vec();
+    if side_by_side {
+        let row_count = left_rows.len().max(right_rows.len());
+        left_rows.resize(row_count, String::new());
+        right_rows.resize(row_count, String::new());
+    }
+    let left = panel_lines(title, &left_rows, left_width, false);
+    let right = panel_lines(right_title, &right_rows, lyrics_width, center_right);
+
+    let frame = if side_by_side {
+        (0..left.len())
+            .map(|index| format!("{} {}", left[index], right[index]))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    } else {
+        format!("{}\r\n{}", left.join("\r\n"), right.join("\r\n"))
+    };
+    draw_frame(stdout, &frame)
+}
+
+fn render_lyrics_panel_rows(
+    lyrics: Option<&Lyrics>,
+    width: usize,
+    height: usize,
+    elapsed: Duration,
+    scroll: usize,
+) -> Vec<String> {
+    let mut rows = match lyrics {
+        Some(lyrics) => {
+            let content_height = if lyrics.is_plain() && height > 1 {
+                height - 1
+            } else {
+                height
+            };
+            let timed = !lyrics.is_plain();
+            let active_color = lyric_color_setting(LyricColorTarget::Active);
+            let inactive_color = lyric_color_setting(LyricColorTarget::Inactive);
+            let plain_color = lyric_color_setting(LyricColorTarget::Plain);
+            let text_width = if timed {
+                width.saturating_sub(2)
+            } else {
+                width
+            };
+            let mut rendered = lyrics
+                .render(text_width, content_height, elapsed, scroll)
+                .into_iter()
+                .map(|line| {
+                    let text = if let Some((start, end)) = line.active_word {
+                        format!(
+                            "{}{}{}",
+                            &line.text[..start],
+                            bold_text(&line.text[start..end]),
+                            &line.text[end..]
+                        )
+                    } else if line.bold_line {
+                        bold_text(&line.text)
+                    } else {
+                        line.text
+                    };
+                    if timed {
+                        color_text(
+                            &format!("{} {text}", if line.marker { ">" } else { " " }),
+                            if line.active {
+                                active_color
+                            } else {
+                                inactive_color
+                            },
+                        )
+                    } else {
+                        color_text(&text, plain_color)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if lyrics.is_plain() && height > 1 {
+                rendered.push(tr("msg.page_up_down_scroll").to_string());
+            }
+            rendered
+        }
+        None => vec![tr("msg.no_embedded_lyrics").to_string()],
+    };
+    rows.resize(height, String::new());
+    rows.truncate(height);
+    rows
+}
+
+fn panel_lines(title: &str, rows: &[String], width: usize, center_rows: bool) -> Vec<String> {
+    let mut lines = Vec::with_capacity(rows.len() + 4);
+    lines.push(format!("┌{}┐", "─".repeat(width + 2)));
+    lines.push(format!("│ {} │", bold_text(&fit_text(title, width))));
+    lines.push(format!("├{}┤", "─".repeat(width + 2)));
+    lines.extend(rows.iter().map(|row| {
+        let row = if center_rows {
+            center_text(row, width)
+        } else {
+            fit_text(row, width)
+        };
+        format!("│ {row} │")
+    }));
+    lines.push(format!("└{}┘", "─".repeat(width + 2)));
+    lines
+}
+
+fn center_text(text: &str, width: usize) -> String {
+    let fitted = fit_text(text, width);
+    let content = fitted.trim_end_matches(' ');
+    let content_width = content
+        .chars()
+        .filter(|character| !is_style_marker(*character))
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    let left = width.saturating_sub(content_width) / 2;
+    let right = width.saturating_sub(content_width + left);
+    format!("{}{content}{}", " ".repeat(left), " ".repeat(right))
 }
 
 pub(crate) fn format_elapsed(duration: Duration) -> String {

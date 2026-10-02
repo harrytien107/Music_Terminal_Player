@@ -46,10 +46,15 @@ This removes only the saved shortcut. It does not delete the folder or any music
 | `r` | Toggle shuffle |
 | `l` | Change loop mode |
 | `u` | Open the queue |
+| `b` | Open live Lyrics settings |
+| `y` | Show or hide embedded lyrics |
+| `Page Up` / `Page Down` | Scroll plain lyrics |
 | `Up` / `Down` | Change volume by 10% |
 | `Left` / `Right` | Change volume by 1% |
-| `b` or `Esc` | Return to the previous menu |
+| `Esc` | Return to the previous menu |
 | `q` or `Ctrl+C` | Quit completely |
+
+Timestamped LRC lyrics embedded in the file follow playback automatically, with `>` marking the current row. Enhanced LRC can also follow and bold the current word. Plain embedded lyrics use manual scrolling, and long lines wrap without splitting normal words. Press `b` to change visibility, position, alignment, and synchronized or plain lyric colors without stopping playback. Beside placement falls back below in a narrow window.
 
 ## If no songs appear
 
