@@ -1,8 +1,8 @@
 # Music Terminal Player
 
-Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, display embedded synchronized lyrics, or stream YouTube audio through yt-dlp and FFmpeg.
+Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, display embedded synchronized lyrics, or stream YouTube audio with synchronized transcripts through yt-dlp and FFmpeg.
 
-![Music Terminal Player Telegram playback](docs/media/example1.png)
+![Music Terminal Player playback](docs/media/player.png)
 
 
 ## Why?
@@ -17,6 +17,7 @@ A small terminal player for local libraries and online sources without the overh
 - Combined multi-channel Telegram queues
 - YouTube video and playlist audio streaming without saving complete media files
 - YouTube seeking, 0.5x–2.0x speed control, and persistent per-category SponsorBlock auto-skip settings
+- Synchronized YouTube transcripts from available manual subtitles or automatic captions, with configurable language, position, alignment, and colors
 - Windows media controls with track metadata and Play, Pause, Next, and Previous actions
 - Automatic YouTube recovery when the default audio output changes
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
@@ -30,7 +31,13 @@ A small terminal player for local libraries and online sources without the overh
 
 Local and Telegram tracks can display embedded plain lyrics, synchronized LRC, and word-synchronized Enhanced LRC directly beside or below the player.
 
-![Music Terminal Player synchronized lyrics](docs/media/example2.png)
+![Music Terminal Player synchronized lyrics](docs/media/lyric-local-tele.png)
+
+### YouTube synchronized transcripts
+
+YouTube playback can display available manual subtitles or automatic captions as a synchronized transcript beside or below the player.
+
+![Music Terminal Player YouTube synchronized transcript](docs/media/transcripts-yt.png)
 
 ## Installing
 Windows is supported. macOS and Linux support are planned.
