@@ -125,6 +125,28 @@ enum LyricColorTarget {
     Plain,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptColorTarget {
+    Active,
+    Inactive,
+}
+
+impl TranscriptColorTarget {
+    fn setting_key(self) -> &'static str {
+        match self {
+            Self::Active => "transcript.color.active",
+            Self::Inactive => "transcript.color.inactive",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => tr("msg.active_transcript_color"),
+            Self::Inactive => tr("msg.inactive_transcript_color"),
+        }
+    }
+}
+
 impl LyricColorTarget {
     fn setting_key(self) -> &'static str {
         match self {
@@ -154,6 +176,228 @@ pub(crate) struct LyricsSettingsEditor {
     selected: usize,
     color_target: Option<LyricColorTarget>,
     color_selected: usize,
+}
+
+pub(crate) enum TranscriptEditorResult {
+    Handled,
+    Close,
+    Visibility(bool),
+    LanguageChanged,
+    Pass,
+}
+
+pub(crate) struct TranscriptSettingsEditor {
+    selected: usize,
+    color_target: Option<TranscriptColorTarget>,
+    color_selected: usize,
+}
+
+impl TranscriptSettingsEditor {
+    pub(crate) fn new() -> Self {
+        Self {
+            selected: 0,
+            color_target: None,
+            color_selected: 0,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        self.color_target
+            .map(TranscriptColorTarget::label)
+            .unwrap_or_else(|| tr("msg.transcript_settings"))
+    }
+
+    fn rows(&self, transcript_visible: bool) -> Vec<String> {
+        if self.color_target.is_some() {
+            let mut rows = LyricColor::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, color)| {
+                    let label = color_text(color.label(), color);
+                    format!(
+                        "{} {label}",
+                        if index == self.color_selected {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.push(format!(
+                "{} ← {}",
+                if self.color_selected == LyricColor::ALL.len() {
+                    ">"
+                } else {
+                    " "
+                },
+                tr("msg.back")
+            ));
+            return rows;
+        }
+
+        let position = if load_setting_value("transcript.position").as_deref() == Some("below") {
+            tr("msg.below_player")
+        } else {
+            tr("msg.next_to_player")
+        };
+        let alignment = if load_setting_value("transcript.alignment").as_deref() == Some("center") {
+            tr("msg.center")
+        } else {
+            tr("msg.left")
+        };
+        let language = transcript_language_label(
+            load_setting_value("transcript.language")
+                .as_deref()
+                .unwrap_or("auto"),
+        );
+        let active = transcript_color_setting(TranscriptColorTarget::Active);
+        let inactive = transcript_color_setting(TranscriptColorTarget::Inactive);
+        let items = [
+            format!(
+                "{}: {}  {}",
+                tr("msg.transcript"),
+                if transcript_visible {
+                    tr("msg.shown")
+                } else {
+                    tr("msg.hidden")
+                },
+                tr("msg.y_show_hide_transcript")
+            ),
+            format!("{}: {position}", tr("msg.transcript_position")),
+            format!("{}: {alignment}", tr("msg.transcript_alignment")),
+            format!("{}: {language}", tr("msg.transcript_language")),
+            format!(
+                "{}: {}",
+                tr("msg.active_transcript_color"),
+                color_text(active.label(), active)
+            ),
+            format!(
+                "{}: {}",
+                tr("msg.inactive_transcript_color"),
+                color_text(inactive.label(), inactive)
+            ),
+            format!("← {}", tr("msg.back")),
+        ];
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!("{} {item}", if index == self.selected { ">" } else { " " })
+            })
+            .collect()
+    }
+
+    pub(crate) fn handle_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        transcript_visible: bool,
+    ) -> Result<TranscriptEditorResult> {
+        if code == KeyCode::Char('y') && modifiers.is_empty() {
+            let visible = !transcript_visible;
+            save_setting_bool("playback.transcript", visible)?;
+            return Ok(TranscriptEditorResult::Visibility(visible));
+        }
+
+        if let Some(target) = self.color_target {
+            match code {
+                KeyCode::Up => {
+                    self.color_selected = self
+                        .color_selected
+                        .checked_sub(1)
+                        .unwrap_or(LyricColor::ALL.len());
+                }
+                KeyCode::Down => {
+                    self.color_selected = (self.color_selected + 1) % (LyricColor::ALL.len() + 1);
+                }
+                KeyCode::Enter if self.color_selected < LyricColor::ALL.len() => {
+                    save_setting_value(
+                        target.setting_key(),
+                        LyricColor::ALL[self.color_selected].key(),
+                    )?;
+                    self.color_target = None;
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => {
+                    self.color_target = None;
+                }
+                _ => return Ok(TranscriptEditorResult::Pass),
+            }
+            return Ok(TranscriptEditorResult::Handled);
+        }
+
+        match code {
+            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(6),
+            KeyCode::Down => self.selected = (self.selected + 1) % 7,
+            KeyCode::Enter => match self.selected {
+                0 => {
+                    let visible = !transcript_visible;
+                    save_setting_bool("playback.transcript", visible)?;
+                    return Ok(TranscriptEditorResult::Visibility(visible));
+                }
+                1 => {
+                    let below =
+                        load_setting_value("transcript.position").as_deref() == Some("below");
+                    save_setting_value(
+                        "transcript.position",
+                        if below { "side" } else { "below" },
+                    )?;
+                }
+                2 => {
+                    let centered =
+                        load_setting_value("transcript.alignment").as_deref() == Some("center");
+                    save_setting_value(
+                        "transcript.alignment",
+                        if centered { "left" } else { "center" },
+                    )?;
+                }
+                3 => {
+                    let current = load_setting_value("transcript.language")
+                        .unwrap_or_else(|| "auto".to_string());
+                    save_setting_value("transcript.language", next_transcript_language(&current))?;
+                    return Ok(TranscriptEditorResult::LanguageChanged);
+                }
+                4..=5 => {
+                    let target = if self.selected == 4 {
+                        TranscriptColorTarget::Active
+                    } else {
+                        TranscriptColorTarget::Inactive
+                    };
+                    let current = transcript_color_setting(target);
+                    self.color_selected = LyricColor::ALL
+                        .iter()
+                        .position(|color| *color == current)
+                        .unwrap_or(0);
+                    self.color_target = Some(target);
+                }
+                6 => return Ok(TranscriptEditorResult::Close),
+                _ => unreachable!(),
+            },
+            KeyCode::Esc | KeyCode::Char('b') => return Ok(TranscriptEditorResult::Close),
+            _ => return Ok(TranscriptEditorResult::Pass),
+        }
+        Ok(TranscriptEditorResult::Handled)
+    }
+}
+
+fn transcript_language_label(value: &str) -> &'static str {
+    match value {
+        "original" => tr("msg.original"),
+        "en" => tr("msg.english"),
+        "vi" => tr("msg.vietnamese"),
+        "ja" => tr("msg.japanese"),
+        _ => tr("msg.auto"),
+    }
+}
+
+fn next_transcript_language(value: &str) -> &'static str {
+    match value {
+        "auto" => "original",
+        "original" => "en",
+        "en" => "vi",
+        "vi" => "ja",
+        _ => "auto",
+    }
 }
 
 impl LyricsSettingsEditor {
@@ -603,6 +847,17 @@ fn lyric_color_setting(target: LyricColorTarget) -> LyricColor {
         .unwrap_or(LyricColor::Default)
 }
 
+fn transcript_color_setting(target: TranscriptColorTarget) -> LyricColor {
+    let default = match target {
+        TranscriptColorTarget::Active => LyricColor::Green,
+        TranscriptColorTarget::Inactive => LyricColor::Default,
+    };
+    load_setting_value(target.setting_key())
+        .as_deref()
+        .map(LyricColor::from_key)
+        .unwrap_or(default)
+}
+
 fn color_text(text: &str, color: LyricColor) -> String {
     format!("{}{text}{COLOR_DEFAULT}", color.marker())
 }
@@ -825,6 +1080,41 @@ pub(crate) fn manage_lyrics_settings() -> Result<()> {
                 return Ok(());
             }
             LyricsEditorResult::Handled | LyricsEditorResult::Pass => {}
+        }
+    }
+}
+
+pub(crate) fn manage_transcript_settings() -> Result<()> {
+    let _raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut editor = TranscriptSettingsEditor::new();
+    let mut transcript_visible = load_setting_bool("playback.transcript", true);
+    loop {
+        draw_panel(
+            &mut stdout,
+            editor.title(),
+            &editor.rows(transcript_visible),
+        )?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if menu_quit_key(key.code, key.modifiers) {
+            drop(_raw);
+            clear_screen()?;
+            std::process::exit(0);
+        }
+        match editor.handle_key(key.code, key.modifiers, transcript_visible)? {
+            TranscriptEditorResult::Visibility(visible) => transcript_visible = visible,
+            TranscriptEditorResult::Close => {
+                clear_screen()?;
+                return Ok(());
+            }
+            TranscriptEditorResult::Handled
+            | TranscriptEditorResult::LanguageChanged
+            | TranscriptEditorResult::Pass => {}
         }
     }
 }
@@ -1318,12 +1608,12 @@ where
     }
 }
 
-pub(crate) fn playback_controls() -> Vec<String> {
-    playback_controls_with_middle(tr("msg.b_menu"))
-}
-
 pub(crate) fn playback_controls_with_lyrics() -> Vec<String> {
     playback_controls_with_middle(tr("msg.b_lyrics_settings"))
+}
+
+pub(crate) fn playback_controls_with_transcript() -> Vec<String> {
+    playback_controls_with_middle(tr("msg.b_transcript_settings"))
 }
 
 pub(crate) fn playback_key_bindings_hint() -> String {
@@ -1650,6 +1940,106 @@ pub(crate) fn draw_player_panels(
         format!("{}\r\n{}", left.join("\r\n"), right.join("\r\n"))
     };
     draw_frame(stdout, &frame)
+}
+
+pub(crate) fn draw_transcript_player_panels(
+    stdout: &mut io::Stdout,
+    title: &str,
+    rows: &[String],
+    transcript: Option<&Lyrics>,
+    elapsed: Duration,
+    show_transcript: bool,
+    transcript_editor: Option<&TranscriptSettingsEditor>,
+) -> Result<()> {
+    if !show_transcript && transcript_editor.is_none() {
+        return draw_panel(stdout, title, rows);
+    }
+
+    let terminal_width = usize::from(terminal::size().map(|size| size.0).unwrap_or(80));
+    let left_content = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .chain([UnicodeWidthStr::width(title)])
+        .max()
+        .unwrap_or(28)
+        .clamp(28, 60);
+    let left_width = left_content.min(terminal_width.saturating_sub(4).max(28));
+    let prefer_side = load_setting_value("transcript.position").as_deref() != Some("below");
+    let center_transcript = load_setting_value("transcript.alignment").as_deref() == Some("center");
+    let minimum_right_width = if transcript_editor.is_some() { 38 } else { 24 };
+    let side_by_side =
+        prefer_side && terminal_width >= left_width + 4 + 1 + minimum_right_width + 4;
+    let transcript_width = if side_by_side {
+        terminal_width
+            .saturating_sub(left_width + 9)
+            .clamp(minimum_right_width, 60)
+    } else {
+        left_width
+    };
+    let (right_title, mut right_rows, center_right) = if let Some(editor) = transcript_editor {
+        (editor.title(), editor.rows(show_transcript), false)
+    } else {
+        (
+            tr("msg.transcript"),
+            render_transcript_panel_rows(transcript, transcript_width, rows.len().max(5), elapsed),
+            center_transcript,
+        )
+    };
+    let mut left_rows = rows.to_vec();
+    if side_by_side {
+        let row_count = left_rows.len().max(right_rows.len());
+        left_rows.resize(row_count, String::new());
+        right_rows.resize(row_count, String::new());
+    }
+    let left = panel_lines(title, &left_rows, left_width, false);
+    let right = panel_lines(right_title, &right_rows, transcript_width, center_right);
+
+    let frame = if side_by_side {
+        (0..left.len())
+            .map(|index| format!("{} {}", left[index], right[index]))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    } else {
+        format!("{}\r\n{}", left.join("\r\n"), right.join("\r\n"))
+    };
+    draw_frame(stdout, &frame)
+}
+
+fn render_transcript_panel_rows(
+    transcript: Option<&Lyrics>,
+    width: usize,
+    height: usize,
+    elapsed: Duration,
+) -> Vec<String> {
+    let mut rows = match transcript {
+        Some(transcript) => {
+            let active_color = transcript_color_setting(TranscriptColorTarget::Active);
+            let inactive_color = transcript_color_setting(TranscriptColorTarget::Inactive);
+            let text_width = width.saturating_sub(2);
+            transcript
+                .render(text_width, height, elapsed, 0)
+                .into_iter()
+                .map(|line| {
+                    let text = if line.bold_line {
+                        bold_text(&line.text)
+                    } else {
+                        line.text
+                    };
+                    color_text(
+                        &format!("{} {text}", if line.marker { ">" } else { " " }),
+                        if line.active {
+                            active_color
+                        } else {
+                            inactive_color
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        None => vec![tr("msg.no_transcript_available").to_string()],
+    };
+    rows.resize(height, String::new());
+    rows
 }
 
 fn render_lyrics_panel_rows(

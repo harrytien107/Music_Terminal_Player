@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::ops::Deref;
@@ -17,13 +18,17 @@ use serde_json::Value;
 
 use crate::audio_output::AudioOutput;
 use crate::i18n::tr;
+use crate::lyrics::{Lyrics, TimedLyricLine};
 use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
-    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, bold_text, clear_screen, draw_panel,
-    format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_volume,
-    manage_queue_with_adder, playback_controls, playback_key_bindings_hint, player_title_row,
-    previous_track_index, progress_bar, prompt, prompt_or_escape, restart_pass_order, save_volume,
-    select_menu, select_menu_from, set_shuffle_order, toggle_playback_key_bindings,
+    DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, TranscriptEditorResult,
+    TranscriptSettingsEditor, bold_text, clear_screen, draw_panel, draw_transcript_player_panels,
+    format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_setting_value,
+    load_volume, manage_queue_with_adder, manage_transcript_settings,
+    playback_controls_with_transcript, playback_key_bindings_hint, player_title_row,
+    previous_track_index, progress_bar, prompt, prompt_or_escape, restart_pass_order,
+    save_setting_bool, save_volume, select_menu, select_menu_from, set_shuffle_order,
+    toggle_playback_key_bindings,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -103,6 +108,12 @@ struct YouTubeTrack {
     webpage_url: String,
     duration: Option<Duration>,
     sponsor_segments: Option<Vec<SponsorSegment>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptChoice {
+    language: String,
+    automatic: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,6 +287,7 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
         let items = vec![
             format!("▶  {}", tr("msg.play_youtube_url_or_playlist")),
             format!("✓  {}", tr("msg.sponsorblock_categories")),
+            format!("≣  {}", tr("msg.transcript_settings")),
             format!("◇  {}", tr("msg.youtube_tools_and_updater")),
             format!("←  {}", tr("msg.back")),
         ];
@@ -286,8 +298,9 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
                 }
             }
             Some(1) => manage_sponsorblock_categories()?,
-            Some(2) => manage_youtube_tools()?,
-            Some(3) | None => return Ok(PlayerExit::Back),
+            Some(2) => manage_transcript_settings()?,
+            Some(3) => manage_youtube_tools()?,
+            Some(4) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
         }
     }
@@ -1125,6 +1138,297 @@ fn parse_youtube_track_line(line: &str) -> Option<YouTubeTrack> {
     })
 }
 
+fn transcript_preference() -> String {
+    load_setting_value("transcript.language").unwrap_or_else(|| "auto".to_string())
+}
+
+fn transcript_memory_key(track: &YouTubeTrack) -> String {
+    format!("{}|{}", track.video_id, transcript_preference())
+}
+
+fn transcript_cache_path(track: &YouTubeTrack) -> PathBuf {
+    let preference = transcript_preference();
+    Path::new(DATA_DIR)
+        .join("youtube-transcripts")
+        .join(format!("{}-{preference}.vtt", track.video_id))
+}
+
+fn available_caption_languages(metadata: &Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|captions| {
+            captions
+                .keys()
+                .filter(|language| language.as_str() != "live_chat")
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn matching_caption_language(languages: &[String], wanted: &str) -> Option<String> {
+    if wanted.is_empty() {
+        return None;
+    }
+    languages
+        .iter()
+        .find(|language| language.eq_ignore_ascii_case(wanted))
+        .or_else(|| {
+            languages.iter().find(|language| {
+                language
+                    .strip_prefix(wanted)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+        })
+        .cloned()
+}
+
+fn original_auto_caption_language(languages: &[String]) -> Option<String> {
+    languages
+        .iter()
+        .find(|language| language.ends_with("-orig"))
+        .cloned()
+}
+
+fn choose_transcript(metadata: &Value, preference: &str) -> Option<TranscriptChoice> {
+    let manual = available_caption_languages(metadata, "subtitles");
+    let automatic = available_caption_languages(metadata, "automatic_captions");
+    let video_language = metadata
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let manual_choice = |language: String| TranscriptChoice {
+        language,
+        automatic: false,
+    };
+    let automatic_choice = |language: String| TranscriptChoice {
+        language,
+        automatic: true,
+    };
+
+    if matches!(preference, "en" | "vi" | "ja") {
+        return matching_caption_language(&manual, preference)
+            .map(manual_choice)
+            .or_else(|| matching_caption_language(&automatic, preference).map(automatic_choice))
+            .or_else(|| original_auto_caption_language(&automatic).map(automatic_choice))
+            .or_else(|| manual.first().cloned().map(manual_choice))
+            .or_else(|| automatic.first().cloned().map(automatic_choice));
+    }
+
+    if preference == "original" {
+        return matching_caption_language(&manual, video_language)
+            .map(manual_choice)
+            .or_else(|| original_auto_caption_language(&automatic).map(automatic_choice))
+            .or_else(|| matching_caption_language(&automatic, video_language).map(automatic_choice))
+            .or_else(|| manual.first().cloned().map(manual_choice))
+            .or_else(|| automatic.first().cloned().map(automatic_choice));
+    }
+
+    matching_caption_language(&manual, video_language)
+        .map(manual_choice)
+        .or_else(|| manual.first().cloned().map(manual_choice))
+        .or_else(|| original_auto_caption_language(&automatic).map(automatic_choice))
+        .or_else(|| matching_caption_language(&automatic, video_language).map(automatic_choice))
+        .or_else(|| matching_caption_language(&automatic, "en").map(automatic_choice))
+        .or_else(|| automatic.first().cloned().map(automatic_choice))
+}
+
+fn resolve_transcript(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Option<Lyrics>> {
+    let cache_path = transcript_cache_path(track);
+    if let Ok(text) = fs::read_to_string(&cache_path)
+        && let Some(transcript) = parse_webvtt_transcript(&text)
+    {
+        return Ok(Some(transcript));
+    }
+
+    let metadata_output = Command::new(&tools.yt_dlp)
+        .args([
+            "--no-warnings",
+            "--no-playlist",
+            "--skip-download",
+            "--extractor-args",
+            youtube_extractor_args(),
+            "--dump-single-json",
+        ])
+        .arg(&track.webpage_url)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to inspect captions for {}", track.title))?;
+    if !metadata_output.status.success() {
+        return Ok(None);
+    }
+    let metadata: Value = serde_json::from_slice(&metadata_output.stdout)
+        .context("yt-dlp returned invalid YouTube metadata JSON")?;
+    let preference = transcript_preference();
+    let Some(choice) = choose_transcript(&metadata, &preference) else {
+        return Ok(None);
+    };
+
+    let cache_dir = cache_path
+        .parent()
+        .context("transcript cache path has no parent")?;
+    fs::create_dir_all(cache_dir)?;
+    let temp_stem = format!(".{}-caption-{}", track.video_id, std::process::id());
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&temp_stem) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let output_template = cache_dir.join(&temp_stem);
+    let mut command = Command::new(&tools.yt_dlp);
+    command.args([
+        "--no-warnings",
+        "--no-playlist",
+        "--skip-download",
+        "--extractor-args",
+        youtube_extractor_args(),
+        "--sub-format",
+        "vtt",
+        "--sub-langs",
+    ]);
+    command.arg(&choice.language);
+    if choice.automatic {
+        command.arg("--write-auto-subs");
+    } else {
+        command.arg("--write-subs");
+    }
+    let output = command
+        .arg("-o")
+        .arg(&output_template)
+        .arg(&track.webpage_url)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to download transcript for {}", track.title))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let mut downloaded = None;
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&temp_stem)
+            && entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("vtt"))
+        {
+            downloaded = Some(entry.path());
+            break;
+        }
+    }
+    let Some(downloaded) = downloaded else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(&downloaded)?;
+    fs::write(&cache_path, &text)?;
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&temp_stem) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(parse_webvtt_transcript(&text))
+}
+
+fn ensure_transcript(
+    cache: &mut HashMap<String, Option<Lyrics>>,
+    tools: &YouTubeTools,
+    track: &YouTubeTrack,
+) {
+    let key = transcript_memory_key(track);
+    if cache.contains_key(&key) {
+        return;
+    }
+    let transcript = resolve_transcript(tools, track).ok().flatten();
+    cache.insert(key, transcript);
+}
+
+fn cached_transcript<'a>(
+    cache: &'a HashMap<String, Option<Lyrics>>,
+    track: &YouTubeTrack,
+) -> Option<&'a Lyrics> {
+    cache
+        .get(&transcript_memory_key(track))
+        .and_then(Option::as_ref)
+}
+
+fn parse_webvtt_timestamp(value: &str) -> Option<Duration> {
+    let parts = value.trim().split(':').collect::<Vec<_>>();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (
+            0u64,
+            minutes.parse::<u64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        [hours, minutes, seconds] => (
+            hours.parse::<u64>().ok()?,
+            minutes.parse::<u64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        _ => return None,
+    };
+    let total = hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds;
+    (total.is_finite() && total >= 0.0).then(|| Duration::from_secs_f64(total))
+}
+
+fn clean_webvtt_text(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for character in text.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => plain.push(character),
+            _ => {}
+        }
+    }
+    let plain = plain
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_webvtt_transcript(text: &str) -> Option<Lyrics> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized.lines().peekable();
+    let mut transcript = Vec::new();
+    while let Some(line) = lines.next() {
+        let Some((start, _)) = line.split_once("-->") else {
+            continue;
+        };
+        let Some(at) = parse_webvtt_timestamp(start) else {
+            continue;
+        };
+        let mut cue_lines = Vec::new();
+        while let Some(next) = lines.peek() {
+            if next.trim().is_empty() {
+                lines.next();
+                break;
+            }
+            cue_lines.push(lines.next().unwrap_or_default().trim());
+        }
+        let cue = clean_webvtt_text(&cue_lines.join(" "));
+        if cue.is_empty()
+            || transcript
+                .last()
+                .is_some_and(|previous: &TimedLyricLine| previous.text == cue)
+        {
+            continue;
+        }
+        transcript.push(TimedLyricLine { at, text: cue });
+    }
+    (!transcript.is_empty()).then_some(Lyrics::Timed(transcript))
+}
+
 fn youtube_stream_format() -> &'static str {
     // Prefer audio-only Opus/AAC for quality, then fall back to progressive MP4 for compatibility.
     // Keep itag 18 available because its front-loaded index has historically made seeking reliable.
@@ -1433,6 +1737,9 @@ fn play_youtube_tracks(
     let mut sponsor_enabled = categories_json != "[]";
     let mut last_skipped = None;
     let mut stream_failures = 0usize;
+    let mut transcript_cache = HashMap::<String, Option<Lyrics>>::new();
+    let mut transcript_visible = load_setting_bool("playback.transcript", true);
+    let mut transcript_settings = None;
     cache_sponsor_segments(&mut tracks[index], &categories_json);
     let mut playback = start_track(output.stream(), tools, &tracks[index], volume, rate)?;
     let mut resumed_from_suspend = false;
@@ -1440,6 +1747,9 @@ fn play_youtube_tracks(
     media_controls.set_playing(true);
 
     loop {
+        if transcript_visible {
+            ensure_transcript(&mut transcript_cache, tools, &tracks[index]);
+        }
         let elapsed = playback.elapsed(tracks[index].duration);
         let stream_ended_early =
             playback.empty() && playback_ended_early(elapsed, tracks[index].duration);
@@ -1711,6 +2021,9 @@ fn play_youtube_tracks(
             shuffle,
             loop_mode,
             sponsor_enabled,
+            cached_transcript(&transcript_cache, &tracks[index]),
+            transcript_visible,
+            transcript_settings.as_ref(),
         )?;
 
         if playback.empty() {
@@ -1764,9 +2077,32 @@ fn play_youtube_tracks(
             return Ok(PlayerExit::Quit);
         }
 
+        if let Some(editor) = transcript_settings.as_mut() {
+            match editor.handle_key(key.code, key.modifiers, transcript_visible)? {
+                TranscriptEditorResult::Visibility(visible) => {
+                    transcript_visible = visible;
+                    continue;
+                }
+                TranscriptEditorResult::LanguageChanged => continue,
+                TranscriptEditorResult::Close => {
+                    transcript_settings = None;
+                    continue;
+                }
+                TranscriptEditorResult::Handled => continue,
+                TranscriptEditorResult::Pass => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => return Ok(PlayerExit::Quit),
-            KeyCode::Char('b') | KeyCode::Esc => return Ok(PlayerExit::Back),
+            KeyCode::Char('b') => {
+                transcript_settings = Some(TranscriptSettingsEditor::new());
+            }
+            KeyCode::Esc => return Ok(PlayerExit::Back),
+            KeyCode::Char('y') if key.modifiers.is_empty() => {
+                transcript_visible = !transcript_visible;
+                save_setting_bool("playback.transcript", transcript_visible)?;
+            }
             KeyCode::Char('/') => toggle_playback_key_bindings()?,
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if playback.is_paused() {
@@ -1947,6 +2283,9 @@ fn draw_youtube_player(
     shuffle: bool,
     loop_mode: LoopMode,
     sponsor_enabled: bool,
+    transcript: Option<&Lyrics>,
+    transcript_visible: bool,
+    transcript_settings: Option<&TranscriptSettingsEditor>,
 ) -> Result<()> {
     let state = if playback.is_paused() {
         tr("msg.paused")
@@ -1995,11 +2334,19 @@ fn draw_youtube_player(
         rows.push(playback_key_bindings_hint());
         rows.extend(youtube_playback_controls());
     }
-    draw_panel(stdout, "Music Terminal Player · YouTube", &rows)
+    draw_transcript_player_panels(
+        stdout,
+        "Music Terminal Player · YouTube",
+        &rows,
+        transcript,
+        elapsed,
+        transcript_visible,
+        transcript_settings,
+    )
 }
 
 fn youtube_playback_controls() -> Vec<String> {
-    let mut rows = playback_controls();
+    let mut rows = playback_controls_with_transcript();
     rows.pop();
     rows.extend([
         "├────────────────┼────────────────┼────────────────┤".to_string(),
@@ -2015,11 +2362,14 @@ mod youtube_tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use crate::lyrics::Lyrics;
+
     use super::{
         PlaybackInterruption, SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment,
-        YouTubeTools, compare_versions, install_staged_tool, installed_version, is_portable_ffmpeg,
-        is_portable_yt_dlp, logical_elapsed, parse_resolved_audio_stream, parse_sponsor_segments,
-        parse_sponsorblock_settings, parse_youtube_track_line, parse_yt_dlp_release,
+        TranscriptChoice, YouTubeTools, choose_transcript, compare_versions, install_staged_tool,
+        installed_version, is_portable_ffmpeg, is_portable_yt_dlp, logical_elapsed,
+        parse_resolved_audio_stream, parse_sponsor_segments, parse_sponsorblock_settings,
+        parse_webvtt_transcript, parse_youtube_track_line, parse_yt_dlp_release,
         playback_ended_early, playback_interruption, portable_ffmpeg_update_paths,
         portable_tool_pair, portable_yt_dlp_update_paths, recovery_message,
         relocated_portable_tools, resume_gap_detected, seek_target,
@@ -2329,9 +2679,59 @@ mod youtube_tests {
         assert!(controls.iter().any(|row| row.contains("[←/→] seek 10s")));
         assert!(controls.iter().any(|row| row.contains("[,/.] ±0.25x")));
         assert!(controls.iter().any(|row| row.contains("[s] sponsors")));
+        assert!(controls.iter().any(|row| row.contains("[b] transcript")));
         assert_eq!(
             controls.last().unwrap(),
             "└────────────────┴────────────────┴────────────────┘"
+        );
+    }
+
+    #[test]
+    fn webvtt_transcript_parses_timestamps_markup_and_entities() {
+        let source = "WEBVTT\n\n00:00:01.250 --> 00:00:03.000\n<c>Hello &amp; welcome</c>\n\n00:03.500 --> 00:05.000\n<00:00:03.500><c>Next line</c>\n";
+        let Lyrics::Timed(lines) = parse_webvtt_transcript(source).unwrap() else {
+            panic!("expected timed transcript");
+        };
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].at, Duration::from_millis(1250));
+        assert_eq!(lines[0].text, "Hello & welcome");
+        assert_eq!(lines[1].at, Duration::from_millis(3500));
+        assert_eq!(lines[1].text, "Next line");
+    }
+
+    #[test]
+    fn transcript_selection_prefers_manual_then_original_auto() {
+        let metadata = serde_json::json!({
+            "language": "ja",
+            "subtitles": {"en": [{}], "ja": [{}]},
+            "automatic_captions": {"en": [{}], "ja-orig": [{}], "vi": [{}]}
+        });
+        assert_eq!(
+            choose_transcript(&metadata, "auto"),
+            Some(TranscriptChoice {
+                language: "ja".to_string(),
+                automatic: false,
+            })
+        );
+        assert_eq!(
+            choose_transcript(&metadata, "vi"),
+            Some(TranscriptChoice {
+                language: "vi".to_string(),
+                automatic: true,
+            })
+        );
+
+        let automatic_only = serde_json::json!({
+            "language": "ja",
+            "subtitles": {},
+            "automatic_captions": {"en": [{}], "ja-orig": [{}]}
+        });
+        assert_eq!(
+            choose_transcript(&automatic_only, "original"),
+            Some(TranscriptChoice {
+                language: "ja-orig".to_string(),
+                automatic: true,
+            })
         );
     }
 
