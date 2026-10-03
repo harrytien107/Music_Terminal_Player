@@ -1900,7 +1900,7 @@ pub(crate) fn draw_player_panels(
     let minimum_right_width = if lyrics_editor.is_some() { 36 } else { 24 };
     let side_by_side =
         prefer_side && terminal_width >= left_width + 4 + 1 + minimum_right_width + 4;
-    let lyrics_width = if side_by_side {
+    let maximum_lyrics_width = if side_by_side {
         terminal_width
             .saturating_sub(left_width + 9)
             .clamp(minimum_right_width, 60)
@@ -1914,13 +1914,31 @@ pub(crate) fn draw_player_panels(
             tr("msg.lyrics"),
             render_lyrics_panel_rows(
                 lyrics,
-                lyrics_width,
+                maximum_lyrics_width,
                 rows.len().max(5),
                 elapsed,
                 lyrics_scroll,
             ),
             center_lyrics,
         )
+    };
+    let lyrics_width = if lyrics_editor.is_some() {
+        maximum_lyrics_width
+    } else {
+        let whole_lyrics_width = lyrics
+            .map(|lyrics| {
+                let timed_prefix = if lyrics.is_plain() { 0 } else { 2 };
+                lyrics.max_line_width().saturating_add(timed_prefix)
+            })
+            .unwrap_or_else(|| visible_text_width(tr("msg.no_embedded_lyrics")));
+        let plain_scroll_hint = lyrics
+            .is_some_and(Lyrics::is_plain)
+            .then(|| visible_text_width(tr("msg.page_up_down_scroll")))
+            .unwrap_or(0);
+        whole_lyrics_width
+            .max(plain_scroll_hint)
+            .max(visible_text_width(right_title))
+            .clamp(1, maximum_lyrics_width.max(1))
     };
     let mut left_rows = rows.to_vec();
     if side_by_side {
@@ -2124,14 +2142,17 @@ fn panel_lines(title: &str, rows: &[String], width: usize, center_rows: bool) ->
     lines
 }
 
+fn visible_text_width(text: &str) -> usize {
+    text.chars()
+        .filter(|character| !is_style_marker(*character))
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
 fn center_text(text: &str, width: usize) -> String {
     let fitted = fit_text(text, width);
     let content = fitted.trim_end_matches(' ');
-    let content_width = content
-        .chars()
-        .filter(|character| !is_style_marker(*character))
-        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
-        .sum::<usize>();
+    let content_width = visible_text_width(content);
     let left = width.saturating_sub(content_width) / 2;
     let right = width.saturating_sub(content_width + left);
     format!("{}{content}{}", " ".repeat(left), " ".repeat(right))

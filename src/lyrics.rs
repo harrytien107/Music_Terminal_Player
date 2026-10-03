@@ -59,6 +59,32 @@ impl Lyrics {
         matches!(self, Self::Plain(_))
     }
 
+    pub(crate) fn max_line_width(&self) -> usize {
+        match self {
+            Self::Plain(lines) => lines.iter().map(|line| text_width(line)).max().unwrap_or(0),
+            Self::Timed(lines) => lines
+                .iter()
+                .map(|line| text_width(&line.text))
+                .max()
+                .unwrap_or(0),
+            Self::Enhanced(tokens) => {
+                let mut widest = 0usize;
+                let mut current = 0usize;
+                for token in tokens {
+                    for character in token.text.chars() {
+                        if character == '\n' {
+                            widest = widest.max(current);
+                            current = 0;
+                        } else {
+                            current += UnicodeWidthChar::width(character).unwrap_or(0);
+                        }
+                    }
+                }
+                widest.max(current)
+            }
+        }
+    }
+
     pub(crate) fn render(
         &self,
         width: usize,
@@ -123,6 +149,12 @@ impl Lyrics {
             Self::Enhanced(tokens) => render_enhanced(tokens, width, height, elapsed),
         }
     }
+}
+
+fn text_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
 }
 
 fn centered_window_start(center: usize, total: usize, height: usize) -> usize {
@@ -620,5 +652,17 @@ mod tests {
         let rows = lyrics.render(16, 4, Duration::ZERO, 0);
         assert_eq!(rows[0].text, "This lyric has a");
         assert_eq!(rows[1].text, "beautiful ending");
+    }
+
+    #[test]
+    fn whole_lyrics_width_uses_the_longest_logical_line() {
+        let plain = Lyrics::from_text("short\nthis is the longest line\nmid").unwrap();
+        assert_eq!(plain.max_line_width(), 24);
+
+        let timed = Lyrics::from_text("[00:01]tiny\n[00:02]longer timed lyric").unwrap();
+        assert_eq!(timed.max_line_width(), 18);
+
+        let enhanced = Lyrics::from_text("<00:01>Hello <00:02>wide world\n<00:03>tiny").unwrap();
+        assert_eq!(enhanced.max_line_width(), 16);
     }
 }
