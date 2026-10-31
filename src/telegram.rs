@@ -3,8 +3,9 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use anyhow::{Context, Result, bail};
@@ -23,7 +24,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CodecRegistry, Decoder as SymphoniaDecoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -31,7 +32,7 @@ use symphonia::core::units;
 use symphonia_adapter_libopus::OpusDecoder;
 use tokio::task::JoinHandle;
 
-use crate::audio_output::{AudioOutput, device_unavailable_error};
+use crate::audio_output::AudioOutput;
 use crate::i18n::tr;
 use crate::lyrics::{Lyrics, read_embedded_lyrics};
 use crate::media_controls::{MediaCommand, MediaControls};
@@ -54,6 +55,7 @@ const DOWNLOAD_CHUNK_BYTES: u64 = 512 * 1024;
 const FILE_MIGRATE_ERROR: i32 = 303;
 const CDN_RECOVERY_RETRIES: u8 = 5;
 const INITIAL_BUFFER_BYTES: u64 = 1024 * 1024;
+const AUDIO_RECOVERY_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TRACK_LIST_PAGE_SIZE: usize = 25;
 const PRIVATE_CHANNEL_PAGE_SIZE: usize = 20;
 const PRIVATE_CHANNEL_PREFIX: &str = "private:";
@@ -90,6 +92,7 @@ struct DownloadState {
 struct SharedDownload {
     state: Mutex<DownloadState>,
     changed: Condvar,
+    reader_epoch: AtomicU64,
 }
 
 impl SharedDownload {
@@ -101,7 +104,19 @@ impl SharedDownload {
                 ..DownloadState::default()
             }),
             changed: Condvar::new(),
+            reader_epoch: AtomicU64::new(0),
         }
+    }
+
+    fn interrupt_playback_readers(&self) {
+        // Hold the same lock as the waiting readers so the notification cannot
+        // arrive between a reader's epoch check and its condvar wait.
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.reader_epoch.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
     }
 
     fn cancel(&self) {
@@ -116,11 +131,19 @@ struct ProgressiveReader {
     file: File,
     position: u64,
     shared: Arc<SharedDownload>,
+    reader_epoch: u64,
+    // Bound reads while constructing the replacement sink. After construction,
+    // let playback wait normally for additional Telegram download chunks.
+    recovery_limit: Option<(Arc<AtomicBool>, Instant)>,
 }
 
 impl Read for ProgressiveReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        if self.reader_epoch != self.shared.reader_epoch.load(Ordering::Acquire) {
             return Ok(0);
         }
 
@@ -130,11 +153,34 @@ impl Read for ProgressiveReader {
                 && !state.complete
                 && !state.cancelled
                 && state.error.is_none()
+                && self.reader_epoch == self.shared.reader_epoch.load(Ordering::Acquire)
             {
                 state.buffering = true;
-                state = self.shared.changed.wait(state).map_err(lock_error)?;
+                if let Some((preparing, deadline)) = &self.recovery_limit
+                    && preparing.load(Ordering::Acquire)
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "waiting for Telegram cache during audio output recovery",
+                        ));
+                    }
+                    state = self
+                        .shared
+                        .changed
+                        .wait_timeout(state, remaining)
+                        .map_err(lock_error)?
+                        .0;
+                } else {
+                    state = self.shared.changed.wait(state).map_err(lock_error)?;
+                }
             }
             state.buffering = false;
+
+            if self.reader_epoch != self.shared.reader_epoch.load(Ordering::Acquire) {
+                return Ok(0);
+            }
 
             if let Some(error) = &state.error {
                 return Err(io::Error::other(error.clone()));
@@ -279,7 +325,9 @@ impl Iterator for OpusSource {
 
 impl Source for OpusSource {
     fn current_span_len(&self) -> Option<usize> {
-        Some(self.buffer.len().saturating_sub(self.offset))
+        // A zero-length span between Opus packets would make Rodio's
+        // skip_duration() stop before reaching a recovered position.
+        None
     }
 
     fn channels(&self) -> u16 {
@@ -292,6 +340,55 @@ impl Source for OpusSource {
 
     fn total_duration(&self) -> Option<Duration> {
         self.duration
+    }
+
+    fn try_seek(&mut self, position: Duration) -> Result<(), rodio::source::SeekError> {
+        let time_base = self
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.id == self.track_id)
+            .and_then(|track| track.codec_params.time_base)
+            .ok_or_else(|| {
+                rodio::source::SeekError::Other(Box::new(io::Error::other(
+                    "Opus time base unavailable",
+                )))
+            })?;
+        let seeked = self
+            .format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: units::Time::from(position),
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(|error| {
+                rodio::source::SeekError::Other(Box::new(io::Error::other(error.to_string())))
+            })?;
+        self.decoder.reset();
+        let (buffer, spec) =
+            next_decoded_packet(&mut *self.format, &mut *self.decoder, self.track_id).ok_or_else(
+                || {
+                    rodio::source::SeekError::Other(Box::new(io::Error::other(
+                        "Cannot decode Opus after seek",
+                    )))
+                },
+            )?;
+        self.buffer = buffer;
+        self.spec = spec;
+        self.offset = 0;
+        let offset = Duration::from(
+            time_base.calc_time(seeked.required_ts.saturating_sub(seeked.actual_ts)),
+        );
+        let skip =
+            (offset.as_secs_f64() * f64::from(spec.rate) * spec.channels.count() as f64) as usize;
+        for _ in 0..skip {
+            if self.next().is_none() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -942,6 +1039,7 @@ const DECODE_WARNING: &str = "Cannot decode this track. Press p, Space, or n for
 
 struct ActiveTelegramTrack {
     sink: Sink,
+    position_offset: Duration,
     duration: Option<Duration>,
     lyrics: Option<Lyrics>,
     lyrics_checked_complete: bool,
@@ -952,6 +1050,16 @@ struct ActiveTelegramTrack {
 }
 
 impl ActiveTelegramTrack {
+    fn position(&self) -> Duration {
+        self.position_offset.saturating_add(self.sink.get_pos())
+    }
+
+    fn replace_sink(&mut self, sink: Sink, position: Duration) {
+        self.sink.stop();
+        self.sink = sink;
+        self.position_offset = position;
+    }
+
     async fn stop(mut self) {
         self.shared.cancel();
         self.sink.stop();
@@ -959,6 +1067,494 @@ impl ActiveTelegramTrack {
         if let Some(task) = self.download_task.take() {
             task.abort();
             let _ = task.await;
+        }
+    }
+}
+
+struct PreparedTelegramOutput {
+    output: AudioOutput,
+    sink: Sink,
+}
+
+fn prepare_telegram_output(
+    cache_path: PathBuf,
+    shared: Arc<SharedDownload>,
+    position: Duration,
+    volume: f32,
+    stage: &AtomicU8,
+) -> Result<PreparedTelegramOutput> {
+    stage.store(RECOVERY_OPENING_OUTPUT, Ordering::Release);
+    append_recovery_diagnostic("worker: opening new default audio stream");
+    let output = AudioOutput::open()?;
+    append_recovery_diagnostic("worker: new audio stream opened");
+    if output.is_lost() || output.default_changed() {
+        bail!("Audio output changed during reconnection");
+    }
+    let sink = Sink::connect_new(output.stream().mixer());
+    sink.pause();
+    sink.set_volume(volume);
+    stage.store(RECOVERY_RESTORING_AUDIO, Ordering::Release);
+    append_recovery_diagnostic("worker: restoring decoder and playback position");
+    let preparing = Arc::new(AtomicBool::new(true));
+    let deadline = Instant::now() + AUDIO_RECOVERY_READ_TIMEOUT;
+    let reader = || -> io::Result<ProgressiveReader> {
+        Ok(ProgressiveReader {
+            file: open_cache_for_read(&cache_path)?,
+            position: 0,
+            shared: Arc::clone(&shared),
+            reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+            recovery_limit: Some((Arc::clone(&preparing), deadline)),
+        })
+    };
+    let complete = shared.state.lock().map_err(lock_error)?.complete;
+    if is_opus_path(&cache_path) {
+        let source = OpusSource::new(reader()?)?;
+        append_recovery_diagnostic("worker: Opus decoder ready; seeking to playback position");
+        sink.append(restored_source(source, position, complete, || {
+            OpusSource::new(reader()?)
+        })?);
+    } else {
+        let hint = telegram_format_hint(&cache_path);
+        let decode =
+            || -> Result<_> { telegram_recovery_decoder(reader()?, &shared, hint.as_deref()) };
+        let source = decode()?;
+        append_recovery_diagnostic("worker: decoder ready; seeking to playback position");
+        sink.append(restored_source(source, position, complete, decode)?);
+    }
+    append_recovery_diagnostic("worker: playback position restored");
+    if output.is_lost() || output.default_changed() {
+        bail!("Audio output changed during reconnection");
+    }
+    preparing.store(false, Ordering::Release);
+    stage.store(RECOVERY_READY, Ordering::Release);
+    append_recovery_diagnostic("worker: decoder and sink ready");
+    Ok(PreparedTelegramOutput { output, sink })
+}
+
+fn telegram_recovery_decoder(
+    reader: ProgressiveReader,
+    shared: &SharedDownload,
+    hint: Option<&str>,
+) -> Result<Decoder<BufReader<ProgressiveReader>>> {
+    // Decoder initialization reads from ProgressiveReader, which needs this
+    // same mutex. Release the guard before starting the decoder probe.
+    let total = shared.state.lock().map_err(lock_error)?.total;
+    Ok(telegram_decoder(reader, total, hint)?)
+}
+
+// A progressive decoder must really reach the saved position before a new sink
+// is accepted. Rodio's skip_duration reads samples synchronously and may wait
+// indefinitely for bytes which Telegram has not downloaded yet.
+fn restored_source<S: Source + Send + 'static>(
+    mut source: S,
+    position: Duration,
+    complete: bool,
+    fresh: impl FnOnce() -> Result<S>,
+) -> Result<Box<dyn Source + Send>> {
+    if position.is_zero() {
+        return Ok(Box::new(source));
+    }
+    if complete && source.try_seek(position).is_ok() {
+        return Ok(Box::new(source));
+    }
+    let mut source = if complete { fresh()? } else { source };
+    let sample_count = position
+        .as_nanos()
+        .saturating_mul(u128::from(source.sample_rate()))
+        / 1_000_000_000
+        * u128::from(source.channels());
+    let count = usize::try_from(sample_count).context("audio recovery position is too large")?;
+    for _ in 0..count {
+        if source.next().is_none() {
+            if !complete {
+                bail!("Telegram cache has not reached the saved playback position yet");
+            }
+            break;
+        }
+    }
+    Ok(Box::new(source))
+}
+
+#[cfg(test)]
+mod audio_output_recovery_tests {
+    use super::*;
+    use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn output_change_unblocks_old_cache_reader_without_stopping_download() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-output-restart-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&path, []).unwrap();
+        let shared = Arc::new(SharedDownload::new(Some(128)));
+        let mut reader = ProgressiveReader {
+            file: open_cache_for_read(&path).unwrap(),
+            position: 0,
+            shared: Arc::clone(&shared),
+            reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+            recovery_limit: None,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(reader.read(&mut [0_u8; 1])).unwrap();
+        });
+        let start = Instant::now();
+        while !shared.state.lock().unwrap().buffering && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shared.interrupt_playback_readers();
+        let result = receiver.recv_timeout(Duration::from_millis(500));
+        worker.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 0);
+        assert!(!shared.state.lock().unwrap().cancelled);
+        fs::write(&path, [42_u8]).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.downloaded = 1;
+            state.complete = true;
+        }
+        shared.changed.notify_all();
+        let mut resumed = ProgressiveReader {
+            file: open_cache_for_read(&path).unwrap(),
+            position: 0,
+            shared: Arc::clone(&shared),
+            reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+            recovery_limit: None,
+        };
+        let mut byte = [0_u8];
+        resumed.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [42]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn progressive_cache_recovery_skips_to_previous_playback_position() {
+        let samples = || SamplesBuffer::new(1, 10, (0..30).map(|i| i as f32).collect::<Vec<_>>());
+        let source = restored_source(samples(), Duration::from_secs(1), false, || {
+            panic!("incomplete cache must reuse the same source")
+        })
+        .unwrap();
+        assert_eq!(source.take(3).collect::<Vec<_>>(), vec![10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn recovery_must_not_accept_a_position_beyond_incomplete_audio() {
+        let samples = SamplesBuffer::new(1, 10, vec![0.0_f32; 10]);
+        assert!(
+            restored_source(samples, Duration::from_secs(2), false, || {
+                panic!("incomplete recovery must not reopen the decoder")
+            })
+            .is_err(),
+            "recovery must retry when the downloaded audio cannot reach the saved position"
+        );
+    }
+
+    #[test]
+    fn recovery_reader_times_out_without_blocking_on_unavailable_cache_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-output-read-timeout-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&path, []).unwrap();
+        let shared = Arc::new(SharedDownload::new(Some(128)));
+        let preparing = Arc::new(AtomicBool::new(true));
+        let mut reader = ProgressiveReader {
+            file: open_cache_for_read(&path).unwrap(),
+            position: 0,
+            shared: Arc::clone(&shared),
+            reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+            recovery_limit: Some((
+                Arc::clone(&preparing),
+                Instant::now() + Duration::from_millis(80),
+            )),
+        };
+        let start = Instant::now();
+        let error = reader.read(&mut [0_u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        preparing.store(false, Ordering::Release);
+        fs::write(&path, [42_u8]).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.downloaded = 1;
+        }
+        shared.changed.notify_all();
+        let mut sample = [0_u8; 1];
+        reader.read_exact(&mut sample).unwrap();
+        assert_eq!(sample, [42]);
+        drop(reader);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_decoder_can_read_the_download_state_during_initialization() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-recovery-decoder-{}-{:?}.wav",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&44_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&8_u32.to_le_bytes());
+        wav.extend_from_slice(&[0_u8; 8]);
+        fs::write(&path, &wav).unwrap();
+
+        let shared = Arc::new(SharedDownload::new(Some(wav.len() as u64)));
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.downloaded = wav.len() as u64;
+            state.complete = true;
+        }
+        let reader = ProgressiveReader {
+            file: open_cache_for_read(&path).unwrap(),
+            position: 0,
+            shared: Arc::clone(&shared),
+            reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+            recovery_limit: None,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let shared_for_worker = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let result = telegram_recovery_decoder(reader, &shared_for_worker, Some("wav"))
+                .map(|mut decoder| decoder.next().is_some());
+            let _ = sender.send(result);
+        });
+        let decoded = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("decoder initialization deadlocked on Telegram download state")
+            .unwrap();
+        worker.join().unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(decoded);
+    }
+
+    #[test]
+    fn completed_cache_recovery_resumes_at_requested_position() {
+        let samples = || SamplesBuffer::new(1, 10, (0..30).map(|i| i as f32).collect::<Vec<_>>());
+        let source =
+            restored_source(samples(), Duration::from_secs(2), true, || Ok(samples())).unwrap();
+        assert_eq!(source.take(2).collect::<Vec<_>>(), vec![20.0, 21.0]);
+    }
+
+    #[test]
+    fn recovery_records_pause_state_and_tries_immediately() {
+        let before = Instant::now();
+        let recovery = AudioRecovery::new(Duration::from_secs(37), true);
+        assert_eq!(recovery.position, Duration::from_secs(37));
+        assert!(recovery.paused);
+        assert!(recovery.retry_at >= before);
+        assert!(recovery.worker.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_progressive_audio_does_not_block_the_ui_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-audio-recovery-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, [42_u8]).unwrap();
+        let shared = Arc::new(SharedDownload::new(Some(1)));
+        shared.state.lock().unwrap().buffering = false;
+        let reader_shared = Arc::clone(&shared);
+        let reader_path = path.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut reader = ProgressiveReader {
+                file: open_cache_for_read(&reader_path).unwrap(),
+                position: 0,
+                reader_epoch: reader_shared.reader_epoch.load(Ordering::Acquire),
+                shared: reader_shared,
+                recovery_limit: None,
+            };
+            let mut result = [0_u8];
+            reader.read_exact(&mut result).unwrap();
+            result[0]
+        });
+
+        let buffering = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if shared.state.lock().unwrap().buffering {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        // Release the worker even if the buffering assertion fails.
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.downloaded = 1;
+            state.complete = true;
+        }
+        shared.changed.notify_all();
+
+        assert!(
+            buffering.is_ok(),
+            "the progressive reader did not wait for data"
+        );
+        assert_eq!(worker.await.unwrap(), 42);
+        fs::remove_file(path).unwrap();
+    }
+}
+
+const RECOVERY_CLOSING_OUTPUT: u8 = 0;
+const RECOVERY_OPENING_OUTPUT: u8 = 1;
+const RECOVERY_RESTORING_AUDIO: u8 = 2;
+const RECOVERY_READY: u8 = 3;
+
+const LOOP_CHECK_DEVICE: u8 = 0;
+const LOOP_CAPTURE_POSITION: u8 = 1;
+const LOOP_PAUSE_SINK: u8 = 2;
+const LOOP_INTERRUPT_READER: u8 = 3;
+const LOOP_STOP_SINK: u8 = 4;
+const LOOP_PROCESS_RECOVERY: u8 = 5;
+const LOOP_MEDIA_CONTROLS: u8 = 6;
+const LOOP_RENDER: u8 = 7;
+const LOOP_INPUT: u8 = 8;
+const LOOP_DOWNLOAD_STATE: u8 = 9;
+const LOOP_EMBEDDED_LYRICS: u8 = 10;
+
+fn loop_stage_name(stage: u8) -> &'static str {
+    match stage {
+        LOOP_CHECK_DEVICE => "checking audio device",
+        LOOP_CAPTURE_POSITION => "capturing playback position",
+        LOOP_PAUSE_SINK => "pausing old sink",
+        LOOP_INTERRUPT_READER => "interrupting old decoder",
+        LOOP_STOP_SINK => "stopping old sink",
+        LOOP_PROCESS_RECOVERY => "processing audio recovery",
+        LOOP_MEDIA_CONTROLS => "reading media controls",
+        LOOP_RENDER => "rendering Telegram player",
+        LOOP_INPUT => "polling keyboard input",
+        LOOP_DOWNLOAD_STATE => "reading Telegram download state",
+        LOOP_EMBEDDED_LYRICS => "reading embedded lyrics",
+        _ => "unknown",
+    }
+}
+
+struct TelegramLoopWatchdog {
+    enabled: bool,
+    stage: Arc<AtomicU8>,
+    heartbeat_ms: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+    started: Instant,
+}
+
+impl TelegramLoopWatchdog {
+    fn start() -> Self {
+        let enabled = telegram_recovery_logging_enabled();
+        let stage = Arc::new(AtomicU8::new(LOOP_CHECK_DEVICE));
+        let heartbeat_ms = Arc::new(AtomicU64::new(0));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let watch_stage = Arc::clone(&stage);
+        let watch_heartbeat = Arc::clone(&heartbeat_ms);
+        let watch_stopped = Arc::clone(&stopped);
+        if enabled {
+            append_recovery_diagnostic(&format!(
+                "Telegram playback started; recovery log: {}",
+                recovery_log_path().display()
+            ));
+            if let Err(error) = std::thread::Builder::new()
+                .name("telegram-ui-watchdog".to_owned())
+                .spawn(move || {
+                    let mut last_report_ms = 0;
+                    while !watch_stopped.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let now = started.elapsed().as_millis() as u64;
+                        let last = watch_heartbeat.load(Ordering::Acquire);
+                        if now.saturating_sub(last) >= 5_000
+                            && now.saturating_sub(last_report_ms) >= 5_000
+                            && !watch_stopped.load(Ordering::Acquire)
+                        {
+                            append_recovery_diagnostic(&format!(
+                                "UI loop stalled for {}ms; last step: {}",
+                                now.saturating_sub(last),
+                                loop_stage_name(watch_stage.load(Ordering::Acquire))
+                            ));
+                            last_report_ms = now;
+                        }
+                    }
+                })
+            {
+                append_recovery_diagnostic(&format!("could not start UI watchdog: {error}"));
+            }
+        }
+        Self {
+            enabled,
+            stage,
+            heartbeat_ms,
+            stopped,
+            started,
+        }
+    }
+
+    fn pulse(&self, stage: u8) {
+        if !self.enabled {
+            return;
+        }
+        self.stage.store(stage, Ordering::Release);
+        self.heartbeat_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Release);
+    }
+}
+
+impl Drop for TelegramLoopWatchdog {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+fn recovery_stage_name(stage: u8) -> &'static str {
+    match stage {
+        RECOVERY_CLOSING_OUTPUT => "closing previous audio output",
+        RECOVERY_OPENING_OUTPUT => "opening new audio output",
+        RECOVERY_RESTORING_AUDIO => "restoring cached audio",
+        RECOVERY_READY => "finishing output handoff",
+        _ => "unknown",
+    }
+}
+
+struct AudioRecovery {
+    position: Duration,
+    paused: bool,
+    retry_at: Instant,
+    worker: Option<JoinHandle<Result<PreparedTelegramOutput>>>,
+    previous_output: Option<AudioOutput>,
+    stage: Arc<AtomicU8>,
+    attempt_started: Instant,
+    last_stall_log: Option<Instant>,
+    last_failure: Option<String>,
+}
+
+impl AudioRecovery {
+    fn new(position: Duration, paused: bool) -> Self {
+        Self {
+            position,
+            paused,
+            retry_at: Instant::now(),
+            worker: None,
+            previous_output: None,
+            stage: Arc::new(AtomicU8::new(RECOVERY_CLOSING_OUTPUT)),
+            attempt_started: Instant::now(),
+            last_stall_log: None,
+            last_failure: None,
         }
     }
 }
@@ -978,7 +1574,7 @@ async fn play_telegram_tracks(
         shuffle_slice(&mut tracks);
         index = 0;
     }
-    let output = AudioOutput::open()?;
+    let mut output = Some(AudioOutput::open()?);
     let media_controls = MediaControls::new();
     let mut volume = load_volume();
     let mut last_volume_change = None;
@@ -989,31 +1585,130 @@ async fn play_telegram_tracks(
     let mut lyrics_settings = None;
     let mut lyrics_scroll = 0usize;
     let mut lyrics_index = index;
-    let mut active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+    let mut active = start_catalog_track(
+        &client,
+        output.as_ref().expect("audio output available").stream(),
+        &tracks[index],
+        volume,
+    )
+    .await?;
     update_telegram_media(&media_controls, &tracks[index], &active);
+    let mut recovery: Option<AudioRecovery> = None;
+    let watchdog = TelegramLoopWatchdog::start();
 
     loop {
+        watchdog.pulse(LOOP_CHECK_DEVICE);
         if lyrics_index != index {
             lyrics_scroll = 0;
             lyrics_index = index;
         }
-        if output.is_lost() {
-            active.stop().await;
-            delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
-            return Err(device_unavailable_error());
+        if recovery.is_none()
+            && output
+                .as_ref()
+                .is_some_and(|device| device.is_lost() || device.default_changed())
+        {
+            append_recovery_diagnostic("audio change detected; capturing playback position");
+            watchdog.pulse(LOOP_CAPTURE_POSITION);
+            let position = active.position();
+            let paused = active.sink.is_paused();
+            recovery = Some(AudioRecovery::new(position, paused));
+            watchdog.pulse(LOOP_PAUSE_SINK);
+            active.sink.pause();
+            watchdog.pulse(LOOP_INTERRUPT_READER);
+            active.shared.interrupt_playback_readers();
+            watchdog.pulse(LOOP_STOP_SINK);
+            active.sink.stop();
+            if let Some(state) = recovery.as_mut() {
+                state.previous_output = output.take();
+            }
+            append_recovery_diagnostic("audio output changed; closing old stream before reconnect");
+            media_controls.set_playing(false);
+        }
+        watchdog.pulse(LOOP_PROCESS_RECOVERY);
+        if let Some(state) = recovery.as_mut() {
+            if state.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                let result = state.worker.take().expect("finished recovery worker").await;
+                let failure = match result {
+                    Ok(Ok(prepared))
+                        if !prepared.output.is_lost() && !prepared.output.default_changed() =>
+                    {
+                        prepared.sink.set_volume(volume);
+                        if !state.paused && active.warning.is_none() {
+                            prepared.sink.play();
+                        }
+                        active.replace_sink(prepared.sink, state.position);
+                        output = Some(prepared.output);
+                        append_recovery_diagnostic("audio output reconnected successfully");
+                        media_controls.set_playing(active.warning.is_none() && !state.paused);
+                        recovery = None;
+                        None
+                    }
+                    Ok(Ok(_)) => Some("default audio output changed during recovery".to_owned()),
+                    Ok(Err(error)) => Some(format!("{error:#}")),
+                    Err(error) => Some(format!("recovery worker failed: {error}")),
+                };
+                if let Some(state) = recovery.as_mut() {
+                    if let Some(failure) = failure
+                        && state.last_failure.as_deref() != Some(&failure)
+                    {
+                        append_recovery_diagnostic(&format!("audio output recovery: {failure}"));
+                        state.last_failure = Some(failure);
+                    }
+                    state.retry_at = Instant::now() + Duration::from_millis(750);
+                }
+            } else if state.worker.is_some()
+                && state
+                    .last_stall_log
+                    .is_none_or(|logged| logged.elapsed() >= Duration::from_secs(5))
+                && state.attempt_started.elapsed() >= Duration::from_secs(5)
+            {
+                append_recovery_diagnostic(&format!(
+                    "audio recovery running {}s: {}",
+                    state.attempt_started.elapsed().as_secs(),
+                    recovery_stage_name(state.stage.load(Ordering::Acquire))
+                ));
+                state.last_stall_log = Some(Instant::now());
+            } else if state.worker.is_none() && Instant::now() >= state.retry_at {
+                let cache_path = active.cache_path.clone();
+                let shared = Arc::clone(&active.shared);
+                let position = state.position;
+                let previous_output = state.previous_output.take();
+                let stage = Arc::clone(&state.stage);
+                state.attempt_started = Instant::now();
+                state.last_stall_log = None;
+                stage.store(RECOVERY_CLOSING_OUTPUT, Ordering::Release);
+                state.worker = Some(tokio::task::spawn_blocking(move || {
+                    // Bluetooth Headset -> Headphones may not activate its stereo
+                    // profile until the hands-free WASAPI stream is released.
+                    append_recovery_diagnostic("worker: releasing previous audio stream");
+                    drop(previous_output);
+                    append_recovery_diagnostic("worker: previous audio stream released");
+                    prepare_telegram_output(cache_path, shared, position, volume, &stage)
+                }));
+            }
         }
 
+        watchdog.pulse(LOOP_MEDIA_CONTROLS);
         if let Some(command) = media_controls.command() {
             match command {
                 MediaCommand::Play if active.warning.is_none() => {
-                    active.sink.play();
-                    media_controls.set_playing(true);
+                    if let Some(state) = recovery.as_mut() {
+                        state.paused = false;
+                    } else {
+                        active.sink.play();
+                        media_controls.set_playing(true);
+                    }
                 }
                 MediaCommand::Play => {}
                 MediaCommand::Pause => {
-                    active.sink.pause();
+                    if let Some(state) = recovery.as_mut() {
+                        state.paused = true;
+                    } else {
+                        active.sink.pause();
+                    }
                     media_controls.set_playing(false);
                 }
+                MediaCommand::Next | MediaCommand::Previous if recovery.is_some() => {}
                 MediaCommand::Next | MediaCommand::Previous => {
                     let forward = command == MediaCommand::Next;
                     let next = if forward {
@@ -1046,26 +1741,38 @@ async fn play_telegram_tracks(
                         play_next -= 1;
                     }
                     index = next;
-                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
-                        .await?;
+                    active = start_catalog_track(
+                        &client,
+                        output.as_ref().expect("audio output available").stream(),
+                        &tracks[index],
+                        volume,
+                    )
+                    .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
                 }
             }
             continue;
         }
 
+        watchdog.pulse(LOOP_DOWNLOAD_STATE);
         let complete = active.shared.state.lock().map_err(lock_error)?.complete;
         if complete && !active.lyrics_checked_complete {
+            watchdog.pulse(LOOP_EMBEDDED_LYRICS);
             active.lyrics = read_embedded_lyrics(&active.cache_path).ok().flatten();
             active.lyrics_checked_complete = true;
         }
 
+        watchdog.pulse(LOOP_RENDER);
         draw_telegram_player(
             &mut stdout,
             &tracks,
             index,
             active.duration,
             &active.sink,
+            recovery
+                .as_ref()
+                .map_or_else(|| active.position(), |state| state.position),
+            recovery.is_some(),
             volume,
             last_volume_change,
             shuffle,
@@ -1078,7 +1785,7 @@ async fn play_telegram_tracks(
             lyrics_settings.as_ref(),
         )?;
 
-        if active.warning.is_none() && complete && active.sink.empty() {
+        if recovery.is_none() && active.warning.is_none() && complete && active.sink.empty() {
             let Some((next, new_pass, advance_queue)) = forward_track_index(
                 index,
                 tracks.len(),
@@ -1100,10 +1807,17 @@ async fn play_telegram_tracks(
                 play_next -= 1;
             }
             index = next;
-            active = start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+            active = start_catalog_track(
+                &client,
+                output.as_ref().expect("audio output available").stream(),
+                &tracks[index],
+                volume,
+            )
+            .await?;
             update_telegram_media(&media_controls, &tracks[index], &active);
             continue;
         }
+        watchdog.pulse(LOOP_INPUT);
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -1117,6 +1831,15 @@ async fn play_telegram_tracks(
             active.stop().await;
             delete_cache_directory(Path::new(TELEGRAM_CACHE_DIR))?;
             return Ok(PlayerExit::Quit);
+        }
+        if recovery.is_some() && matches!(key.code, KeyCode::Char('n' | 'v' | 'u')) {
+            continue;
+        }
+        if recovery.is_some()
+            && active.warning.is_some()
+            && matches!(key.code, KeyCode::Char('p' | ' '))
+        {
+            continue;
         }
 
         if let Some(editor) = lyrics_settings.as_mut() {
@@ -1150,7 +1873,9 @@ async fn play_telegram_tracks(
                 return Ok(PlayerExit::Back);
             }
             KeyCode::Char('p') | KeyCode::Char(' ') if active.warning.is_none() => {
-                if active.sink.is_paused() {
+                if let Some(state) = recovery.as_mut() {
+                    state.paused = !state.paused;
+                } else if active.sink.is_paused() {
                     active.sink.play();
                     media_controls.set_playing(true);
                 } else {
@@ -1180,8 +1905,13 @@ async fn play_telegram_tracks(
                     play_next -= 1;
                 }
                 index = next;
-                active =
-                    start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+                active = start_catalog_track(
+                    &client,
+                    output.as_ref().expect("audio output available").stream(),
+                    &tracks[index],
+                    volume,
+                )
+                .await?;
                 update_telegram_media(&media_controls, &tracks[index], &active);
             }
             KeyCode::Char('v') if key.modifiers.is_empty() => {
@@ -1189,8 +1919,13 @@ async fn play_telegram_tracks(
                 active.stop().await;
                 delete_cache_file(&old_cache)?;
                 index = previous_track_index(index, tracks.len(), &mut resume_after_replay);
-                active =
-                    start_catalog_track(&client, output.stream(), &tracks[index], volume).await?;
+                active = start_catalog_track(
+                    &client,
+                    output.as_ref().expect("audio output available").stream(),
+                    &tracks[index],
+                    volume,
+                )
+                .await?;
                 update_telegram_media(&media_controls, &tracks[index], &active);
             }
             KeyCode::Left => {
@@ -1267,8 +2002,13 @@ async fn play_telegram_tracks(
                         play_next -= 1;
                     }
                     index = next;
-                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
-                        .await?;
+                    active = start_catalog_track(
+                        &client,
+                        output.as_ref().expect("audio output available").stream(),
+                        &tracks[index],
+                        volume,
+                    )
+                    .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
                     continue;
                 }
@@ -1278,8 +2018,13 @@ async fn play_telegram_tracks(
                     let old_cache = active.cache_path.clone();
                     active.stop().await;
                     delete_cache_file(&old_cache)?;
-                    active = start_catalog_track(&client, output.stream(), &tracks[index], volume)
-                        .await?;
+                    active = start_catalog_track(
+                        &client,
+                        output.as_ref().expect("audio output available").stream(),
+                        &tracks[index],
+                        volume,
+                    )
+                    .await?;
                     update_telegram_media(&media_controls, &tracks[index], &active);
                 }
                 break;
@@ -1452,6 +2197,8 @@ async fn start_telegram_track(
         file: open_cache_for_read(&track.cache_path)?,
         position: 0,
         shared: Arc::clone(&shared),
+        reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+        recovery_limit: None,
     };
     let lyrics = read_embedded_lyrics(&track.cache_path).ok().flatten();
     let sink = Sink::connect_new(stream.mixer());
@@ -1479,6 +2226,8 @@ async fn start_telegram_track(
                     file: open_cache_for_read(&track.cache_path)?,
                     position: 0,
                     shared: Arc::clone(&shared),
+                    reader_epoch: shared.reader_epoch.load(Ordering::Acquire),
+                    recovery_limit: None,
                 };
                 telegram_decoder(reader, track.size, hint.as_deref()).ok()
             }
@@ -1498,6 +2247,7 @@ async fn start_telegram_track(
     };
     Ok(ActiveTelegramTrack {
         sink,
+        position_offset: Duration::ZERO,
         duration,
         lyrics,
         lyrics_checked_complete: cache_complete,
@@ -1698,14 +2448,44 @@ async fn refresh_download_media(client: &Client, peer: &PeerRef, message_id: i32
     Ok(media)
 }
 
+fn telegram_recovery_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env::var("MTP_TELEGRAM_RECOVERY_LOG").is_ok_and(|value| value == "1"))
+}
+
 fn append_recovery_diagnostic(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(TELEGRAM_RECOVERY_LOG)
-    {
-        let _ = writeln!(file, "{message}");
+    if !telegram_recovery_logging_enabled() {
+        return;
     }
+    let path = recovery_log_path();
+    let result = (|| -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        writeln!(
+            file,
+            "unix_ms={timestamp_ms} pid={} thread={:?} {message}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "Unable to write Telegram recovery log at {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn recovery_log_path() -> PathBuf {
+    env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(TELEGRAM_RECOVERY_LOG)
 }
 
 const TELEGRAM_FILE_WINDOW_BYTES: u64 = 1024 * 1024;
@@ -2212,6 +2992,8 @@ fn draw_telegram_player(
     index: usize,
     duration: Option<Duration>,
     sink: &Sink,
+    elapsed: Duration,
+    audio_reconnecting: bool,
     volume: f32,
     last_volume_change: Option<Instant>,
     shuffle: bool,
@@ -2224,7 +3006,9 @@ fn draw_telegram_player(
     lyrics_settings: Option<&LyricsSettingsEditor>,
 ) -> Result<()> {
     let state = shared.state.lock().map_err(lock_error)?;
-    let playback = if warning.is_some() || state.error.is_some() {
+    let playback = if audio_reconnecting {
+        tr("msg.reconnecting_audio_output")
+    } else if warning.is_some() || state.error.is_some() {
         tr("msg.cannot_play")
     } else if sink.is_paused() {
         tr("msg.paused")
@@ -2245,7 +3029,6 @@ fn draw_telegram_player(
             )
         })
         .unwrap_or_else(|| format!("{} KiB", state.downloaded / 1024));
-    let elapsed = sink.get_pos();
     let total = duration
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());

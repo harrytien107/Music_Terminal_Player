@@ -177,6 +177,7 @@ msg.quick_play=Quick play
 msg.quit=Quit
 msg.r_shuffle=[r] shuffle
 msg.reconnecting=reconnecting
+msg.reconnecting_audio_output=Reconnecting audio output...
 msg.rename_playlist=Rename playlist
 msg.recently_added=Recently added
 msg.rename_which_playlist=Rename which playlist?

@@ -177,6 +177,7 @@ msg.quick_play=Phát nhanh
 msg.quit=Thoát
 msg.r_shuffle=[r] trộn bài
 msg.reconnecting=đang kết nối lại
+msg.reconnecting_audio_output=Đang kết nối lại thiết bị âm thanh...
 msg.rename_playlist=Đổi tên danh sách phát
 msg.recently_added=Thêm gần đây
 msg.rename_which_playlist=Đổi tên danh sách phát nào?

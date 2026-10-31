@@ -13,22 +13,12 @@ A small terminal player for local libraries and online sources without the overh
 
 - Local file and folder playback
 - Telegram public- and private-channel synchronization, streaming, and offline download
-- Resilient Telegram progressive streaming with transient-error retry, fresh media-reference refresh, aligned adaptive recovery from 512 KiB down to 4 KiB, and verified CDN fallback when Telegram offers a redirect
 - Combined multi-channel Telegram queues
 - YouTube video and playlist audio streaming without saving complete media files
-- YouTube seeking, 0.5x–2.0x speed control, and persistent per-category SponsorBlock auto-skip settings
-- Synchronized YouTube transcripts from available manual subtitles or automatic captions, with configurable language, position, alignment, and colors
-- Windows media controls with track metadata and Play, Pause, Next, and Previous actions
-- Automatic YouTube recovery when the default audio output changes
+- YouTube persistent per-category SponsorBlock auto-skip settings
+- Synchronized YouTube transcripts
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
 - Configurable embedded lyrics for local and Telegram tracks, including line-synchronized LRC and word-synchronized Enhanced LRC
-- Built-in offline English UI with optional, verified Vietnamese download and persistent selection
-- Unicode-aware terminal panels, compact color-coded launcher actions, and queue columns
-- Portable or custom yt-dlp and FFmpeg setup with manual portable tool updates
-- Direct YouTube URL or playlist input from Quick play
-- Optional startup synchronization for selected saved Telegram channels (off by default)
-- Background GitHub release version checks at startup with manual ZIP installation from Settings, restart, and rollback
-- Responsive menu and queue layouts, plus a temporary volume meter in the player progress row
 
 ### Lyrics support for local files and telegram
 
@@ -45,7 +35,7 @@ YouTube playback can display available manual subtitles or automatic captions as
 ## Installing
 Windows is supported. macOS and Linux support are planned.
 
-Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.0.9)
+Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.1.0)
 
 ## Tutorials
 
