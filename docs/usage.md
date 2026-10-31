@@ -44,6 +44,18 @@ If the catalog is unavailable, English and installed valid packs remain selectab
 
 ## Player controls
 
+Changing the volume temporarily replaces the existing playback progress row with a volume meter and percentage. The playback progress returns about one second after the last volume keypress; repeated changes keep the volume meter visible. YouTube `Left` and `Right` continue to seek.
+
+Resizing the terminal redraws menus and playback panels using the available space. The queue switches from three columns to a stacked list on narrower terminals, keeping the highlighted entry visible. Lyrics use a consistent width for the whole track, limited by the current window size.
+
+## Optional automatic startup tasks
+
+Open **Settings** to configure **Automatic Telegram sync**, **Select startup channels**, and **GitHub Updates**. Telegram synchronization is **OFF by default**; GitHub checks for new versions in the background at every interactive launch.
+
+Telegram startup sync uses only the saved channels you explicitly select. Press `Space` to toggle one or more channels; each change saves immediately. Press `Esc` or `b` to return. On later launches, selected channels sync in the background using your existing Telegram session, without interrupting playback or asking for credentials. An unsuccessful sync leaves the previous catalog intact. Diagnostics are saved in `.music-terminal/auto-sync-status.txt`.
+
+GitHub version checking uses the latest stable release and runs without blocking playback or downloading files. Go to **Settings → GitHub Updates** to see the installed and latest versions, or choose **Check for updates again** after a network error. A newer release with a compatible Windows x64 ZIP enables **Download and update to vX.Y.Z**; select it to download, validate, and stage the update. The player continues running until you exit. A separate Windows helper then backs up the current executable, installs the staged update, and restarts the application. If replacement or restart fails, it attempts to restore the original executable. If the release has no compatible Windows ZIP, the version remains visible but installation is unavailable. The backup is stored alongside the staged update under `.music-terminal/app-update` in the executable directory, and the outcome is logged to `.music-terminal/update-status.txt` in the launch directory. Prefer naming the ZIP release asset with `windows`, `win64`, or `win-x64`; a single unambiguous generic ZIP asset also works. Include `music-terminal-player.exe` at the ZIP root or one directory deep; other layouts are rejected. GitHub's published SHA-256 digest, when provided, is checked before extraction. Existing libraries, playlists, settings, credentials, and downloaded music are preserved. Previously saved `app.auto_update` settings are ignored.
+
 - `p` / `Space`: play or pause
 - `Up` / `Down`: volume up or down 10%
 - `+` / `-`: volume up or down 10%

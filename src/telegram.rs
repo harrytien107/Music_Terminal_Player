@@ -39,10 +39,11 @@ use crate::util::{
     DATA_DIR, LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
     clear_screen, draw_frame, draw_player_panels, format_duration, format_elapsed,
     forward_track_index, is_supported_audio_path, load_setting_bool, load_volume, manage_queue,
-    normalize_channel, playback_controls_with_lyrics, playback_key_bindings_hint, player_title_row,
+    normalize_channel, playback_bar_width, playback_controls_with_lyrics,
+    playback_key_bindings_hint, playback_progress_or_volume, player_title_row,
     previous_track_index, progress_bar, prompt, restart_pass_order, safe_file_name,
     save_setting_bool, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
-    toggle_playback_key_bindings,
+    toggle_playback_key_bindings, wrap_playback_status,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -56,6 +57,7 @@ const INITIAL_BUFFER_BYTES: u64 = 1024 * 1024;
 const TRACK_LIST_PAGE_SIZE: usize = 25;
 const PRIVATE_CHANNEL_PAGE_SIZE: usize = 20;
 const PRIVATE_CHANNEL_PREFIX: &str = "private:";
+static CATALOG_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct TelegramTrack {
@@ -317,7 +319,16 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
 }
 
 pub(crate) async fn telegram_client() -> Result<Client> {
-    let (api_id, api_hash) = telegram_credentials()?;
+    telegram_client_with_login(true).await
+}
+
+async fn telegram_client_with_login(interactive: bool) -> Result<Client> {
+    let (api_id, api_hash) = if interactive {
+        telegram_credentials()?
+    } else {
+        // Startup background work must never read from or redraw the console.
+        silent_telegram_credentials()?
+    };
     let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
     let SenderPool { runner, handle, .. } = SenderPool::new(session, api_id);
     let client = Client::new(handle);
@@ -325,6 +336,10 @@ pub(crate) async fn telegram_client() -> Result<Client> {
 
     if client.is_authorized().await? {
         return Ok(client);
+    }
+
+    if !interactive {
+        bail!("Telegram session is not authorized; log in from the main menu");
     }
 
     clear_screen()?;
@@ -411,6 +426,33 @@ pub(crate) async fn telegram_client() -> Result<Client> {
         tr("msg.session_saved_in")
     );
     Ok(client)
+}
+
+fn silent_telegram_credentials() -> Result<(i32, String)> {
+    if let (Ok(id), Ok(hash)) = (env::var("TG_ID"), env::var("TG_HASH")) {
+        let id = id.parse::<i32>()?;
+        if valid_api_credentials(id, &hash) {
+            return Ok((id, hash));
+        }
+        bail!("invalid TG_ID/TG_HASH");
+    }
+    let text = fs::read_to_string(TELEGRAM_CREDENTIALS_FILE)
+        .context("Telegram credentials missing; log in from the main menu")?;
+    let mut lines = text.lines();
+    let id = lines
+        .next()
+        .context("missing Telegram API ID")?
+        .trim()
+        .parse::<i32>()?;
+    let hash = lines
+        .next()
+        .context("missing Telegram API hash")?
+        .trim()
+        .to_owned();
+    if !valid_api_credentials(id, &hash) {
+        bail!("invalid saved Telegram credentials");
+    }
+    Ok((id, hash))
 }
 
 fn valid_api_credentials(id: i32, hash: &str) -> bool {
@@ -939,6 +981,7 @@ async fn play_telegram_tracks(
     let output = AudioOutput::open()?;
     let media_controls = MediaControls::new();
     let mut volume = load_volume();
+    let mut last_volume_change = None;
     let mut resume_after_replay = None;
     let mut play_next = initial_play_next.min(tracks.len().saturating_sub(1));
     let mut loop_mode = LoopMode::Off;
@@ -1024,6 +1067,7 @@ async fn play_telegram_tracks(
             active.duration,
             &active.sink,
             volume,
+            last_volume_change,
             shuffle,
             &active.shared,
             loop_mode,
@@ -1151,11 +1195,13 @@ async fn play_telegram_tracks(
             }
             KeyCode::Left => {
                 volume = (volume - 0.01).max(0.0);
+                last_volume_change = Some(Instant::now());
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
             KeyCode::Right => {
                 volume = (volume + 0.01).min(MAX_VOLUME);
+                last_volume_change = Some(Instant::now());
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -1240,11 +1286,13 @@ async fn play_telegram_tracks(
             },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(MAX_VOLUME);
+                last_volume_change = Some(Instant::now());
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
             KeyCode::Down | KeyCode::Char('-') => {
                 volume = (volume - 0.10).max(0.0);
+                last_volume_change = Some(Instant::now());
                 active.sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -2165,6 +2213,7 @@ fn draw_telegram_player(
     duration: Option<Duration>,
     sink: &Sink,
     volume: f32,
+    last_volume_change: Option<Instant>,
     shuffle: bool,
     shared: &SharedDownload,
     loop_mode: LoopMode,
@@ -2200,27 +2249,31 @@ fn draw_telegram_player(
     let total = duration
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
+    let time_text = format!("{}/{}", format_duration(elapsed), total);
     let mut rows = vec![
         player_title_row(tr("msg.track"), index, tracks.len(), &tracks[index].name),
         String::new(),
-        format!(
-            "[{}] {}/{}",
-            progress_bar(elapsed, duration, 12),
-            format_duration(elapsed),
-            total
+        playback_progress_or_volume(
+            format!(
+                "[{}] {}/{}",
+                progress_bar(elapsed, duration, playback_bar_width(&time_text)),
+                format_duration(elapsed),
+                total
+            ),
+            volume,
+            last_volume_change,
         ),
-        format!(
-            "{} · {:.0}% · cache {} · {} {} · {} {}",
-            playback,
-            volume * 100.0,
-            progress,
-            tr("msg.shuffle"),
-            if shuffle { tr("msg.on") } else { tr("msg.off") },
-            tr("msg.loop"),
-            loop_mode.label()
-        ),
-        String::new(),
     ];
+    rows.extend(wrap_playback_status(&format!(
+        "{} · cache {} · {} {} · {} {}",
+        playback,
+        progress,
+        tr("msg.shuffle"),
+        if shuffle { tr("msg.on") } else { tr("msg.off") },
+        tr("msg.loop"),
+        loop_mode.label()
+    )));
+    rows.push(String::new());
     if let Some(warning) = warning {
         rows.push(format!("{}: {warning}", tr("msg.warning")));
         rows.push(String::new());
@@ -2248,12 +2301,18 @@ fn draw_telegram_player(
 }
 
 pub(crate) async fn sync_catalog(channel: &str) -> Result<()> {
-    scan_channel(channel, None).await
+    let _guard = CATALOG_SYNC_LOCK.lock().await;
+    scan_channel(channel, None, false).await
+}
+
+pub(crate) async fn sync_catalog_silent(channel: &str) -> Result<()> {
+    let _guard = CATALOG_SYNC_LOCK.lock().await;
+    scan_channel(channel, None, true).await
 }
 
 pub(crate) async fn download_channel(channel: &str, folder: &Path) -> Result<()> {
     fs::create_dir_all(folder).with_context(|| format!("failed to create {}", folder.display()))?;
-    scan_channel(channel, Some(folder)).await
+    scan_channel(channel, Some(folder), false).await
 }
 
 pub(crate) async fn choose_private_channel(
@@ -2488,9 +2547,13 @@ pub(crate) fn private_invite_hash(link: &str) -> Option<String> {
     (!hash.is_empty() && !hash.contains('/')).then(|| hash.to_string())
 }
 
-async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<()> {
+async fn scan_channel(channel: &str, download_folder: Option<&Path>, silent: bool) -> Result<()> {
     let started = Instant::now();
-    let client = telegram_client().await?;
+    let client = if silent {
+        telegram_client_with_login(false).await?
+    } else {
+        telegram_client().await?
+    };
     let channel = normalize_channel_identity(channel);
     let label = telegram_channel_label(&channel);
     let peer = resolve_channel(&client, &channel).await?;
@@ -2501,7 +2564,9 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
     let mut document_count = 0usize;
     let mut messages = client.iter_messages(peer.clone());
 
-    println!("{} {label}...", tr("msg.scanning_all_songs_in"));
+    if !silent {
+        println!("{} {label}...", tr("msg.scanning_all_songs_in"));
+    }
     while let Some(message) = messages.next().await? {
         message_count += 1;
         let Some(media) = message.media() else {
@@ -2541,13 +2606,17 @@ async fn scan_channel(channel: &str, download_folder: Option<&Path>) -> Result<(
     }
     save_telegram_catalog(&catalog_path, &catalog)?;
     let scan_time = started.elapsed();
-    println!(
-        "Scan complete. Total songs: {total_songs}. Scan time: {}. Song list: {}",
-        format_elapsed(scan_time),
-        catalog_path.display()
-    );
+    if !silent {
+        println!(
+            "Scan complete. Total songs: {total_songs}. Scan time: {}. Song list: {}",
+            format_elapsed(scan_time),
+            catalog_path.display()
+        );
+    }
     let Some(folder) = download_folder else {
-        println!("{}", tr("msg.song_list_update_complete"));
+        if !silent {
+            println!("{}", tr("msg.song_list_update_complete"));
+        }
         return Ok(());
     };
 
@@ -2729,8 +2798,47 @@ pub(crate) fn save_telegram_catalog(path: &Path, catalog: &[TelegramCatalogEntry
             entry.message_id, entry.published_at
         ));
     }
-    fs::write(path, text)
-        .with_context(|| format!("failed to save Telegram song list {}", path.display()))
+    // A failed scan or write must never replace a usable catalog.
+    let staging = path.with_extension("txt.pending");
+    fs::write(&staging, text)?;
+    if let Err(error) = fs::rename(&staging, path) {
+        if path.exists() {
+            // Windows does not replace an existing destination with rename.
+            // ReplaceFileW keeps the old catalog intact if replacement fails.
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                use windows::Win32::Storage::FileSystem::ReplaceFileW;
+                use windows::core::PCWSTR;
+                let to_wide = |p: &Path| {
+                    p.as_os_str()
+                        .encode_wide()
+                        .chain(Some(0))
+                        .collect::<Vec<_>>()
+                };
+                let target = to_wide(path);
+                let replacement = to_wide(&staging);
+                unsafe {
+                    ReplaceFileW(
+                        PCWSTR(target.as_ptr()),
+                        PCWSTR(replacement.as_ptr()),
+                        PCWSTR::null(),
+                        Default::default(),
+                        None,
+                        None,
+                    )
+                }
+                .with_context(|| {
+                    format!("failed to replace catalog {}: {error}", path.display())
+                })?;
+            }
+            #[cfg(not(windows))]
+            return Err(error.into());
+        } else {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_telegram_catalog(path: &Path) -> Result<Vec<TelegramCatalogEntry>> {

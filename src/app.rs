@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -24,8 +26,9 @@ use crate::telegram::{
 };
 use crate::util::{
     LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
-    fit_text, load_setting_bool, load_setting_value, manage_lyrics_settings, normalize_channel,
-    prompt, save_setting_bool, save_setting_value, select_menu, select_menu_from, toggle_all,
+    fit_text, load_setting_bool, load_setting_value, manage_lyrics_settings, menu_quit_key,
+    normalize_channel, prompt, save_setting_bool, save_setting_value, select_menu,
+    select_menu_from, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +342,8 @@ pub(crate) fn launcher_items(telegram_status: &str) -> Vec<String> {
 
 pub(crate) fn launch_menu() -> Result<()> {
     let mut library = load_library()?;
+    start_automatic_telegram_sync(&library);
+    crate::updater::start_version_check();
     loop {
         let entries = launcher_entries(telegram_login_status());
         let items = entries
@@ -478,6 +483,7 @@ fn manage_settings() -> Result<()> {
     loop {
         let telegram_icons = load_setting_bool("telegram.channel_icons", true);
         let playback_key_bindings = load_setting_bool("playback.key_bindings", true);
+        let auto_sync = load_setting_bool("telegram.auto_sync", false);
         let items = vec![
             format!("{} {}", fit_text("≡", 2), tr("msg.main_menu_visibility")),
             format!(
@@ -502,6 +508,17 @@ fn manage_settings() -> Result<()> {
             ),
             format!("{} {}", fit_text("▭", 2), tr("msg.lyrics_settings")),
             format!("{} {}", fit_text("A", 2), tr("msg.language")),
+            format!(
+                "↻  {}: {}",
+                tr("msg.telegram_auto_sync"),
+                if auto_sync {
+                    tr("msg.toggle_on")
+                } else {
+                    tr("msg.toggle_off")
+                }
+            ),
+            format!("♫  {}", tr("msg.select_startup_channels")),
+            format!("↑  {}", tr("msg.github_updates")),
             format!("{} {}", fit_text("←", 2), tr("msg.back")),
         ];
         match select_menu_from(tr("msg.settings"), &items, selected)? {
@@ -525,10 +542,315 @@ fn manage_settings() -> Result<()> {
                 selected = 4;
                 manage_language()?;
             }
-            Some(5) | None => return Ok(()),
+            Some(5) => {
+                selected = 5;
+                save_setting_bool("telegram.auto_sync", !auto_sync)?;
+            }
+            Some(6) => {
+                selected = 6;
+                select_startup_telegram_channels()?;
+            }
+            Some(7) => {
+                selected = 7;
+                manage_github_updates()?;
+            }
+            Some(8) | None => return Ok(()),
             _ => unreachable!(),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GitHubUpdateAction {
+    Download,
+    CheckAgain,
+    Back,
+}
+
+fn github_update_actions(state: &crate::updater::UpdateState) -> Vec<(GitHubUpdateAction, String)> {
+    use crate::updater::UpdateState;
+    let mut actions = Vec::new();
+    if let UpdateState::Available(info, _) = state
+        && state.can_install()
+    {
+        actions.push((
+            GitHubUpdateAction::Download,
+            format!("{} {}", tr("msg.github_download_and_update"), info.tag),
+        ));
+    }
+    if !matches!(state, UpdateState::Downloading(_) | UpdateState::Staged(_)) {
+        actions.push((
+            GitHubUpdateAction::CheckAgain,
+            tr("msg.github_check_again").to_string(),
+        ));
+    }
+    actions.push((GitHubUpdateAction::Back, tr("msg.back").to_string()));
+    actions
+}
+
+#[cfg(test)]
+mod github_update_ui_tests {
+    use super::*;
+    use crate::updater::{ReleaseInfo, UpdateState};
+
+    #[test]
+    fn settings_only_offers_download_when_an_asset_can_be_installed() {
+        let no_zip = UpdateState::Available(ReleaseInfo::without_asset("v3.0.10"), None);
+        assert_eq!(github_update_actions(&no_zip).len(), 2);
+        assert!(
+            github_update_actions(&UpdateState::UpToDate("v3.0.9".into()))
+                .iter()
+                .all(|(action, _)| *action != GitHubUpdateAction::Download)
+        );
+        assert_eq!(
+            github_update_actions(&UpdateState::Staged("v3.0.10".into()))
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>(),
+            vec![GitHubUpdateAction::Back]
+        );
+        assert_eq!(
+            github_update_actions(&UpdateState::Downloading("v3.0.10".into()))
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>(),
+            vec![GitHubUpdateAction::Back]
+        );
+    }
+}
+
+fn github_update_details(state: &crate::updater::UpdateState) -> (String, String) {
+    use crate::updater::UpdateState;
+    match state {
+        UpdateState::Unchecked => (
+            tr("msg.github_unknown").to_string(),
+            tr("msg.github_checking").to_string(),
+        ),
+        UpdateState::Checking => (
+            tr("msg.github_unknown").to_string(),
+            tr("msg.github_checking").to_string(),
+        ),
+        UpdateState::UpToDate(tag) => (tag.clone(), tr("msg.github_up_to_date").to_string()),
+        UpdateState::Available(info, failure) => {
+            let status = if let Some(error) = failure {
+                format!("{}: {error}", tr("msg.github_download_failed"))
+            } else if !state.can_install() {
+                tr("msg.github_no_windows_zip").to_string()
+            } else {
+                tr("msg.github_new_version").to_string()
+            };
+            (info.tag.clone(), status)
+        }
+        UpdateState::Error(error) => (
+            tr("msg.github_unknown").to_string(),
+            format!("{}: {error}", tr("msg.github_check_failed")),
+        ),
+        UpdateState::Downloading(tag) => (tag.clone(), tr("msg.github_downloading").to_string()),
+        UpdateState::Staged(tag) => (tag.clone(), tr("msg.github_staged").to_string()),
+    }
+}
+
+fn manage_github_updates() -> Result<()> {
+    let raw = RawMode::new()?;
+    let mut stdout = io::stdout();
+    let mut selected = 0usize;
+    loop {
+        let state = crate::updater::snapshot();
+        let actions = github_update_actions(&state);
+        selected = selected.min(actions.len() - 1);
+        let (latest, status) = github_update_details(&state);
+        let mut frame = format!(
+            "{}\r\n\r\n{}: v{}\r\n{}: {}\r\n\r\n{}\r\n\r\n",
+            bold_text(tr("msg.github_updates")),
+            tr("msg.github_installed_version"),
+            env!("CARGO_PKG_VERSION"),
+            tr("msg.github_latest_version"),
+            latest,
+            status
+        );
+        for (index, (_, label)) in actions.iter().enumerate() {
+            frame.push_str(&format!(
+                "{} {label}\r\n",
+                if index == selected { '>' } else { ' ' }
+            ));
+        }
+        draw_frame(&mut stdout, &frame)?;
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if menu_quit_key(key.code, key.modifiers) {
+            drop(raw);
+            clear_screen()?;
+            std::process::exit(0);
+        }
+        match key.code {
+            KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(actions.len() - 1),
+            KeyCode::Down => selected = (selected + 1) % actions.len(),
+            KeyCode::Esc | KeyCode::Char('b') => break,
+            KeyCode::Enter => match actions[selected].0 {
+                GitHubUpdateAction::Download => {
+                    crate::updater::start_manual_update();
+                }
+                GitHubUpdateAction::CheckAgain => crate::updater::start_version_check(),
+                GitHubUpdateAction::Back => break,
+            },
+            _ => {}
+        }
+    }
+    drop(raw);
+    clear_screen()?;
+    Ok(())
+}
+
+const STARTUP_CHANNELS_KEY: &str = "telegram.auto_channels";
+
+fn selected_startup_channels(saved: &[String], value: Option<&str>) -> HashSet<String> {
+    let selections: Vec<String> = value
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    saved
+        .iter()
+        .filter(|channel| selections.contains(channel))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod auto_sync_tests {
+    use super::*;
+
+    #[test]
+    fn only_selected_saved_channels_are_synced() {
+        let saved = vec!["alpha".to_string(), "beta".to_string()];
+        assert!(selected_startup_channels(&saved, None).is_empty());
+        assert!(selected_startup_channels(&saved, Some("invalid")).is_empty());
+        assert_eq!(
+            selected_startup_channels(&saved, Some(r#"["beta","unknown","beta"]"#)),
+            HashSet::from(["beta".to_string()])
+        );
+        assert_eq!(
+            selected_startup_channels(&saved, Some(r#"["alpha","beta"]"#)).len(),
+            2
+        );
+    }
+}
+
+fn startup_channel_selection(saved: &[String]) -> HashSet<String> {
+    selected_startup_channels(saved, load_setting_value(STARTUP_CHANNELS_KEY).as_deref())
+}
+
+fn select_startup_telegram_channels() -> Result<()> {
+    let library = load_library()?;
+    if library.channels.is_empty() {
+        clear_screen()?;
+        println!("{}", tr("msg.no_saved_telegram_channels"));
+        prompt(tr("msg.press_enter_to_return"))?;
+        return Ok(());
+    }
+    let mut enabled = startup_channel_selection(&library.channels);
+    let mut selected = 0usize;
+    let mut stdout = io::stdout();
+    let raw = RawMode::new()?;
+    loop {
+        let height = crossterm::terminal::size()
+            .map(|(_, h)| h as usize)
+            .unwrap_or(24);
+        let page = height.saturating_sub(6).max(1);
+        let start = selected
+            .saturating_sub(page / 2)
+            .min(library.channels.len().saturating_sub(page));
+        let mut frame = format!(
+            "{} ({} {})\r\n{}\r\n\r\n",
+            tr("msg.startup_telegram_channels"),
+            enabled.len(),
+            tr("msg.selected"),
+            tr("msg.startup_channels_help")
+        );
+        for (index, channel) in library.channels.iter().enumerate().skip(start).take(page) {
+            frame.push_str(&format!(
+                "{} [{}] {}\r\n",
+                if index == selected { '>' } else { ' ' },
+                if enabled.contains(channel) { 'x' } else { ' ' },
+                telegram_channel_label(channel)
+            ));
+        }
+        draw_frame(&mut stdout, &frame)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => {
+                selected = selected
+                    .checked_sub(1)
+                    .unwrap_or(library.channels.len() - 1)
+            }
+            KeyCode::Down => selected = (selected + 1) % library.channels.len(),
+            KeyCode::Char(' ') => {
+                if !enabled.remove(&library.channels[selected]) {
+                    enabled.insert(library.channels[selected].clone());
+                }
+                let channels: Vec<_> = library
+                    .channels
+                    .iter()
+                    .filter(|channel| enabled.contains(*channel))
+                    .collect();
+                save_setting_value(STARTUP_CHANNELS_KEY, &serde_json::to_string(&channels)?)?;
+            }
+            KeyCode::Esc | KeyCode::Char('b') => break,
+            _ => {}
+        }
+    }
+    drop(raw);
+    clear_screen()?;
+    Ok(())
+}
+
+fn start_automatic_telegram_sync(library: &SavedLibrary) {
+    if !load_setting_bool("telegram.auto_sync", false) {
+        return;
+    }
+    let enabled = startup_channel_selection(&library.channels);
+    let channels: Vec<String> = library
+        .channels
+        .iter()
+        .filter(|channel| enabled.contains(*channel))
+        .cloned()
+        .collect();
+    if channels.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let runtime = runtime::Builder::new_multi_thread().enable_all().build()?;
+            let mut statuses = Vec::new();
+            for channel in channels {
+                let outcome = runtime.block_on(crate::telegram::sync_catalog_silent(&channel));
+                // Expose results in Settings data without interrupting an active player screen.
+                let status = match outcome {
+                    Ok(()) => format!("{}: OK", telegram_channel_label(&channel)),
+                    Err(error) => format!("{}: {error:#}", telegram_channel_label(&channel)),
+                };
+                statuses.push(status);
+                let _ = fs::write(".music-terminal/auto-sync-status.txt", statuses.join("\n"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::write(
+                ".music-terminal/auto-sync-status.txt",
+                format!("Auto-sync: {error:#}"),
+            );
+        }
+    });
 }
 
 fn manage_main_menu_visibility() -> Result<()> {

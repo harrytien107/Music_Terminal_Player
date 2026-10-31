@@ -24,11 +24,11 @@ use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, TranscriptEditorResult,
     TranscriptSettingsEditor, bold_text, clear_screen, draw_panel, draw_transcript_player_panels,
     format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_setting_value,
-    load_volume, manage_queue_with_adder, manage_transcript_settings,
-    playback_controls_with_transcript, playback_key_bindings_hint, player_title_row,
-    previous_track_index, progress_bar, prompt, prompt_or_escape, restart_pass_order,
-    save_setting_bool, save_volume, select_menu, select_menu_from, set_shuffle_order,
-    toggle_playback_key_bindings,
+    load_volume, manage_queue_with_adder, manage_transcript_settings, playback_bar_width,
+    playback_controls_with_youtube, playback_key_bindings_hint, playback_progress_or_volume,
+    player_title_row, previous_track_index, progress_bar, prompt, prompt_or_escape,
+    restart_pass_order, save_setting_bool, save_volume, select_menu, select_menu_from,
+    set_shuffle_order, toggle_playback_key_bindings, wrap_playback_status,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
@@ -1730,6 +1730,7 @@ fn play_youtube_tracks(
     let mut resume_after_replay = None;
     let mut play_next = 0usize;
     let mut volume = load_volume();
+    let mut last_volume_change = None;
     let mut shuffle = false;
     let mut loop_mode = LoopMode::Off;
     let mut rate = 1.0;
@@ -2018,6 +2019,7 @@ fn play_youtube_tracks(
             index,
             &playback,
             volume,
+            last_volume_change,
             shuffle,
             loop_mode,
             sponsor_enabled,
@@ -2169,11 +2171,13 @@ fn play_youtube_tracks(
             }
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(MAX_VOLUME);
+                last_volume_change = Some(Instant::now());
                 playback.set_volume(volume);
                 save_volume(volume)?;
             }
             KeyCode::Down | KeyCode::Char('-') => {
                 volume = (volume - 0.10).max(0.0);
+                last_volume_change = Some(Instant::now());
                 playback.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -2280,6 +2284,7 @@ fn draw_youtube_player(
     index: usize,
     playback: &YouTubePlayback,
     volume: f32,
+    last_volume_change: Option<Instant>,
     shuffle: bool,
     loop_mode: LoopMode,
     sponsor_enabled: bool,
@@ -2297,39 +2302,57 @@ fn draw_youtube_player(
     let total = duration
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
+    let time_text = format!("{}/{}", format_duration(elapsed), total);
     let mut rows = vec![
         player_title_row(tr("msg.track"), index, tracks.len(), &tracks[index].title),
         String::new(),
+    ];
+    let progress = playback_progress_or_volume(
         format!(
-            "[{}] {}/{} · {:.2}x{}",
-            progress_bar(elapsed, duration, 12),
+            "[{}] {}/{}",
+            progress_bar(elapsed, duration, playback_bar_width(&time_text)),
             format_duration(elapsed),
             total,
+        ),
+        volume,
+        last_volume_change,
+    );
+    let showing_volume = last_volume_change.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+    rows.push(progress);
+    if !showing_volume {
+        let details = format!(
+            "{:.2}x{}",
             playback.rate,
             playback
                 .bitrate_kbps
                 .map(|kbps| format!(" · {kbps} kbps"))
                 .unwrap_or_default()
-        ),
-        format!(
-            "{} · {:.0}% · {} {} · {} {}",
-            state,
-            volume * 100.0,
-            tr("msg.shuffle"),
-            if shuffle { tr("msg.on") } else { tr("msg.off") },
-            tr("msg.loop"),
-            loop_mode.label(),
-        ),
-        format!(
-            "SponsorBlock {} · {}",
-            if sponsor_enabled {
-                tr("msg.on")
-            } else {
-                tr("msg.off")
-            },
-            tr("msg.a_add_next_url_or_playlist")
-        ),
-    ];
+        );
+        let bar_row = rows.last_mut().expect("progress row exists");
+        if crate::util::playback_metadata_fits(bar_row, &details) {
+            bar_row.push_str(" · ");
+            bar_row.push_str(&details);
+        } else {
+            rows.extend(wrap_playback_status(&details));
+        }
+    }
+    rows.extend(wrap_playback_status(&format!(
+        "{} · {} {} · {} {}",
+        state,
+        tr("msg.shuffle"),
+        if shuffle { tr("msg.on") } else { tr("msg.off") },
+        tr("msg.loop"),
+        loop_mode.label(),
+    )));
+    rows.extend(wrap_playback_status(&format!(
+        "SponsorBlock {} · {}",
+        if sponsor_enabled {
+            tr("msg.on")
+        } else {
+            tr("msg.off")
+        },
+        tr("msg.a_add_next_url_or_playlist")
+    )));
     if load_setting_bool("playback.key_bindings", true) {
         rows.push(playback_key_bindings_hint());
         rows.extend(youtube_playback_controls());
@@ -2346,14 +2369,7 @@ fn draw_youtube_player(
 }
 
 fn youtube_playback_controls() -> Vec<String> {
-    let mut rows = playback_controls_with_transcript();
-    rows.pop();
-    rows.extend([
-        "├────────────────┼────────────────┼────────────────┤".to_string(),
-        tr("msg.seek_10s_0_25x_s_sponsors").to_string(),
-        "└────────────────┴────────────────┴────────────────┘".to_string(),
-    ]);
-    rows
+    playback_controls_with_youtube()
 }
 
 #[cfg(test)]
@@ -2680,10 +2696,8 @@ mod youtube_tests {
         assert!(controls.iter().any(|row| row.contains("[,/.] ±0.25x")));
         assert!(controls.iter().any(|row| row.contains("[s] sponsors")));
         assert!(controls.iter().any(|row| row.contains("[b] transcript")));
-        assert_eq!(
-            controls.last().unwrap(),
-            "└────────────────┴────────────────┴────────────────┘"
-        );
+        assert!(controls.last().unwrap().starts_with('└'));
+        assert!(controls.last().unwrap().ends_with('┘'));
     }
 
     #[test]

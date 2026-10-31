@@ -13,6 +13,7 @@ mod media_controls;
 mod telegram;
 #[cfg(test)]
 mod tests;
+mod updater;
 mod util;
 mod youtube;
 

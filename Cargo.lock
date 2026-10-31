@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "music-terminal-player"
-version = "0.1.0"
+version = "3.0.9"
 dependencies = [
  "aes",
  "anyhow",

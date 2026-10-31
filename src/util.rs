@@ -3,7 +3,7 @@ use std::fs;
 use std::hash::Hash;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1012,12 +1012,24 @@ pub(crate) fn select_menu_from(
     let mut selected = initial_selection.min(items.len() - 1);
     let mut stdout = io::stdout();
     loop {
+        let height = terminal::size()
+            .map(|(_, height)| height as usize)
+            .unwrap_or(24);
+        let title_height = if title.is_empty() {
+            0
+        } else {
+            title.lines().count() + 2
+        };
+        let page_size = height.saturating_sub(title_height + 2).max(1);
+        let start = selected
+            .saturating_sub(page_size / 2)
+            .min(items.len().saturating_sub(page_size));
         let mut frame = if title.is_empty() {
             String::new()
         } else {
             format!("{}\r\n\r\n", bold_menu_title(title))
         };
-        for (index, label) in items.iter().enumerate() {
+        for (index, label) in items.iter().enumerate().skip(start).take(page_size) {
             frame.push_str(&format!(
                 "{} {label}\r\n",
                 if index == selected { ">" } else { " " },
@@ -1294,18 +1306,79 @@ fn queue_table<T, Label>(
 where
     Label: Fn(&T) -> String,
 {
-    const WIDTH: usize = 34;
-    const PAGE_SIZE: usize = 12;
+    let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
+    queue_table_at_size(
+        queue,
+        current,
+        play_next,
+        selected,
+        label,
+        terminal_width,
+        terminal_height,
+    )
+}
+
+fn queue_table_at_size<T, Label>(
+    queue: &[T],
+    current: usize,
+    play_next: usize,
+    selected: usize,
+    label: &Label,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> String
+where
+    Label: Fn(&T) -> String,
+{
+    let page_size = (terminal_height as usize).saturating_sub(9).clamp(1, 12);
+    if terminal_width < 75 {
+        let width = (terminal_width as usize).saturating_sub(4).max(1);
+        let mut frame = format!(
+            "{} | {} {}\r\n\r\n",
+            tr("msg.playback_queue"),
+            queue.len(),
+            tr("msg.songs")
+        );
+        frame.push_str(&format!(
+            "{}\r\n{} {}\r\n",
+            bold_text(tr("msg.now_playing")),
+            if selected == current { '>' } else { ' ' },
+            fit_text(&label(&queue[current]), width)
+        ));
+        let start = current.saturating_add(1);
+        let end = queue.len();
+        let window = queue_window_start(selected, start, end, page_size);
+        for index in start.saturating_add(window)..end.min(start.saturating_add(window + page_size))
+        {
+            let section = if index <= current.saturating_add(play_next) {
+                tr("msg.next_in_queue")
+            } else {
+                tr("msg.next_from_track_list")
+            };
+            frame.push_str(&format!(
+                "{} {}: {}\r\n",
+                if index == selected { ">" } else { " " },
+                section,
+                fit_text(
+                    &label(&queue[index]),
+                    width.saturating_sub(visible_text_width(section) + 4).max(1)
+                )
+            ));
+        }
+        frame.push_str(tr("msg.up_down_select_enter_play_delete_unqueue_a"));
+        return frame;
+    }
+    let width = ((terminal_width as usize).saturating_sub(4) / 3).min(34);
     let queued_start = current.saturating_add(1).min(queue.len());
     let queued_end = queued_start.saturating_add(play_next).min(queue.len());
     let remaining_start = queued_end;
-    let queued_offset = queue_window_start(selected, queued_start, queued_end, PAGE_SIZE);
-    let remaining_offset = queue_window_start(selected, remaining_start, queue.len(), PAGE_SIZE);
+    let queued_offset = queue_window_start(selected, queued_start, queued_end, page_size);
+    let remaining_offset = queue_window_start(selected, remaining_start, queue.len(), page_size);
     let queued_visible_start = queued_start + queued_offset;
     let remaining_visible_start = remaining_start + remaining_offset;
-    let queued = &queue[queued_visible_start..queued_end.min(queued_visible_start + PAGE_SIZE)];
+    let queued = &queue[queued_visible_start..queued_end.min(queued_visible_start + page_size)];
     let remaining =
-        &queue[remaining_visible_start..queue.len().min(remaining_visible_start + PAGE_SIZE)];
+        &queue[remaining_visible_start..queue.len().min(remaining_visible_start + page_size)];
     let rows = queued.len().max(remaining.len()).max(1);
     let cell = |index: Option<usize>, item: Option<&T>| {
         item.map(|item| {
@@ -1315,25 +1388,25 @@ where
                     if index == Some(selected) { ">" } else { " " },
                     label(item)
                 ),
-                WIDTH,
+                width,
             )
         })
-        .unwrap_or_else(|| " ".repeat(WIDTH))
+        .unwrap_or_else(|| " ".repeat(width))
     };
     let mut frame = format!(
         "{} | {} {}\r\n\r\n┌{}┬{}┬{}┐\r\n│{}│{}│{}│\r\n├{}┼{}┼{}┤\r\n",
         tr("msg.playback_queue"),
         queue.len(),
         tr("msg.songs"),
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
-        bold_text(&fit_text(tr("msg.now_playing"), WIDTH)),
-        bold_text(&fit_text(tr("msg.next_in_queue"), WIDTH)),
-        bold_text(&fit_text(tr("msg.next_from_track_list"), WIDTH)),
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
+        "─".repeat(width),
+        "─".repeat(width),
+        "─".repeat(width),
+        bold_text(&fit_text(tr("msg.now_playing"), width)),
+        bold_text(&fit_text(tr("msg.next_in_queue"), width)),
+        bold_text(&fit_text(tr("msg.next_from_track_list"), width)),
+        "─".repeat(width),
+        "─".repeat(width),
+        "─".repeat(width),
     );
     for row in 0..rows {
         frame.push_str(&format!(
@@ -1354,9 +1427,9 @@ where
     }
     frame.push_str(&format!(
         "└{}┴{}┴{}┘\r\n\r\n{}",
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
-        "─".repeat(WIDTH),
+        "─".repeat(width),
+        "─".repeat(width),
+        "─".repeat(width),
         tr("msg.up_down_select_enter_play_delete_unqueue_a"),
     ));
     frame
@@ -1609,11 +1682,16 @@ where
 }
 
 pub(crate) fn playback_controls_with_lyrics() -> Vec<String> {
-    playback_controls_with_middle(tr("msg.b_lyrics_settings"))
+    playback_controls_with_middle(tr("msg.b_lyrics_settings"), false, player_panel_width())
 }
 
+#[cfg(test)]
 pub(crate) fn playback_controls_with_transcript() -> Vec<String> {
-    playback_controls_with_middle(tr("msg.b_transcript_settings"))
+    playback_controls_with_middle(tr("msg.b_transcript_settings"), false, player_panel_width())
+}
+
+pub(crate) fn playback_controls_with_youtube() -> Vec<String> {
+    playback_controls_with_middle(tr("msg.b_transcript_settings"), true, player_panel_width())
 }
 
 pub(crate) fn playback_key_bindings_hint() -> String {
@@ -1625,44 +1703,127 @@ pub(crate) fn toggle_playback_key_bindings() -> Result<()> {
     save_setting_bool("playback.key_bindings", visible)
 }
 
-fn playback_controls_with_middle(middle: &str) -> Vec<String> {
-    const CELL_WIDTH: usize = 14;
-    let controls = [
-        [
-            tr("msg.p_play_pause"),
-            tr("msg.v_previous"),
-            tr("msg.n_next"),
-        ],
-        [tr("msg.r_shuffle"), tr("msg.l_loop"), tr("msg.u_queue")],
-        [tr("msg.volume"), middle, tr("msg.q_quit")],
+fn playback_controls_with_middle(middle: &str, youtube: bool, width: usize) -> Vec<String> {
+    let mut controls = vec![
+        tr("msg.p_play_pause"),
+        tr("msg.v_previous"),
+        tr("msg.n_next"),
+        tr("msg.r_shuffle"),
+        tr("msg.l_loop"),
+        tr("msg.u_queue"),
+        tr("msg.volume"),
+        middle,
+        tr("msg.q_quit"),
     ];
+    if youtube {
+        controls.extend(
+            tr("msg.seek_10s_0_25x_s_sponsors")
+                .split('│')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty()),
+        );
+    }
+    playback_control_grid(&controls, width)
+}
 
-    let border = |left, middle, right| {
-        format!(
-            "{left}{}{middle}{}{middle}{}{right}",
-            "─".repeat(CELL_WIDTH + 2),
-            "─".repeat(CELL_WIDTH + 2),
-            "─".repeat(CELL_WIDTH + 2),
-        )
+fn playback_control_grid(controls: &[&str], width: usize) -> Vec<String> {
+    let columns = if width >= 52 {
+        3
+    } else if width >= 35 {
+        2
+    } else {
+        1
     };
-    let row = |cells: [&str; 3]| {
-        format!(
-            "│ {} │ {} │ {} │",
-            fit_text(cells[0], CELL_WIDTH),
-            fit_text(cells[1], CELL_WIDTH),
-            fit_text(cells[2], CELL_WIDTH),
-        )
+    if width < 18 {
+        return controls
+            .iter()
+            .map(|control| fit_text(control, width))
+            .collect();
+    }
+    let cell_width = (width.saturating_sub(columns * 3 + 1) / columns).min(14);
+    let border = |left: char, join: char, right: char| {
+        let segments = vec!["─".repeat(cell_width + 2); columns];
+        format!("{left}{}{right}", segments.join(&join.to_string()))
     };
+    let mut lines = vec![border('┌', '┬', '┐')];
+    for (index, group) in controls.chunks(columns).enumerate() {
+        if index > 0 && columns > 1 {
+            lines.push(border('├', '┼', '┤'));
+        }
+        let cells = (0..columns)
+            .map(|col| {
+                format!(
+                    " {} ",
+                    fit_text(group.get(col).copied().unwrap_or(""), cell_width)
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!("│{}│", cells.join("│")));
+    }
+    lines.push(border('└', '┴', '┘'));
+    lines
+}
 
-    vec![
-        border('┌', '┬', '┐'),
-        row(controls[0]),
-        border('├', '┼', '┤'),
-        row(controls[1]),
-        border('├', '┼', '┤'),
-        row(controls[2]),
-        border('└', '┴', '┘'),
-    ]
+pub(crate) fn player_panel_width() -> usize {
+    panel_available_width(terminal::size().map(|size| size.0).unwrap_or(80)).min(52)
+}
+
+fn panel_available_width(columns: u16) -> usize {
+    usize::from(columns).saturating_sub(5)
+}
+
+pub(crate) fn playback_bar_width(time_text: &str) -> usize {
+    player_panel_width()
+        .saturating_sub(visible_text_width(time_text) + 3)
+        .clamp(1, 12)
+}
+
+pub(crate) fn wrap_playback_status(text: &str) -> Vec<String> {
+    wrap_playback_status_at_width(text, player_panel_width())
+}
+
+pub(crate) fn playback_metadata_fits(progress: &str, metadata: &str) -> bool {
+    visible_text_width(progress) + 3 + visible_text_width(metadata) <= player_panel_width()
+}
+
+fn wrap_playback_status_at_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for field in text.split(" · ") {
+        let candidate = if current.is_empty() {
+            field.to_string()
+        } else {
+            format!("{current} · {field}")
+        };
+        if visible_text_width(&candidate) <= width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        for word in field.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            if visible_text_width(&candidate) > width && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 pub(crate) fn progress_bar(elapsed: Duration, total: Option<Duration>, width: usize) -> String {
@@ -1675,6 +1836,188 @@ pub(crate) fn progress_bar(elapsed: Duration, total: Option<Duration>, width: us
         })
         .unwrap_or(0);
     format!("{}{}", "/".repeat(filled), " ".repeat(width - filled))
+}
+
+pub(crate) fn playback_progress_or_volume(
+    progress: String,
+    volume: f32,
+    last_change: Option<Instant>,
+) -> String {
+    playback_progress_or_volume_at_width(progress, volume, last_change, player_panel_width())
+}
+
+fn playback_progress_or_volume_at_width(
+    progress: String,
+    volume: f32,
+    last_change: Option<Instant>,
+    available_width: usize,
+) -> String {
+    if !last_change.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        return progress;
+    }
+    let percentage = format!("{:.0}%", volume.clamp(0.0, 1.0) * 100.0);
+    let label = tr("msg.volume_meter");
+    let width = available_width
+        .saturating_sub(visible_text_width(label) + visible_text_width(&percentage) + 4)
+        .min(12);
+    let filled = (volume.clamp(0.0, 1.0) * width as f32).round() as usize;
+    format!(
+        "{label} [{}{}] {percentage}",
+        "/".repeat(filled),
+        " ".repeat(width - filled)
+    )
+}
+
+#[cfg(test)]
+mod responsive_player_tests {
+    use super::*;
+
+    #[test]
+    fn controls_use_available_columns_and_preserve_panel_borders() {
+        let controls = [
+            "[p] play/pause",
+            "[v] previous",
+            "[n] next",
+            "[r] shuffle",
+            "[l] loop",
+            "[u] queue",
+            "[↑/↓] volume",
+            "[b] lyrics",
+            "[q] quit",
+        ];
+        for terminal_columns in [20_u16, 24, 40, 52, 80, 120] {
+            let content_width = panel_available_width(terminal_columns).min(52);
+            let rendered = playback_control_grid(&controls, content_width);
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| visible_text_width(line) <= content_width)
+            );
+            let expected_columns = if content_width >= 52 {
+                3
+            } else if content_width >= 35 {
+                2
+            } else {
+                1
+            };
+            if content_width >= 18 {
+                assert!(rendered.first().unwrap().starts_with('┌'));
+                assert!(rendered.last().unwrap().ends_with('┘'));
+                assert_eq!(rendered[0].matches('┬').count(), expected_columns - 1);
+                assert!(
+                    !rendered
+                        .iter()
+                        .any(|line| line.starts_with('┌') && line.contains('…'))
+                );
+                if expected_columns == 1 {
+                    assert_eq!(rendered.len(), controls.len() + 2);
+                }
+            } else {
+                assert_eq!(rendered.len(), controls.len());
+            }
+            for line in panel_lines("Music Terminal", &rendered, content_width, false) {
+                assert!(visible_text_width(&line) <= usize::from(terminal_columns) - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_status_wraps_at_separators_and_respects_unicode_markers() {
+        let status = "playing · cache 100% · shuffle off · loop off";
+        assert_eq!(
+            wrap_playback_status_at_width(status, 24),
+            ["playing · cache 100%", "shuffle off · loop off"]
+        );
+        assert_eq!(
+            wrap_playback_status_at_width(status, 20),
+            ["playing · cache 100%", "shuffle off", "loop off"]
+        );
+        let styled = format!("{} · cache 100%", bold_text("đang phát"));
+        let wrapped = wrap_playback_status_at_width(&styled, 12);
+        assert!(wrapped.iter().all(|line| visible_text_width(line) <= 12));
+        assert!(wrapped.concat().contains("đang"));
+    }
+
+    #[test]
+    fn short_heights_preserve_controls_or_request_resize() {
+        let mut rows = vec![
+            "Track 1/9".into(),
+            "".into(),
+            "[////] 1:00/3:00".into(),
+            "playing".into(),
+            "".into(),
+        ];
+        rows.extend(playback_control_grid(
+            &["[p] play", "[n] next", "[q] quit"],
+            19,
+        ));
+        let compact = player_rows_for_height(&rows, 24 - 1 - 4).unwrap();
+        assert!(compact.iter().any(|line| line.ends_with('┘')));
+        assert!(player_rows_for_height(&rows, 10 - 1 - 4).is_none());
+    }
+
+    #[test]
+    fn narrow_volume_meter_preserves_percentage() {
+        let changed = Some(Instant::now());
+        let compact = playback_progress_or_volume_at_width("progress".into(), 0.67, changed, 18);
+        assert!(compact.starts_with("Volume ["));
+        assert!(compact.ends_with("67%"));
+        assert!(visible_text_width(&compact) <= 18);
+    }
+
+    #[test]
+    fn volume_replaces_progress_only_for_one_second_from_latest_press() {
+        let progress = "[////        ] 0:04/3:00".to_string();
+        let earlier = Instant::now() - Duration::from_millis(1100);
+        assert_eq!(
+            playback_progress_or_volume(progress.clone(), 0.5, None),
+            progress
+        );
+        assert_eq!(
+            playback_progress_or_volume(progress.clone(), 0.5, Some(earlier)),
+            progress
+        );
+        let first = Instant::now() - Duration::from_millis(900);
+        let second = Instant::now();
+        assert_eq!(
+            playback_progress_or_volume(progress.clone(), 0.5, Some(first)),
+            "Volume [//////      ] 50%"
+        );
+        assert_eq!(
+            playback_progress_or_volume(progress, 0.8, Some(second)),
+            "Volume [//////////  ] 80%"
+        );
+    }
+
+    #[test]
+    fn volume_bar_matches_playback_style_at_zero_partial_and_full_volume() {
+        let progress = "[////        ] 0:04/3:00".to_string();
+        let changed = Some(Instant::now());
+        for (volume, expected) in [
+            (0.0, "Volume [            ] 0%"),
+            (0.25, "Volume [///         ] 25%"),
+            (0.67, "Volume [////////    ] 67%"),
+            (1.0, "Volume [////////////] 100%"),
+        ] {
+            assert_eq!(
+                playback_progress_or_volume(progress.clone(), volume, changed),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn queue_stacks_in_narrow_terminal_and_keeps_selection_visible() {
+        let queue = ["first", "second", "third"];
+        let label = |entry: &&str| entry.to_string();
+        let narrow = queue_table_at_size(&queue, 0, 1, 2, &label, 52, 20);
+        let wide = queue_table_at_size(&queue, 0, 1, 2, &label, 100, 20);
+        assert!(narrow.contains(">"));
+        assert!(narrow.contains("third"));
+        assert!(!narrow.contains("┬"));
+        assert!(wide.contains("┬"));
+        assert!(wide.contains("third"));
+    }
 }
 
 pub(crate) fn fit_text(text: &str, width: usize) -> String {
@@ -1796,19 +2139,36 @@ pub(crate) fn marquee_text(text: &str, width: usize) -> String {
 }
 
 pub(crate) fn player_title_row(label: &str, index: usize, total: usize, title: &str) -> String {
-    let prefix = format!("{label} {}/{} | ", index + 1, total);
-    let available =
-        usize::from(terminal::size().map(|size| size.0).unwrap_or(80)).saturating_sub(4);
-    let panel_width = 52usize.min(available.max(28));
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let title_width = panel_width.saturating_sub(prefix_width).max(1);
+    player_title_at_width(label, index, total, title, player_panel_width())
+}
+
+fn player_title_at_width(
+    label: &str,
+    index: usize,
+    total: usize,
+    title: &str,
+    width: usize,
+) -> String {
+    let mut prefix = format!("{label} {}/{} | ", index + 1, total);
+    if visible_text_width(&prefix) + 5 > width {
+        prefix = format!("{}/{} ", index + 1, total);
+    }
+    if visible_text_width(&prefix) + 2 > width {
+        prefix = format!("#{} ", index + 1);
+    }
+    let title_width = width.saturating_sub(visible_text_width(&prefix));
     format!("{prefix}{}", bold_text(&marquee_text(title, title_width)))
 }
 
 pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
     let mut output = Vec::new();
     queue!(output, cursor::MoveTo(0, 0))?;
-    for (index, line) in frame.lines().enumerate() {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    for (index, line) in frame
+        .lines()
+        .take(rows.saturating_sub(1) as usize)
+        .enumerate()
+    {
         if index > 0 {
             queue!(output, cursor::MoveToNextLine(1))?;
         }
@@ -1818,7 +2178,8 @@ pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
             cursor::MoveToColumn(0),
             SetForegroundColor(NORMAL_TEXT_COLOR)
         )?;
-        let line = line.trim_end_matches('\r');
+        let line = fit_text(line.trim_end_matches('\r'), cols.saturating_sub(1) as usize);
+        let line = line.trim_end();
         let line = if index == 0 && !line.contains(BOLD_START) {
             bold_text(line)
         } else {
@@ -1851,15 +2212,14 @@ pub(crate) fn draw_frame(stdout: &mut io::Stdout, frame: &str) -> Result<()> {
 }
 
 pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) -> Result<()> {
-    let available =
-        usize::from(terminal::size().map(|size| size.0).unwrap_or(80)).saturating_sub(4);
+    let available = panel_available_width(terminal::size().map(|size| size.0).unwrap_or(80));
     let content = rows
         .iter()
-        .map(|row| UnicodeWidthStr::width(row.as_str()))
-        .chain([UnicodeWidthStr::width(title)])
+        .map(|row| visible_text_width(row))
+        .chain([visible_text_width(title)])
         .max()
         .unwrap_or(28);
-    let width = content.clamp(28, 60).min(available.max(28));
+    let width = content.clamp(1, 60).min(available);
     let mut frame = String::new();
     frame.push_str(&format!("┌{}┐\r\n", "─".repeat(width + 2)));
     frame.push_str(&format!("│ {} │\r\n", bold_text(&fit_text(title, width))));
@@ -1872,6 +2232,84 @@ pub(crate) fn draw_panel(stdout: &mut io::Stdout, title: &str, rows: &[String]) 
     draw_frame(stdout, &frame)
 }
 
+fn player_rows_for_height(rows: &[String], limit: usize) -> Option<Vec<String>> {
+    let mut visible = rows.to_vec();
+    while visible.last().is_some_and(String::is_empty) {
+        visible.pop();
+    }
+    while visible.len() > limit {
+        if let Some(index) = visible.iter().position(String::is_empty) {
+            visible.remove(index);
+        } else if let Some(index) = visible
+            .iter()
+            .position(|row| row.starts_with('├') && row.ends_with('┤'))
+        {
+            visible.remove(index);
+        } else if let Some(index) = visible
+            .iter()
+            .position(|row| *row == playback_key_bindings_hint())
+        {
+            visible.remove(index);
+        } else {
+            return None;
+        }
+    }
+    Some(visible)
+}
+
+fn small_terminal(columns: u16, height: u16) -> bool {
+    columns < 18 || height < 10
+}
+
+fn resize_terminal_message(stdout: &mut io::Stdout) -> Result<()> {
+    let columns = terminal::size().map(|size| size.0).unwrap_or(80);
+    let message = if columns < 8 {
+        "Resize"
+    } else if columns < 18 {
+        "Resize window"
+    } else {
+        "Resize terminal"
+    };
+    draw_frame(stdout, message)
+}
+
+fn lyrics_panel_layout(
+    terminal_width: usize,
+    player_width: usize,
+    prefer_side: bool,
+) -> (usize, bool) {
+    let side_by_side = prefer_side && terminal_width >= player_width.saturating_mul(2) + 10;
+    (player_width, side_by_side)
+}
+
+#[cfg(test)]
+mod lyrics_panel_layout_tests {
+    use super::{lyrics_panel_layout, panel_available_width, panel_lines, visible_text_width};
+
+    #[test]
+    fn player_and_lyrics_boxes_match_at_resized_terminal_widths() {
+        for columns in [20_u16, 24, 40, 52, 80, 120] {
+            let player_width = panel_available_width(columns).min(52);
+            let (lyrics_width, side_by_side) =
+                lyrics_panel_layout(usize::from(columns), player_width, true);
+            let player = panel_lines("Player", &["playing".to_string()], player_width, false);
+            let lyrics = panel_lines("Lyrics", &["Lời bài hát".to_string()], lyrics_width, true);
+
+            assert_eq!(player[0], lyrics[0], "terminal width {columns}");
+            assert_eq!(player.last(), lyrics.last(), "terminal width {columns}");
+            assert_eq!(lyrics_width, player_width, "terminal width {columns}");
+            assert!(visible_text_width(&player[0]) < usize::from(columns));
+
+            if side_by_side {
+                assert!(visible_text_width(&player[0]) * 2 + 1 < usize::from(columns));
+            }
+        }
+        assert!(!lyrics_panel_layout(80, 52, true).1);
+        assert!(lyrics_panel_layout(120, 52, true).1);
+        assert!(!lyrics_panel_layout(120, 52, false).1);
+    }
+}
+
 pub(crate) fn draw_player_panels(
     stdout: &mut io::Stdout,
     title: &str,
@@ -1882,69 +2320,52 @@ pub(crate) fn draw_player_panels(
     show_lyrics: bool,
     lyrics_editor: Option<&LyricsSettingsEditor>,
 ) -> Result<()> {
-    if !show_lyrics && lyrics_editor.is_none() {
-        return draw_panel(stdout, title, rows);
+    let (terminal_columns, terminal_height) = terminal::size().unwrap_or((80, 24));
+    if small_terminal(terminal_columns, terminal_height) {
+        return resize_terminal_message(stdout);
     }
-
-    let terminal_width = usize::from(terminal::size().map(|size| size.0).unwrap_or(80));
-    let left_content = rows
-        .iter()
-        .map(|row| UnicodeWidthStr::width(row.as_str()))
-        .chain([UnicodeWidthStr::width(title)])
-        .max()
-        .unwrap_or(28)
-        .clamp(28, 60);
-    let left_width = left_content.min(terminal_width.saturating_sub(4).max(28));
+    let usable_height = usize::from(terminal_height.saturating_sub(1));
+    let terminal_width = usize::from(terminal_columns);
+    let left_width = player_panel_width();
+    if !show_lyrics && lyrics_editor.is_none() {
+        let Some(visible) = player_rows_for_height(rows, usable_height.saturating_sub(4)) else {
+            return resize_terminal_message(stdout);
+        };
+        return draw_panel(stdout, title, &visible);
+    }
     let prefer_side = load_setting_value("lyrics.position").as_deref() != Some("below");
     let center_lyrics = load_setting_value("lyrics.alignment").as_deref() == Some("center");
-    let minimum_right_width = if lyrics_editor.is_some() { 36 } else { 24 };
-    let side_by_side =
-        prefer_side && terminal_width >= left_width + 4 + 1 + minimum_right_width + 4;
-    let maximum_lyrics_width = if side_by_side {
-        terminal_width
-            .saturating_sub(left_width + 9)
-            .clamp(minimum_right_width, 60)
+    let (lyrics_width, side_by_side) = lyrics_panel_layout(terminal_width, left_width, prefer_side);
+    let target_height = usable_height.saturating_sub(if side_by_side { 4 } else { 9 });
+    let Some(mut left_rows) = player_rows_for_height(rows, target_height)
+        .or_else(|| player_rows_for_height(rows, usable_height.saturating_sub(4)))
+    else {
+        return resize_terminal_message(stdout);
+    };
+    let lyrics_height = if side_by_side {
+        usable_height.saturating_sub(4)
     } else {
-        left_width
+        usable_height.saturating_sub(left_rows.len() + 8)
     };
     let (right_title, mut right_rows, center_right) = if let Some(editor) = lyrics_editor {
         (editor.title(), editor.rows(show_lyrics), false)
     } else {
         (
             tr("msg.lyrics"),
-            render_lyrics_panel_rows(
-                lyrics,
-                maximum_lyrics_width,
-                rows.len().max(5),
-                elapsed,
-                lyrics_scroll,
-            ),
+            render_lyrics_panel_rows(lyrics, lyrics_width, lyrics_height, elapsed, lyrics_scroll),
             center_lyrics,
         )
     };
-    let lyrics_width = if lyrics_editor.is_some() {
-        maximum_lyrics_width
-    } else {
-        let whole_lyrics_width = lyrics
-            .map(|lyrics| {
-                let timed_prefix = if lyrics.is_plain() { 0 } else { 2 };
-                lyrics.max_line_width().saturating_add(timed_prefix)
-            })
-            .unwrap_or_else(|| visible_text_width(tr("msg.no_embedded_lyrics")));
-        let plain_scroll_hint = lyrics
-            .is_some_and(Lyrics::is_plain)
-            .then(|| visible_text_width(tr("msg.page_up_down_scroll")))
-            .unwrap_or(0);
-        whole_lyrics_width
-            .max(plain_scroll_hint)
-            .max(visible_text_width(right_title))
-            .clamp(1, maximum_lyrics_width.max(1))
-    };
-    let mut left_rows = rows.to_vec();
     if side_by_side {
+        right_rows.truncate(usable_height.saturating_sub(4));
         let row_count = left_rows.len().max(right_rows.len());
         left_rows.resize(row_count, String::new());
         right_rows.resize(row_count, String::new());
+    } else {
+        right_rows.truncate(lyrics_height);
+    }
+    if !side_by_side && lyrics_height == 0 {
+        return draw_panel(stdout, title, &left_rows);
     }
     let left = panel_lines(title, &left_rows, left_width, false);
     let right = panel_lines(right_title, &right_rows, lyrics_width, center_right);
@@ -1969,27 +2390,37 @@ pub(crate) fn draw_transcript_player_panels(
     show_transcript: bool,
     transcript_editor: Option<&TranscriptSettingsEditor>,
 ) -> Result<()> {
-    if !show_transcript && transcript_editor.is_none() {
-        return draw_panel(stdout, title, rows);
+    let (terminal_columns, terminal_height) = terminal::size().unwrap_or((80, 24));
+    if small_terminal(terminal_columns, terminal_height) {
+        return resize_terminal_message(stdout);
     }
-
-    let terminal_width = usize::from(terminal::size().map(|size| size.0).unwrap_or(80));
-    let left_content = rows
-        .iter()
-        .map(|row| UnicodeWidthStr::width(row.as_str()))
-        .chain([UnicodeWidthStr::width(title)])
-        .max()
-        .unwrap_or(28)
-        .clamp(28, 60);
-    let left_width = left_content.min(terminal_width.saturating_sub(4).max(28));
+    let usable_height = usize::from(terminal_height.saturating_sub(1));
+    let terminal_width = usize::from(terminal_columns);
+    let left_width = player_panel_width();
+    if !show_transcript && transcript_editor.is_none() {
+        let Some(visible) = player_rows_for_height(rows, usable_height.saturating_sub(4)) else {
+            return resize_terminal_message(stdout);
+        };
+        return draw_panel(stdout, title, &visible);
+    }
     let prefer_side = load_setting_value("transcript.position").as_deref() != Some("below");
     let center_transcript = load_setting_value("transcript.alignment").as_deref() == Some("center");
     let minimum_right_width = if transcript_editor.is_some() { 38 } else { 24 };
-    let side_by_side =
-        prefer_side && terminal_width >= left_width + 4 + 1 + minimum_right_width + 4;
+    let side_by_side = prefer_side && terminal_width >= left_width + minimum_right_width + 10;
+    let target_height = usable_height.saturating_sub(if side_by_side { 4 } else { 9 });
+    let Some(mut left_rows) = player_rows_for_height(rows, target_height)
+        .or_else(|| player_rows_for_height(rows, usable_height.saturating_sub(4)))
+    else {
+        return resize_terminal_message(stdout);
+    };
+    let transcript_height = if side_by_side {
+        usable_height.saturating_sub(4)
+    } else {
+        usable_height.saturating_sub(left_rows.len() + 8)
+    };
     let transcript_width = if side_by_side {
         terminal_width
-            .saturating_sub(left_width + 9)
+            .saturating_sub(left_width + 10)
             .clamp(minimum_right_width, 60)
     } else {
         left_width
@@ -1999,15 +2430,20 @@ pub(crate) fn draw_transcript_player_panels(
     } else {
         (
             tr("msg.transcript"),
-            render_transcript_panel_rows(transcript, transcript_width, rows.len().max(5), elapsed),
+            render_transcript_panel_rows(transcript, transcript_width, transcript_height, elapsed),
             center_transcript,
         )
     };
-    let mut left_rows = rows.to_vec();
     if side_by_side {
+        right_rows.truncate(usable_height.saturating_sub(4));
         let row_count = left_rows.len().max(right_rows.len());
         left_rows.resize(row_count, String::new());
         right_rows.resize(row_count, String::new());
+    } else {
+        right_rows.truncate(transcript_height);
+    }
+    if !side_by_side && transcript_height == 0 {
+        return draw_panel(stdout, title, &left_rows);
     }
     let left = panel_lines(title, &left_rows, left_width, false);
     let right = panel_lines(right_title, &right_rows, transcript_width, center_right);

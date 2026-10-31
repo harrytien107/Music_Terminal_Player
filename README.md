@@ -26,6 +26,9 @@ A small terminal player for local libraries and online sources without the overh
 - Unicode-aware terminal panels, compact color-coded launcher actions, and queue columns
 - Portable or custom yt-dlp and FFmpeg setup with manual portable tool updates
 - Direct YouTube URL or playlist input from Quick play
+- Optional startup synchronization for selected saved Telegram channels (off by default)
+- Background GitHub release version checks at startup with manual ZIP installation from Settings, restart, and rollback
+- Responsive menu and queue layouts, plus a temporary volume meter in the player progress row
 
 ### Lyrics support for local files and telegram
 

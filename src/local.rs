@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::cursor;
@@ -18,10 +18,11 @@ use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
     draw_frame, draw_player_panels, format_duration, forward_track_index, insert_queue_next,
-    is_supported_audio_path, load_setting_bool, load_volume, manage_queue,
-    playback_controls_with_lyrics, playback_key_bindings_hint, player_title_row,
-    previous_track_index, progress_bar, restart_pass_order, save_setting_bool, save_volume,
-    set_shuffle_order, shuffle_slice, toggle_all, toggle_playback_key_bindings,
+    is_supported_audio_path, load_setting_bool, load_volume, manage_queue, playback_bar_width,
+    playback_controls_with_lyrics, playback_key_bindings_hint, playback_progress_or_volume,
+    player_title_row, previous_track_index, progress_bar, restart_pass_order, save_setting_bool,
+    save_volume, set_shuffle_order, shuffle_slice, toggle_all, toggle_playback_key_bindings,
+    wrap_playback_status,
 };
 const TRACK_LIST_PAGE_SIZE: usize = 12;
 
@@ -101,6 +102,7 @@ fn play_tracks_inner(
     let mut resume_after_replay = None;
     let mut play_next = 0usize;
     let mut volume = load_volume();
+    let mut last_volume_change = None;
     let mut shuffle = initially_shuffled;
     let mut loop_mode = LoopMode::Off;
     let mut lyrics_visible = load_setting_bool("playback.lyrics", true);
@@ -185,6 +187,7 @@ fn play_tracks_inner(
             duration,
             &sink,
             volume,
+            last_volume_change,
             shuffle,
             loop_mode,
             add_tracks.is_some(),
@@ -303,11 +306,13 @@ fn play_tracks_inner(
             }
             KeyCode::Left => {
                 volume = (volume - 0.01).max(0.0);
+                last_volume_change = Some(Instant::now());
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
             KeyCode::Right => {
                 volume = (volume + 0.01).min(MAX_VOLUME);
+                last_volume_change = Some(Instant::now());
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -402,11 +407,13 @@ fn play_tracks_inner(
             },
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
                 volume = (volume + 0.10).min(MAX_VOLUME);
+                last_volume_change = Some(Instant::now());
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
             KeyCode::Down | KeyCode::Char('-') => {
                 volume = (volume - 0.10).max(0.0);
+                last_volume_change = Some(Instant::now());
                 sink.set_volume(volume);
                 save_volume(volume)?;
             }
@@ -452,6 +459,7 @@ fn draw_player(
     duration: Option<Duration>,
     sink: &Sink,
     volume: f32,
+    last_volume_change: Option<Instant>,
     shuffle: bool,
     loop_mode: LoopMode,
     can_add_tracks: bool,
@@ -469,6 +477,7 @@ fn draw_player(
     let total = duration
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
+    let time_text = format!("{}/{}", format_duration(elapsed), total);
     let mut rows = vec![
         player_title_row(
             tr("msg.track"),
@@ -477,23 +486,26 @@ fn draw_player(
             &local_track_label(&tracks[index]),
         ),
         String::new(),
-        format!(
-            "[{}] {}/{}",
-            progress_bar(elapsed, duration, 12),
-            format_duration(elapsed),
-            total
+        playback_progress_or_volume(
+            format!(
+                "[{}] {}/{}",
+                progress_bar(elapsed, duration, playback_bar_width(&time_text)),
+                format_duration(elapsed),
+                total
+            ),
+            volume,
+            last_volume_change,
         ),
-        format!(
-            "{} · {:.0}% · {} {} · {} {}",
-            state,
-            volume * 100.0,
-            tr("msg.shuffle"),
-            if shuffle { tr("msg.on") } else { tr("msg.off") },
-            tr("msg.loop"),
-            loop_mode.label()
-        ),
-        String::new(),
     ];
+    rows.extend(wrap_playback_status(&format!(
+        "{} · {} {} · {} {}",
+        state,
+        tr("msg.shuffle"),
+        if shuffle { tr("msg.on") } else { tr("msg.off") },
+        tr("msg.loop"),
+        loop_mode.label()
+    )));
+    rows.push(String::new());
     if can_add_tracks {
         rows.push(tr("msg.a_add_youtube_url_or_playlist").to_string());
     }
