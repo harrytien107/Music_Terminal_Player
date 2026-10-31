@@ -319,7 +319,7 @@ fn stage_release_update(release: &ReleaseInfo) -> Result<()> {
     let _ = fs::remove_file(&archive);
     fs::write(
         Path::new(DATA_DIR).join("update-status.txt"),
-        format!("Update {} staged; will install after exit", release.tag),
+        format!("Update {} staged; restarting to install", release.tag),
     )?;
     install_after_exit(&current, &candidate, &stage, &std::env::current_dir()?)?;
     Ok(())

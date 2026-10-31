@@ -1,6 +1,6 @@
 language.code=vi
 language.name=Tiếng Việt
-language.version=21
+language.version=22
 msg.telegram_auto_sync=Tự đồng bộ Telegram
 msg.select_startup_channels=Chọn kênh Telegram tự đồng bộ khi mở ứng dụng
 msg.github_updates=Cập nhật từ GitHub
@@ -14,7 +14,7 @@ msg.github_no_windows_zip=Phiên bản này chưa có tệp ZIP Windows tương 
 msg.github_check_failed=Không thể kiểm tra GitHub
 msg.github_download_failed=Tải bản cập nhật thất bại
 msg.github_downloading=Đang tải và chuẩn bị bản cập nhật...
-msg.github_staged=Đã sẵn sàng — sẽ cài đặt khi bạn thoát.
+msg.github_staged=Đã sẵn sàng — đang cài đặt và khởi động lại...
 msg.github_download_and_update=Tải và cập nhật lên
 msg.github_check_again=Kiểm tra cập nhật lần nữa
 msg.startup_telegram_channels=Kênh Telegram tự đồng bộ khi mở ứng dụng

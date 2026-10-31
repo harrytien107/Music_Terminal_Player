@@ -656,6 +656,11 @@ fn manage_github_updates() -> Result<()> {
     let mut selected = 0usize;
     loop {
         let state = crate::updater::snapshot();
+        if matches!(state, crate::updater::UpdateState::Staged(_)) {
+            drop(raw);
+            let _ = clear_screen();
+            std::process::exit(0);
+        }
         let actions = github_update_actions(&state);
         selected = selected.min(actions.len() - 1);
         let (latest, status) = github_update_details(&state);
@@ -692,13 +697,22 @@ fn manage_github_updates() -> Result<()> {
         match key.code {
             KeyCode::Up => selected = selected.checked_sub(1).unwrap_or(actions.len() - 1),
             KeyCode::Down => selected = (selected + 1) % actions.len(),
-            KeyCode::Esc | KeyCode::Char('b') => break,
+            KeyCode::Esc | KeyCode::Char('b')
+                if !matches!(state, crate::updater::UpdateState::Downloading(_)) =>
+            {
+                break;
+            }
             KeyCode::Enter => match actions[selected].0 {
                 GitHubUpdateAction::Download => {
                     crate::updater::start_manual_update();
                 }
                 GitHubUpdateAction::CheckAgain => crate::updater::start_version_check(),
-                GitHubUpdateAction::Back => break,
+                GitHubUpdateAction::Back
+                    if !matches!(state, crate::updater::UpdateState::Downloading(_)) =>
+                {
+                    break;
+                }
+                GitHubUpdateAction::Back => {}
             },
             _ => {}
         }
