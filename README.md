@@ -69,4 +69,10 @@ music-terminal-player.exe --borderless
 
 ## Documentation
 
+Choose **Settings → Startup Window Size** to use Default, Small (52×24),
+Medium (80×30), Large (120×36), or Custom (minimum 40×20). Nondefault choices
+open a dedicated Windows Terminal window on the next launch. Other windows and
+global terminal settings are unaffected. If Windows Terminal cannot start, the
+player uses its existing window and displays a warning.
+
 See the [usage guide](docs/usage.md) for CLI commands, queues, playlists, language packs, data files, and current limitations.

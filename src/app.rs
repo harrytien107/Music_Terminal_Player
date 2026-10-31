@@ -18,6 +18,7 @@ use crate::local::{
     choose_local_tracks, collect_tracks, play_tracks, play_tracks_recently_added,
     play_tracks_shuffled,
 };
+use crate::startup_window::{SETTING_KEY, StartupWindowSize, parse_dimensions};
 use crate::telegram::{
     SESSION_FILE, TELEGRAM_CREDENTIALS_FILE, TelegramCatalogEntry, channel_catalog,
     choose_catalog_tracks, choose_private_channel, download_channel, normalize_channel_identity,
@@ -27,8 +28,8 @@ use crate::telegram::{
 use crate::util::{
     LIBRARY_FILE, PLAYLIST_FILE, PlayerExit, RawMode, bold_text, clear_screen, draw_frame,
     fit_text, load_setting_bool, load_setting_value, manage_lyrics_settings, menu_quit_key,
-    normalize_channel, prompt, save_setting_bool, save_setting_value, select_menu,
-    select_menu_from, toggle_all,
+    normalize_channel, prompt, prompt_or_escape, save_setting_bool, save_setting_value,
+    select_menu, select_menu_from, toggle_all,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,6 +520,11 @@ fn manage_settings() -> Result<()> {
             ),
             format!("♫  {}", tr("msg.select_startup_channels")),
             format!("↑  {}", tr("msg.github_updates")),
+            format!(
+                "▣  {}: {}",
+                tr("msg.startup_window_size"),
+                startup_window_size_label(StartupWindowSize::load())
+            ),
             format!("{} {}", fit_text("←", 2), tr("msg.back")),
         ];
         match select_menu_from(tr("msg.settings"), &items, selected)? {
@@ -554,7 +560,86 @@ fn manage_settings() -> Result<()> {
                 selected = 7;
                 manage_github_updates()?;
             }
-            Some(8) | None => return Ok(()),
+            Some(8) => {
+                selected = 8;
+                manage_startup_window_size()?;
+            }
+            Some(9) | None => return Ok(()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn startup_window_size_label(size: StartupWindowSize) -> String {
+    match size {
+        StartupWindowSize::Default => tr("msg.startup_size_default").to_string(),
+        StartupWindowSize::Small => format!("{} (52×24)", tr("msg.startup_size_small")),
+        StartupWindowSize::Medium => format!("{} (80×30)", tr("msg.startup_size_medium")),
+        StartupWindowSize::Large => format!("{} (120×36)", tr("msg.startup_size_large")),
+        StartupWindowSize::Custom(columns, rows) => {
+            format!("{} ({columns}×{rows})", tr("msg.startup_size_custom"))
+        }
+    }
+}
+
+fn manage_startup_window_size() -> Result<()> {
+    loop {
+        let current = StartupWindowSize::load();
+        let choices = [
+            StartupWindowSize::Default,
+            StartupWindowSize::Small,
+            StartupWindowSize::Medium,
+            StartupWindowSize::Large,
+            match current {
+                StartupWindowSize::Custom(_, _) => current,
+                _ => StartupWindowSize::Custom(80, 30),
+            },
+        ];
+        let mut items = choices
+            .iter()
+            .map(|size| {
+                format!(
+                    "{}  {}",
+                    if *size == current { "●" } else { "○" },
+                    startup_window_size_label(*size)
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(format!("←  {}", tr("msg.back")));
+        let title = format!(
+            "{}\n{}",
+            tr("msg.startup_window_size"),
+            tr("msg.startup_size_next_launch")
+        );
+        let selected = if matches!(current, StartupWindowSize::Custom(..)) {
+            4
+        } else {
+            choices
+                .iter()
+                .position(|size| *size == current)
+                .unwrap_or(0)
+        };
+        match select_menu_from(&title, &items, selected)? {
+            Some(index @ 0..=3) => {
+                save_setting_value(SETTING_KEY, &choices[index].as_setting())?;
+                return Ok(());
+            }
+            Some(4) => {
+                let Some(value) = prompt_or_escape(&format!("{} ", tr("msg.startup_size_prompt")))?
+                else {
+                    continue;
+                };
+                if let Some((columns, rows)) = parse_dimensions(&value) {
+                    save_setting_value(
+                        SETTING_KEY,
+                        &StartupWindowSize::Custom(columns, rows).as_setting(),
+                    )?;
+                    return Ok(());
+                }
+                println!("{}", tr("msg.startup_size_invalid"));
+                prompt(tr("msg.press_enter_to_return"))?;
+            }
+            Some(5) | None => return Ok(()),
             _ => unreachable!(),
         }
     }

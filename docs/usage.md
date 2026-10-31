@@ -34,6 +34,17 @@ Running or double-clicking the executable opens the boxed ten-action launcher wi
 
 Windows Terminal owns its shared top-level window, so `--borderless` does not alter Windows Terminal tabs. Command-line usage is available through `--help`.
 
+## Startup window size
+
+**Settings → Startup Window Size** offers Default (existing terminal settings),
+Small (52×24), Medium (80×30), Large (120×36), and Custom (enter columns x rows,
+e.g. `90x32`, at least 40 columns and 20 rows). The choice saves immediately
+and takes effect on the next launch. For nondefault sizes the app opens in a
+dedicated Windows Terminal window using `wt.exe -w new --size`; it forwards CLI
+arguments and preserves the current working directory. Other terminal windows
+and Windows Terminal global settings are not changed. If `wt.exe` is unavailable,
+the app starts in its current console and reports the problem.
+
 ## Language
 
 English is compiled into the executable, needs no language file, and always works offline. Opening `Language` checks the flat catalog at `https://raw.githubusercontent.com/harrytien107/Music_Terminal_Player/main/languages/index.json`. No optional pack downloads during startup.

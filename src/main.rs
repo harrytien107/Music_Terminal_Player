@@ -10,6 +10,7 @@ mod i18n;
 mod local;
 mod lyrics;
 mod media_controls;
+mod startup_window;
 mod telegram;
 #[cfg(test)]
 mod tests;
@@ -18,7 +19,30 @@ mod util;
 mod youtube;
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let is_relaunch = startup_window::consume_relaunch_marker(&mut args);
+    #[cfg(windows)]
+    if !is_relaunch
+        && let Some((columns, rows)) = startup_window::StartupWindowSize::load().dimensions()
+    {
+        let launch = (|| -> std::io::Result<()> {
+            let exe = env::current_exe()?;
+            let cwd = env::current_dir()?;
+            startup_window::terminal_command(&exe, &cwd, &args, columns, rows).spawn()?;
+            Ok(())
+        })();
+        match launch {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("Could not apply startup window size (Windows Terminal): {error}");
+                if args.iter().all(|arg| arg == "--borderless") {
+                    let _ = util::prompt("Press Enter to continue in the current window...");
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = is_relaunch;
     let borderless = args.iter().any(|arg| arg == "--borderless");
     let launched_interactively = args.iter().all(|arg| arg == "--borderless");
     if borderless {

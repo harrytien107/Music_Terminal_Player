@@ -1,6 +1,15 @@
 language.code=en
 language.name=English
 language.version=1
+msg.startup_window_size=Startup Window Size
+msg.startup_size_default=Default (terminal settings)
+msg.startup_size_small=Small
+msg.startup_size_medium=Medium
+msg.startup_size_large=Large
+msg.startup_size_custom=Custom
+msg.startup_size_next_launch=Changes take effect on the next launch. Requires Windows Terminal.
+msg.startup_size_prompt=Enter columns x rows (e.g. 90x32, minimum 40x20; Esc to cancel):
+msg.startup_size_invalid=Invalid size. Use at least 40 columns and 20 rows.
 msg.telegram_auto_sync=Telegram auto-sync
 msg.select_startup_channels=Choose channels to auto-sync on startup
 msg.github_updates=GitHub Updates

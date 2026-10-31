@@ -1,6 +1,15 @@
 language.code=vi
 language.name=Tiếng Việt
-language.version=22
+language.version=24
+msg.startup_window_size=Kích thước cửa sổ khi mở
+msg.startup_size_default=Mặc định (theo terminal)
+msg.startup_size_small=Nhỏ
+msg.startup_size_medium=Vừa
+msg.startup_size_large=Lớn
+msg.startup_size_custom=Tùy chỉnh
+msg.startup_size_next_launch=Áp dụng từ lần mở tiếp theo. Yêu cầu Windows Terminal.
+msg.startup_size_prompt=Nhập số cột x số hàng (ví dụ 90x32, tối thiểu 40x20; Esc để hủy):
+msg.startup_size_invalid=Kích thước không hợp lệ. Cần ít nhất 40 cột và 20 hàng.
 msg.telegram_auto_sync=Tự đồng bộ Telegram
 msg.select_startup_channels=Chọn kênh Telegram tự đồng bộ khi mở ứng dụng
 msg.github_updates=Cập nhật từ GitHub
