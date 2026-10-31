@@ -39,12 +39,13 @@ use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
     clear_screen, draw_frame, draw_player_panels, format_duration, format_elapsed,
-    forward_track_index, is_supported_audio_path, load_setting_bool, load_volume, manage_queue,
-    normalize_channel, playback_bar_width, playback_controls_with_lyrics,
-    playback_key_bindings_hint, playback_progress_or_volume, player_title_row,
-    previous_track_index, progress_bar, prompt, restart_pass_order, safe_file_name,
-    save_setting_bool, save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
-    toggle_playback_key_bindings, wrap_playback_status,
+    forward_track_index, is_supported_audio_path, load_setting_bool, load_volume,
+    lyrics_player_panel_width, manage_queue, normalize_channel,
+    playback_controls_with_lyrics_at_width, playback_key_bindings_hint,
+    playback_progress_or_volume_at_width, playback_progress_row_at_width, player_title_at_width,
+    previous_track_index, prompt, restart_pass_order, safe_file_name, save_setting_bool,
+    save_volume, select_menu, set_shuffle_order, shuffle_slice, toggle_all,
+    toggle_playback_key_bindings, wrap_playback_status_at_width,
 };
 
 pub(crate) const SESSION_FILE: &str = ".music-terminal/telegram.session";
@@ -3033,29 +3034,35 @@ fn draw_telegram_player(
         .map(format_duration)
         .unwrap_or_else(|| "?:??".to_string());
     let time_text = format!("{}/{}", format_duration(elapsed), total);
+    let player_width = lyrics_player_panel_width(lyrics_visible, lyrics_settings.is_some());
     let mut rows = vec![
-        player_title_row(tr("msg.track"), index, tracks.len(), &tracks[index].name),
+        player_title_at_width(
+            tr("msg.track"),
+            index,
+            tracks.len(),
+            &tracks[index].name,
+            player_width,
+        ),
         String::new(),
-        playback_progress_or_volume(
-            format!(
-                "[{}] {}/{}",
-                progress_bar(elapsed, duration, playback_bar_width(&time_text)),
-                format_duration(elapsed),
-                total
-            ),
+        playback_progress_or_volume_at_width(
+            playback_progress_row_at_width(elapsed, duration, &time_text, player_width),
             volume,
             last_volume_change,
+            player_width,
         ),
     ];
-    rows.extend(wrap_playback_status(&format!(
-        "{} · cache {} · {} {} · {} {}",
-        playback,
-        progress,
-        tr("msg.shuffle"),
-        if shuffle { tr("msg.on") } else { tr("msg.off") },
-        tr("msg.loop"),
-        loop_mode.label()
-    )));
+    rows.extend(wrap_playback_status_at_width(
+        &format!(
+            "{} · cache {} · {} {} · {} {}",
+            playback,
+            progress,
+            tr("msg.shuffle"),
+            if shuffle { tr("msg.on") } else { tr("msg.off") },
+            tr("msg.loop"),
+            loop_mode.label()
+        ),
+        player_width,
+    ));
     rows.push(String::new());
     if let Some(warning) = warning {
         rows.push(format!("{}: {warning}", tr("msg.warning")));
@@ -3069,7 +3076,7 @@ fn draw_telegram_player(
     }
     if load_setting_bool("playback.key_bindings", true) {
         rows.push(playback_key_bindings_hint());
-        rows.extend(playback_controls_with_lyrics());
+        rows.extend(playback_controls_with_lyrics_at_width(player_width));
     }
     draw_player_panels(
         stdout,

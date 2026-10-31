@@ -1681,8 +1681,13 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn playback_controls_with_lyrics() -> Vec<String> {
-    playback_controls_with_middle(tr("msg.b_lyrics_settings"), false, player_panel_width())
+    playback_controls_with_lyrics_at_width(player_panel_width())
+}
+
+pub(crate) fn playback_controls_with_lyrics_at_width(width: usize) -> Vec<String> {
+    playback_controls_with_middle(tr("msg.b_lyrics_settings"), false, width)
 }
 
 #[cfg(test)]
@@ -1778,6 +1783,31 @@ pub(crate) fn playback_bar_width(time_text: &str) -> usize {
         .clamp(1, 12)
 }
 
+pub(crate) fn playback_bar_width_at_width(time_text: &str, width: usize) -> usize {
+    width
+        .saturating_sub(visible_text_width(time_text) + 3)
+        .min(12)
+}
+
+pub(crate) fn playback_progress_row_at_width(
+    elapsed: Duration,
+    total: Option<Duration>,
+    time_text: &str,
+    width: usize,
+) -> String {
+    if visible_text_width(time_text) + 3 > width {
+        return fit_text(time_text, width);
+    }
+    format!(
+        "[{}] {time_text}",
+        progress_bar(
+            elapsed,
+            total,
+            playback_bar_width_at_width(time_text, width)
+        )
+    )
+}
+
 pub(crate) fn wrap_playback_status(text: &str) -> Vec<String> {
     wrap_playback_status_at_width(text, player_panel_width())
 }
@@ -1786,7 +1816,7 @@ pub(crate) fn playback_metadata_fits(progress: &str, metadata: &str) -> bool {
     visible_text_width(progress) + 3 + visible_text_width(metadata) <= player_panel_width()
 }
 
-fn wrap_playback_status_at_width(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_playback_status_at_width(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![];
     }
@@ -1846,7 +1876,7 @@ pub(crate) fn playback_progress_or_volume(
     playback_progress_or_volume_at_width(progress, volume, last_change, player_panel_width())
 }
 
-fn playback_progress_or_volume_at_width(
+pub(crate) fn playback_progress_or_volume_at_width(
     progress: String,
     volume: f32,
     last_change: Option<Instant>,
@@ -1963,6 +1993,61 @@ mod responsive_player_tests {
         assert!(compact.starts_with("Volume ["));
         assert!(compact.ends_with("67%"));
         assert!(visible_text_width(&compact) <= 18);
+    }
+
+    #[test]
+    fn adaptive_lyrics_player_rows_fit_the_allocated_width() {
+        let elapsed = Duration::from_secs(8);
+        let duration = Duration::from_secs(150);
+        let time_text = "0:08/2:30";
+        for width in [16, 17, 29, 41, 52] {
+            let title =
+                player_title_at_width("Track", 0, 907, "Tiếng Việt - a long song title", width);
+            assert!(visible_text_width(&title) <= width, "title width {width}");
+
+            let progress =
+                playback_progress_row_at_width(elapsed, Some(duration), time_text, width);
+            assert!(
+                visible_text_width(&progress) <= width,
+                "progress width {width}"
+            );
+            let long_time =
+                playback_progress_row_at_width(elapsed, Some(duration), "1:02:34/2:03:45", width);
+            assert!(
+                visible_text_width(&long_time) <= width,
+                "long time width {width}"
+            );
+            if width == 16 {
+                assert_eq!(long_time.trim_end(), "1:02:34/2:03:45");
+            }
+            let meter = playback_progress_or_volume_at_width(
+                progress.clone(),
+                0.67,
+                Some(Instant::now()),
+                width,
+            );
+            assert!(visible_text_width(&meter) <= width, "volume width {width}");
+            assert_eq!(
+                playback_progress_or_volume_at_width(progress.clone(), 0.67, None, width),
+                progress
+            );
+
+            let controls = playback_controls_with_lyrics_at_width(width);
+            assert!(
+                controls
+                    .iter()
+                    .all(|line| visible_text_width(line) <= width)
+            );
+            assert!(controls.iter().any(|line| line.contains("[p]")));
+            assert!(controls.iter().any(|line| line.contains("[q]")));
+
+            let status = wrap_playback_status_at_width(
+                "playing · cache 100% · shuffle off · loop off",
+                width,
+            );
+            assert!(status.iter().all(|line| visible_text_width(line) <= width));
+            assert!(status.join(" ").contains("loop off"));
+        }
     }
 
     #[test]
@@ -2142,7 +2227,7 @@ pub(crate) fn player_title_row(label: &str, index: usize, total: usize, title: &
     player_title_at_width(label, index, total, title, player_panel_width())
 }
 
-fn player_title_at_width(
+pub(crate) fn player_title_at_width(
     label: &str,
     index: usize,
     total: usize,
@@ -2273,40 +2358,70 @@ fn resize_terminal_message(stdout: &mut io::Stdout) -> Result<()> {
     draw_frame(stdout, message)
 }
 
-fn lyrics_panel_layout(
-    terminal_width: usize,
-    player_width: usize,
-    prefer_side: bool,
-) -> (usize, bool) {
-    let side_by_side = prefer_side && terminal_width >= player_width.saturating_mul(2) + 10;
-    (player_width, side_by_side)
+fn lyrics_panel_layout(terminal_width: usize, prefer_side: bool) -> Option<(usize, usize, bool)> {
+    let default_width = terminal_width.saturating_sub(5).min(52);
+    if !prefer_side {
+        return Some((default_width, default_width, false));
+    }
+
+    // Two framed panels (four columns each), their gap, and the reserved terminal column.
+    let budget = terminal_width.saturating_sub(10);
+    if budget < 16 + 14 {
+        return None;
+    }
+    if budget >= 104 {
+        return Some((52, 52, true));
+    }
+
+    let mut player = (budget * 42 / 100).clamp(16, 52);
+    let lyrics = (budget - player).min(52);
+    player += (budget - player - lyrics).min(52 - player);
+    Some((player, lyrics, true))
+}
+
+pub(crate) fn lyrics_player_panel_width(show_lyrics: bool, editing_lyrics: bool) -> usize {
+    if !show_lyrics && !editing_lyrics {
+        return player_panel_width();
+    }
+    let columns = terminal::size().map(|size| size.0).unwrap_or(80);
+    let prefer_side = load_setting_value("lyrics.position").as_deref() != Some("below");
+    lyrics_panel_layout(usize::from(columns), prefer_side)
+        .map(|(width, _, _)| width)
+        .unwrap_or(16)
 }
 
 #[cfg(test)]
 mod lyrics_panel_layout_tests {
-    use super::{lyrics_panel_layout, panel_available_width, panel_lines, visible_text_width};
+    use super::{lyrics_panel_layout, panel_lines, visible_text_width};
 
     #[test]
-    fn player_and_lyrics_boxes_match_at_resized_terminal_widths() {
+    fn lyrics_stay_beside_player_within_terminal_width() {
         for columns in [20_u16, 24, 40, 52, 80, 120] {
-            let player_width = panel_available_width(columns).min(52);
-            let (lyrics_width, side_by_side) =
-                lyrics_panel_layout(usize::from(columns), player_width, true);
+            let layout = lyrics_panel_layout(usize::from(columns), true);
+            if columns < 40 {
+                assert!(layout.is_none(), "terminal width {columns}");
+                continue;
+            }
+            let (player_width, lyrics_width, side_by_side) = layout.unwrap();
             let player = panel_lines("Player", &["playing".to_string()], player_width, false);
             let lyrics = panel_lines("Lyrics", &["Lời bài hát".to_string()], lyrics_width, true);
 
-            assert_eq!(player[0], lyrics[0], "terminal width {columns}");
-            assert_eq!(player.last(), lyrics.last(), "terminal width {columns}");
-            assert_eq!(lyrics_width, player_width, "terminal width {columns}");
+            assert!(side_by_side, "terminal width {columns}");
+            assert!(player_width >= 16 && lyrics_width >= 14);
+            assert!(player_width <= 52 && lyrics_width <= 52);
             assert!(visible_text_width(&player[0]) < usize::from(columns));
-
-            if side_by_side {
-                assert!(visible_text_width(&player[0]) * 2 + 1 < usize::from(columns));
-            }
+            assert!(
+                visible_text_width(&player[0]) + visible_text_width(&lyrics[0]) + 1
+                    < usize::from(columns)
+            );
+            assert_eq!(player[0].matches('┌').count(), 1);
         }
-        assert!(!lyrics_panel_layout(80, 52, true).1);
-        assert!(lyrics_panel_layout(120, 52, true).1);
-        assert!(!lyrics_panel_layout(120, 52, false).1);
+        assert_eq!(lyrics_panel_layout(40, true), Some((16, 14, true)));
+        assert_eq!(lyrics_panel_layout(52, true), Some((17, 25, true)));
+        assert_eq!(lyrics_panel_layout(80, true), Some((29, 41, true)));
+        assert_eq!(lyrics_panel_layout(120, true), Some((52, 52, true)));
+        assert_eq!(lyrics_panel_layout(120, false), Some((52, 52, false)));
+        assert_eq!(lyrics_panel_layout(40, false), Some((35, 35, false)));
     }
 }
 
@@ -2326,7 +2441,6 @@ pub(crate) fn draw_player_panels(
     }
     let usable_height = usize::from(terminal_height.saturating_sub(1));
     let terminal_width = usize::from(terminal_columns);
-    let left_width = player_panel_width();
     if !show_lyrics && lyrics_editor.is_none() {
         let Some(visible) = player_rows_for_height(rows, usable_height.saturating_sub(4)) else {
             return resize_terminal_message(stdout);
@@ -2335,7 +2449,11 @@ pub(crate) fn draw_player_panels(
     }
     let prefer_side = load_setting_value("lyrics.position").as_deref() != Some("below");
     let center_lyrics = load_setting_value("lyrics.alignment").as_deref() == Some("center");
-    let (lyrics_width, side_by_side) = lyrics_panel_layout(terminal_width, left_width, prefer_side);
+    let Some((left_width, lyrics_width, side_by_side)) =
+        lyrics_panel_layout(terminal_width, prefer_side)
+    else {
+        return resize_terminal_message(stdout);
+    };
     let target_height = usable_height.saturating_sub(if side_by_side { 4 } else { 9 });
     let Some(mut left_rows) = player_rows_for_height(rows, target_height)
         .or_else(|| player_rows_for_height(rows, usable_height.saturating_sub(4)))
