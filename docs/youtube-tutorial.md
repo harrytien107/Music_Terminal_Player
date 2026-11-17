@@ -44,6 +44,20 @@ The player streams audio through FFmpeg. It does not save a complete YouTube med
 
 The new tracks are added under `Next in queue` while current audio continues.
 
+## Use YouTube chapters
+
+1. While a video is playing, press `c` to open **YouTube Chapters**.
+2. If chapters are available, use `Up` / `Down` to choose one, or `Page Up` / `Page Down` to scroll through a long list.
+3. Press `Enter` to jump to that chapter's start time, or `Esc` to close the menu without seeking.
+
+The `>` marker indicates your selected chapter; `♪` indicates the chapter currently playing. Chapters load in the background when you first open the menu for a video. A video without chapter data displays **No chapters available**. If loading fails, press `r` or `Enter` to try again. Playback continues during the lookup; seeking keeps your volume, speed, and pause state.
+
+## Optional browser authentication
+
+If YouTube asks you to sign in or reports that it cannot confirm you are not a bot, open **Play YouTube audio → YouTube Authentication**. You can select **No authentication** (default), **Thorium**, **Google Chrome**, **Vivaldi**, **Zen Browser**, or a **Cookies file (cookies.txt)**. For browser cookies, choose the profile signed in to YouTube. Zen uses yt-dlp's Firefox profile handling.
+
+The player stores the selected browser/profile path, not the extracted cookie values. Browser cookie databases may be locked or encrypted: close the chosen browser fully and retry. If needed, export a Netscape-format `cookies.txt` file and select **Cookies file** instead. Keep that file private because its cookies can grant access to your account. Authentication cannot guarantee that YouTube accepts a request. See the [yt-dlp cookies documentation](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies).
+
 ## Useful playback keys
 
 | Key | Action |
@@ -54,6 +68,7 @@ The new tracks are added under `Next in queue` while current audio continues.
 | `Left` / `Right` | Seek backward or forward 10 seconds |
 | `,` / `.` | Change speed by 0.25x |
 | `s` | Toggle configured SponsorBlock skipping for this queue |
+| `c` | Open YouTube Chapters |
 | `a` | Add another URL or playlist |
 | `u` | Open the queue |
 | `b` or `Esc` | Return to the previous menu |
@@ -86,5 +101,6 @@ The player saves a custom pair only after both tools pass validation. The built-
 - Confirm FFmpeg is still present at the configured path.
 - Check the internet connection.
 - Retry later if YouTube temporarily rejects the stream.
+- If YouTube requires sign-in, select a signed-in browser profile under **YouTube Authentication**, or try a cookies.txt file.
 
 For every option and command, see the [full usage guide](usage.md).

@@ -36,6 +36,7 @@ use crate::audio_output::AudioOutput;
 use crate::i18n::tr;
 use crate::lyrics::{Lyrics, read_embedded_lyrics};
 use crate::media_controls::{MediaCommand, MediaControls};
+use crate::spicylyrics::{SpicyLyricsLookup, TrackQuery};
 use crate::util::{
     DATA_DIR, LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
     clear_screen, draw_frame, draw_player_panels, format_duration, format_elapsed,
@@ -1586,6 +1587,7 @@ async fn play_telegram_tracks(
     let mut lyrics_settings = None;
     let mut lyrics_scroll = 0usize;
     let mut lyrics_index = index;
+    let mut spicy_lyrics = SpicyLyricsLookup::new();
     let mut active = start_catalog_track(
         &client,
         output.as_ref().expect("audio output available").stream(),
@@ -1764,6 +1766,11 @@ async fn play_telegram_tracks(
         }
 
         watchdog.pulse(LOOP_RENDER);
+        spicy_lyrics.update(
+            &format!("{}:{}", tracks[index].channel, tracks[index].message_id),
+            TrackQuery::from_name(&tracks[index].name, active.duration),
+            active.lyrics.as_ref(),
+        );
         draw_telegram_player(
             &mut stdout,
             &tracks,
@@ -1780,7 +1787,8 @@ async fn play_telegram_tracks(
             &active.shared,
             loop_mode,
             active.warning,
-            active.lyrics.as_ref(),
+            spicy_lyrics.display(active.lyrics.as_ref()),
+            spicy_lyrics.attribution(active.lyrics.as_ref()),
             lyrics_scroll,
             lyrics_visible,
             lyrics_settings.as_ref(),
@@ -3002,6 +3010,7 @@ fn draw_telegram_player(
     loop_mode: LoopMode,
     warning: Option<&str>,
     lyrics: Option<&Lyrics>,
+    attribution: Option<&[String]>,
     lyrics_scroll: usize,
     lyrics_visible: bool,
     lyrics_settings: Option<&LyricsSettingsEditor>,
@@ -3083,6 +3092,7 @@ fn draw_telegram_player(
         "Music Terminal Player · Telegram",
         &rows,
         lyrics,
+        attribution,
         elapsed,
         lyrics_scroll,
         lyrics_visible,

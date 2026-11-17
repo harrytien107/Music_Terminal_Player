@@ -280,6 +280,67 @@ pub(crate) fn read_embedded_lyrics(path: &Path) -> Result<Option<Lyrics>> {
     Ok(lyrics)
 }
 
+/// Read optional audio tags on a lookup worker, keeping filesystem probing out of the UI loop.
+pub(crate) fn read_track_tags(
+    path: &Path,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let file = File::open(path).ok()?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut probe = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let mut tags = (None, None, None);
+    if let Some(mut metadata) = probe.metadata.get() {
+        collect_track_tags(&mut metadata, &mut tags);
+    }
+    collect_track_tags(&mut probe.format.metadata(), &mut tags);
+    Some(tags)
+}
+
+fn collect_track_tags(
+    metadata: &mut Metadata<'_>,
+    tags: &mut (Option<String>, Option<String>, Option<String>),
+) {
+    loop {
+        if let Some(revision) = metadata.current() {
+            for tag in revision.tags() {
+                let Value::String(value) = &tag.value else {
+                    continue;
+                };
+                let value = value.trim();
+                if value.is_empty() || value.len() > 300 {
+                    continue;
+                }
+                let key = tag.key.to_ascii_lowercase();
+                if tag.std_key == Some(StandardTagKey::TrackTitle)
+                    || matches!(key.as_str(), "title" | "tracktitle")
+                {
+                    tags.0 = Some(value.into());
+                } else if tag.std_key == Some(StandardTagKey::Artist)
+                    || matches!(key.as_str(), "artist" | "albumartist")
+                {
+                    tags.1 = Some(value.into());
+                } else if tag.std_key == Some(StandardTagKey::Album) || key == "album" {
+                    tags.2 = Some(value.into());
+                }
+            }
+        }
+        if metadata.is_latest() {
+            break;
+        }
+        metadata.pop();
+    }
+}
+
 fn collect_metadata(metadata: &mut Metadata<'_>, candidates: &mut Vec<String>) {
     loop {
         if let Some(revision) = metadata.current() {
@@ -460,7 +521,7 @@ fn parse_lrc_timestamp(value: &str) -> Option<u64> {
     Some(minutes * 60_000 + (seconds * 1000.0).round() as u64)
 }
 
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
     }

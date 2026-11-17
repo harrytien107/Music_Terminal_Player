@@ -1,11 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -23,16 +26,24 @@ use crate::media_controls::{MediaCommand, MediaControls};
 use crate::util::{
     DATA_DIR, LoopMode, MAX_VOLUME, PlayerExit, RawMode, TranscriptEditorResult,
     TranscriptSettingsEditor, bold_text, clear_screen, draw_panel, draw_transcript_player_panels,
-    format_duration, forward_track_index, insert_queue_next, load_setting_bool, load_setting_value,
-    load_volume, manage_queue_with_adder, manage_transcript_settings, playback_bar_width,
-    playback_controls_with_youtube, playback_key_bindings_hint, playback_progress_or_volume,
-    player_title_row, previous_track_index, progress_bar, prompt, prompt_or_escape,
-    restart_pass_order, save_setting_bool, save_volume, select_menu, select_menu_from,
-    set_shuffle_order, toggle_playback_key_bindings, wrap_playback_status,
+    fit_text, format_duration, forward_track_index, insert_queue_next, load_setting_bool,
+    load_setting_value, load_volume, manage_queue_with_adder, manage_transcript_settings,
+    playback_bar_width, playback_controls_with_youtube, playback_key_bindings_hint,
+    playback_progress_or_volume, player_title_row, previous_track_index, progress_bar, prompt,
+    prompt_or_escape, restart_pass_order, save_setting_bool, save_setting_value, save_volume,
+    select_menu, select_menu_from, set_shuffle_order, toggle_playback_key_bindings,
+    wrap_playback_status,
 };
 
 const TOOLS_FILE: &str = ".music-terminal/youtube-tools.txt";
 const SPONSORBLOCK_SETTINGS_FILE: &str = ".music-terminal/youtube-sponsorblock.txt";
+const YOUTUBE_AUTH_METHOD: &str = "youtube.auth.method";
+const YOUTUBE_AUTH_PROFILE: &str = "youtube.auth.thorium_profile";
+const YOUTUBE_AUTH_BROWSER_PROFILE: &str = "youtube.auth.browser_profile";
+const YOUTUBE_AUTH_CHROME_PROFILE: &str = "youtube.auth.chrome_profile";
+const YOUTUBE_AUTH_VIVALDI_PROFILE: &str = "youtube.auth.vivaldi_profile";
+const YOUTUBE_AUTH_ZEN_PROFILE: &str = "youtube.auth.zen_profile";
+const YOUTUBE_AUTH_COOKIES_FILE: &str = "youtube.auth.cookies_file";
 const AUDIO_CHANNELS: u16 = 2;
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const SEEK_STEP: Duration = Duration::from_secs(10);
@@ -111,9 +122,520 @@ struct YouTubeTrack {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct YouTubeChapter {
+    title: String,
+    start: Duration,
+    end: Option<Duration>,
+}
+
+enum ChapterLoadState {
+    Loading,
+    Ready(Vec<YouTubeChapter>),
+    Failed(String),
+}
+
+struct ChaptersMenu {
+    video_id: String,
+    selected: usize,
+    scroll: usize,
+    seek_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TranscriptChoice {
     language: String,
     automatic: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum YouTubeAuthentication {
+    None,
+    Thorium { profile: String },
+    Chrome { profile: String },
+    Vivaldi { profile: String },
+    Zen { profile: String },
+    CookiesFile { path: PathBuf },
+}
+
+impl YouTubeAuthentication {
+    fn from_values(method: Option<&str>, profile: Option<&str>, file: Option<&str>) -> Self {
+        match method {
+            Some("thorium") => Self::Thorium {
+                profile: profile.unwrap_or("Default").to_string(),
+            },
+            Some("chrome") => Self::Chrome {
+                profile: profile.unwrap_or("Default").to_string(),
+            },
+            Some("vivaldi") => Self::Vivaldi {
+                profile: profile.unwrap_or("Default").to_string(),
+            },
+            Some("zen") => Self::Zen {
+                profile: profile.unwrap_or("").to_string(),
+            },
+            Some("file") => Self::CookiesFile {
+                path: PathBuf::from(file.unwrap_or("")),
+            },
+            _ => Self::None,
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Thorium { .. } => "thorium",
+            Self::Chrome { .. } => "chrome",
+            Self::Vivaldi { .. } => "vivaldi",
+            Self::Zen { .. } => "zen",
+            Self::CookiesFile { .. } => "file",
+        }
+    }
+}
+
+fn load_youtube_authentication() -> YouTubeAuthentication {
+    let method = load_setting_value(YOUTUBE_AUTH_METHOD);
+    let profile = if method.as_deref() == Some("thorium") {
+        load_setting_value(YOUTUBE_AUTH_PROFILE)
+    } else {
+        method.as_deref().and_then(load_selected_browser_profile)
+    };
+    YouTubeAuthentication::from_values(
+        method.as_deref(),
+        profile.as_deref(),
+        load_setting_value(YOUTUBE_AUTH_COOKIES_FILE).as_deref(),
+    )
+}
+
+fn browser_profile_setting_key(method: &str) -> Option<&'static str> {
+    match method {
+        "chrome" => Some(YOUTUBE_AUTH_CHROME_PROFILE),
+        "vivaldi" => Some(YOUTUBE_AUTH_VIVALDI_PROFILE),
+        "zen" => Some(YOUTUBE_AUTH_ZEN_PROFILE),
+        _ => None,
+    }
+}
+
+fn load_selected_browser_profile(method: &str) -> Option<String> {
+    load_setting_value(browser_profile_setting_key(method)?).or_else(|| {
+        // Older versions used one shared profile setting for all three browsers.
+        // Apply it only to the previously selected browser during migration.
+        (load_setting_value(YOUTUBE_AUTH_METHOD).as_deref() == Some(method))
+            .then(|| load_setting_value(YOUTUBE_AUTH_BROWSER_PROFILE))
+            .flatten()
+    })
+}
+
+fn thorium_user_data_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("Thorium").join("User Data"))
+}
+
+fn browser_user_data_dir(method: &str) -> Option<PathBuf> {
+    match method {
+        "thorium" => thorium_user_data_dir(),
+        "chrome" => std::env::var_os("LOCALAPPDATA").map(|base| {
+            PathBuf::from(base)
+                .join("Google")
+                .join("Chrome")
+                .join("User Data")
+        }),
+        "vivaldi" => std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Vivaldi").join("User Data")),
+        "zen" => {
+            std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("zen").join("Profiles"))
+        }
+        _ => None,
+    }
+}
+
+fn browser_profiles(method: &str, root: &Path) -> Result<Vec<String>> {
+    if !root.is_dir() {
+        bail!("{}", tr("msg.youtube_browser_not_found"));
+    }
+    if method != "zen" {
+        return thorium_profiles(root);
+    }
+    let mut profiles = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir() && entry.path().join("prefs.js").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    profiles.sort();
+    Ok(profiles)
+}
+
+fn browser_auth_arguments(method: &str, profile: &str, root: &Path) -> Result<Vec<OsString>> {
+    let valid_name = if method == "zen" {
+        !profile.is_empty() && !profile.contains(['/', '\\']) && profile != "." && profile != ".."
+    } else {
+        valid_thorium_profile(profile)
+    };
+    if !valid_name || !root.join(profile).is_dir() {
+        bail!("{}", tr("msg.youtube_browser_profile_missing"));
+    }
+    let directory = root.join(profile);
+    let has_cookies = if method == "zen" {
+        directory.join("cookies.sqlite").is_file()
+    } else {
+        directory.join("Network").join("Cookies").is_file() || directory.join("Cookies").is_file()
+    };
+    if !has_cookies {
+        bail!("{}", tr("msg.youtube_browser_cookies_missing"));
+    }
+    let mut argument = OsString::from(match method {
+        "thorium" => "chromium:",
+        "chrome" => "chrome:",
+        "vivaldi" => "vivaldi:",
+        "zen" => "firefox:",
+        _ => bail!("unsupported browser"),
+    });
+    argument.push(directory.as_os_str());
+    Ok(vec![OsString::from("--cookies-from-browser"), argument])
+}
+
+fn valid_thorium_profile(name: &str) -> bool {
+    name == "Default"
+        || name
+            .strip_prefix("Profile ")
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()))
+}
+
+fn thorium_profiles(root: &Path) -> Result<Vec<String>> {
+    if !root.is_dir() {
+        bail!("{}", tr("msg.thorium_not_found"));
+    }
+    let mut profiles = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (valid_thorium_profile(&name) && entry.path().is_dir()).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by_key(|name| {
+        (
+            name != "Default",
+            name.strip_prefix("Profile ")
+                .unwrap_or("0")
+                .parse::<u32>()
+                .unwrap_or(u32::MAX),
+        )
+    });
+    Ok(profiles)
+}
+
+fn validate_cookies_file(path: &Path) -> Result<()> {
+    let file =
+        fs::File::open(path).map_err(|_| anyhow::anyhow!("{}", tr("msg.cookies_file_missing")))?;
+    // Only inspect the format header, never the cookie entries or values.
+    let mut header = String::new();
+    BufReader::new(file.take(256)).read_line(&mut header)?;
+    if !matches!(
+        header.trim(),
+        "# Netscape HTTP Cookie File" | "# HTTP Cookie File"
+    ) {
+        bail!("{}", tr("msg.cookies_file_format"));
+    }
+    Ok(())
+}
+
+fn youtube_auth_arguments(
+    auth: &YouTubeAuthentication,
+    thorium_root: Option<&Path>,
+) -> Result<Vec<OsString>> {
+    match auth {
+        YouTubeAuthentication::None => Ok(Vec::new()),
+        YouTubeAuthentication::Thorium { profile } => {
+            let root = thorium_root.context(tr("msg.thorium_not_found"))?;
+            if !valid_thorium_profile(profile) || !root.join(profile).is_dir() {
+                bail!("{}", tr("msg.thorium_profile_missing"));
+            }
+            let directory = root.join(profile);
+            if !directory.join("Network").join("Cookies").is_file()
+                && !directory.join("Cookies").is_file()
+            {
+                bail!("{}", tr("msg.thorium_cookies_missing"));
+            }
+            let mut argument = OsString::from("chromium:");
+            argument.push(directory.as_os_str());
+            Ok(vec![OsString::from("--cookies-from-browser"), argument])
+        }
+        YouTubeAuthentication::Chrome { profile } => browser_auth_arguments(
+            "chrome",
+            profile,
+            &browser_user_data_dir("chrome").context(tr("msg.youtube_browser_not_found"))?,
+        ),
+        YouTubeAuthentication::Vivaldi { profile } => browser_auth_arguments(
+            "vivaldi",
+            profile,
+            &browser_user_data_dir("vivaldi").context(tr("msg.youtube_browser_not_found"))?,
+        ),
+        YouTubeAuthentication::Zen { profile } => browser_auth_arguments(
+            "zen",
+            profile,
+            &browser_user_data_dir("zen").context(tr("msg.youtube_browser_not_found"))?,
+        ),
+        YouTubeAuthentication::CookiesFile { path } => {
+            validate_cookies_file(path)?;
+            Ok(vec![
+                OsString::from("--cookies"),
+                path.as_os_str().to_os_string(),
+            ])
+        }
+    }
+}
+
+fn append_youtube_auth_options(
+    command: &mut Command,
+    auth: &YouTubeAuthentication,
+    thorium_root: Option<&Path>,
+    use_android_client: bool,
+) -> Result<()> {
+    command.args(youtube_auth_arguments(auth, thorium_root)?);
+    if use_android_client && *auth == YouTubeAuthentication::None {
+        command.args(["--extractor-args", youtube_extractor_args()]);
+    }
+    Ok(())
+}
+
+fn configure_youtube_command(command: &mut Command, use_android_client: bool) -> Result<()> {
+    append_youtube_auth_options(
+        command,
+        &load_youtube_authentication(),
+        thorium_user_data_dir().as_deref(),
+        use_android_client,
+    )
+}
+
+fn youtube_request_error(operation: &str, stderr: &[u8]) -> String {
+    youtube_request_error_for(&load_youtube_authentication(), operation, stderr)
+}
+
+fn youtube_request_error_for(
+    auth: &YouTubeAuthentication,
+    operation: &str,
+    stderr: &[u8],
+) -> String {
+    if *auth == YouTubeAuthentication::None {
+        format!("{operation}: {}", String::from_utf8_lossy(stderr).trim())
+    } else {
+        // yt-dlp output can contain private paths or request details. Only show safe hints.
+        let message = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+        let explanation = if message.contains("decrypt")
+            || message.contains("dpapi")
+            || message.contains("app-bound")
+            || message.contains("failed to load cookies")
+        {
+            tr("msg.youtube_cookie_decryption_error")
+        } else if message.contains("locked")
+            || message.contains("could not copy")
+            || message.contains("permission denied")
+        {
+            tr("msg.youtube_cookie_locked_error")
+        } else if message.contains("cookie") || message.contains("database") {
+            tr("msg.youtube_cookie_error")
+        } else if message.contains("sign in") || message.contains("login") {
+            tr("msg.youtube_login_error")
+        } else if message.contains("http error 403") || message.contains("http error 429") {
+            tr("msg.youtube_http_error")
+        } else {
+            tr("msg.youtube_auth_request_failed")
+        };
+        format!("{operation}: {explanation}")
+    }
+}
+
+fn youtube_auth_error_screen(error: &anyhow::Error) -> Result<()> {
+    clear_screen()?;
+    println!("{}: {error:#}", tr("msg.youtube_authentication"));
+    prompt(tr("msg.press_enter_to_return_to_the_menu"))?;
+    Ok(())
+}
+
+pub(crate) fn manage_youtube_authentication() -> Result<()> {
+    let mut selected = 0;
+    loop {
+        let current = load_youtube_authentication();
+        let mut items = vec![
+            format!(
+                "{}  {}",
+                if current.method() == "none" {
+                    "●"
+                } else {
+                    "○"
+                },
+                tr("msg.youtube_auth_none")
+            ),
+            format!(
+                "{}  {}{}",
+                if current.method() == "thorium" {
+                    "●"
+                } else {
+                    "○"
+                },
+                tr("msg.youtube_auth_thorium"),
+                match &current {
+                    YouTubeAuthentication::Thorium { profile } => format!(" ({profile})"),
+                    _ => String::new(),
+                }
+            ),
+        ];
+        for (method, label) in [
+            ("chrome", tr("msg.youtube_auth_chrome")),
+            ("vivaldi", tr("msg.youtube_auth_vivaldi")),
+            ("zen", tr("msg.youtube_auth_zen")),
+        ] {
+            let profile = match &current {
+                YouTubeAuthentication::Chrome { profile } if method == "chrome" => Some(profile),
+                YouTubeAuthentication::Vivaldi { profile } if method == "vivaldi" => Some(profile),
+                YouTubeAuthentication::Zen { profile } if method == "zen" => Some(profile),
+                _ => None,
+            };
+            items.push(format!(
+                "{}  {label}{}",
+                if current.method() == method {
+                    "●"
+                } else {
+                    "○"
+                },
+                profile.map_or(String::new(), |name| format!(" ({name})"))
+            ));
+        }
+        items.push(format!(
+            "{}  {}",
+            if current.method() == "file" {
+                "●"
+            } else {
+                "○"
+            },
+            tr("msg.youtube_auth_file")
+        ));
+        items.push(format!("←  {}", tr("msg.back")));
+        match select_menu_from(tr("msg.youtube_authentication"), &items, selected)? {
+            Some(0) => {
+                save_setting_value(YOUTUBE_AUTH_METHOD, "none")?;
+                selected = 0;
+            }
+            Some(1) => {
+                selected = 1;
+                let result = (|| -> Result<()> {
+                    let root = thorium_user_data_dir().context(tr("msg.thorium_not_found"))?;
+                    let profiles = thorium_profiles(&root)?;
+                    if profiles.is_empty() {
+                        bail!("{}", tr("msg.thorium_profile_missing"));
+                    }
+                    let selected_profile = match &current {
+                        YouTubeAuthentication::Thorium { profile } => profile.as_str(),
+                        _ => "Default",
+                    };
+                    let labels = profiles
+                        .iter()
+                        .map(|profile| {
+                            format!(
+                                "{}  {profile}",
+                                if profile == selected_profile {
+                                    "●"
+                                } else {
+                                    "○"
+                                }
+                            )
+                        })
+                        .chain(std::iter::once(format!("←  {}", tr("msg.back"))))
+                        .collect::<Vec<_>>();
+                    let start = profiles
+                        .iter()
+                        .position(|name| name == selected_profile)
+                        .unwrap_or(0);
+                    if let Some(index) =
+                        select_menu_from(tr("msg.youtube_auth_thorium_profile"), &labels, start)?
+                        && index < profiles.len()
+                    {
+                        // Validate the selected profile before persisting it.
+                        youtube_auth_arguments(
+                            &YouTubeAuthentication::Thorium {
+                                profile: profiles[index].clone(),
+                            },
+                            Some(&root),
+                        )?;
+                        save_setting_value(YOUTUBE_AUTH_PROFILE, &profiles[index])?;
+                        save_setting_value(YOUTUBE_AUTH_METHOD, "thorium")?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    youtube_auth_error_screen(&error)?;
+                }
+            }
+            Some(choice @ 2..=4) => {
+                selected = choice;
+                let method = ["chrome", "vivaldi", "zen"][choice - 2];
+                let result = (|| -> Result<()> {
+                    let root = browser_user_data_dir(method)
+                        .context(tr("msg.youtube_browser_not_found"))?;
+                    let profiles = browser_profiles(method, &root)?;
+                    if profiles.is_empty() {
+                        bail!("{}", tr("msg.youtube_browser_profile_missing"));
+                    }
+                    let preferred = match &current {
+                        YouTubeAuthentication::Chrome { profile } if method == "chrome" => {
+                            Some(profile.clone())
+                        }
+                        YouTubeAuthentication::Vivaldi { profile } if method == "vivaldi" => {
+                            Some(profile.clone())
+                        }
+                        YouTubeAuthentication::Zen { profile } if method == "zen" => {
+                            Some(profile.clone())
+                        }
+                        _ => load_selected_browser_profile(method),
+                    };
+                    let preferred = preferred.as_deref().unwrap_or("Default");
+                    let labels = profiles
+                        .iter()
+                        .map(|profile| {
+                            format!(
+                                "{}  {profile}",
+                                if profile == preferred { "●" } else { "○" }
+                            )
+                        })
+                        .chain(std::iter::once(format!("←  {}", tr("msg.back"))))
+                        .collect::<Vec<_>>();
+                    let start = profiles
+                        .iter()
+                        .position(|name| name == preferred)
+                        .unwrap_or(0);
+                    if let Some(index) =
+                        select_menu_from(tr("msg.youtube_auth_select_profile"), &labels, start)?
+                        && index < profiles.len()
+                    {
+                        browser_auth_arguments(method, &profiles[index], &root)?;
+                        save_setting_value(
+                            browser_profile_setting_key(method).expect("supported browser"),
+                            &profiles[index],
+                        )?;
+                        save_setting_value(YOUTUBE_AUTH_METHOD, method)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    youtube_auth_error_screen(&error)?;
+                }
+            }
+            Some(5) => {
+                selected = 5;
+                clear_screen()?;
+                println!("{}", tr("msg.youtube_auth_file_hint"));
+                if let Some(input) = prompt_or_escape(tr("msg.youtube_auth_file_prompt"))? {
+                    let path = PathBuf::from(input.trim().trim_matches('"'));
+                    if let Err(error) = validate_cookies_file(&path) {
+                        youtube_auth_error_screen(&error)?;
+                    } else {
+                        save_setting_value(YOUTUBE_AUTH_COOKIES_FILE, &path.to_string_lossy())?;
+                        save_setting_value(YOUTUBE_AUTH_METHOD, "file")?;
+                    }
+                }
+            }
+            Some(6) | None => return Ok(()),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +808,7 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
     loop {
         let items = vec![
             format!("▶  {}", tr("msg.play_youtube_url_or_playlist")),
+            format!("◇  {}", tr("msg.youtube_authentication")),
             format!("✓  {}", tr("msg.sponsorblock_categories")),
             format!("≣  {}", tr("msg.transcript_settings")),
             format!("◇  {}", tr("msg.youtube_tools_and_updater")),
@@ -297,10 +820,11 @@ pub(crate) fn play_youtube() -> Result<PlayerExit> {
                     return Ok(PlayerExit::Quit);
                 }
             }
-            Some(1) => manage_sponsorblock_categories()?,
-            Some(2) => manage_transcript_settings()?,
-            Some(3) => manage_youtube_tools()?,
-            Some(4) | None => return Ok(PlayerExit::Back),
+            Some(1) => manage_youtube_authentication()?,
+            Some(2) => manage_sponsorblock_categories()?,
+            Some(3) => manage_transcript_settings()?,
+            Some(4) => manage_youtube_tools()?,
+            Some(5) | None => return Ok(PlayerExit::Back),
             _ => unreachable!(),
         }
     }
@@ -1010,7 +1534,7 @@ pub(crate) fn serialize_youtube_tools(tools: &YouTubeTools) -> String {
 }
 
 fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> {
-    let mut error = None::<String>;
+    let mut error = None::<(String, bool)>;
     loop {
         clear_screen()?;
         println!(
@@ -1018,8 +1542,13 @@ fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> 
             tr("msg.youtube_audio_tutor_paste_one_url_multiple_space")
         );
         println!("{}", tr("msg.esc_back"));
-        if let Some(error) = &error {
-            println!("\n{}: {error}", tr("msg.invalid_youtube_url"));
+        if let Some((error, invalid_url)) = &error {
+            let label = if *invalid_url {
+                tr("msg.invalid_youtube_url")
+            } else {
+                tr("msg.youtube_request_failed")
+            };
+            println!("\n{label}: {error}");
         }
 
         let Some(input) = prompt_or_escape(tr("msg.url_s"))? else {
@@ -1032,14 +1561,14 @@ fn prompt_and_resolve_tracks(tools: &YouTubeTools) -> Result<Vec<YouTubeTrack>> 
         let urls = match parse_youtube_urls(&input) {
             Ok(urls) => urls,
             Err(parse_error) => {
-                error = Some(format!("{parse_error:#}"));
+                error = Some((format!("{parse_error:#}"), true));
                 continue;
             }
         };
 
         match resolve_tracks(tools, &urls) {
             Ok(tracks) => return Ok(tracks),
-            Err(resolve_error) => error = Some(format!("{resolve_error:#}")),
+            Err(resolve_error) => error = Some((format!("{resolve_error:#}"), false)),
         }
     }
 }
@@ -1080,22 +1609,27 @@ fn resolve_tracks(tools: &YouTubeTools, urls: &[String]) -> Result<Vec<YouTubeTr
         "{}",
         tr("msg.resolving_youtube_video_and_playlist_metadata")
     );
-    let output = Command::new(&tools.yt_dlp)
-        .args([
-            "--no-warnings",
-            "--ignore-errors",
-            "--yes-playlist",
-            "--flat-playlist",
-            "--print",
-            "%(id)s\t%(webpage_url)s\t%(title)S\t%(duration)s",
-        ])
+    let mut command = Command::new(&tools.yt_dlp);
+    command.args([
+        "--no-warnings",
+        "--ignore-errors",
+        "--yes-playlist",
+        "--flat-playlist",
+        "--print",
+        "%(id)s\t%(webpage_url)s\t%(title)S\t%(duration)s",
+    ]);
+    configure_youtube_command(&mut command, false)?;
+    let output = command
         .args(urls)
         .stdin(Stdio::null())
         .output()
         .context("failed to run yt-dlp")?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        bail!("yt-dlp failed to resolve YouTube input: {}", error.trim());
+        bail!(
+            "{}",
+            youtube_request_error("yt-dlp failed to resolve YouTube input", error.as_bytes())
+        );
     }
     let tracks: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1235,6 +1769,184 @@ fn choose_transcript(metadata: &Value, preference: &str) -> Option<TranscriptCho
         .or_else(|| automatic.first().cloned().map(automatic_choice))
 }
 
+fn parse_youtube_chapters(metadata: &Value) -> Vec<YouTubeChapter> {
+    let mut chapters: Vec<_> = metadata
+        .get("chapters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let title = entry.get("title")?.as_str()?.trim();
+            let start = entry.get("start_time")?.as_f64()?;
+            if title.is_empty() || !start.is_finite() || !(0.0..=1.0e9).contains(&start) {
+                return None;
+            }
+            let end = match entry.get("end_time") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let end = value.as_f64()?;
+                    if !end.is_finite() || end <= start || end > 1.0e9 {
+                        return None;
+                    }
+                    Some(Duration::from_secs_f64(end))
+                }
+            };
+            Some(YouTubeChapter {
+                title: title.to_string(),
+                start: Duration::from_secs_f64(start),
+                end,
+            })
+        })
+        .collect();
+    chapters.sort_by_key(|chapter| chapter.start);
+    chapters.dedup_by_key(|chapter| chapter.start);
+    chapters
+}
+
+fn active_chapter(chapters: &[YouTubeChapter], position: Duration) -> Option<usize> {
+    chapters.iter().rposition(|chapter| {
+        chapter.start <= position && chapter.end.is_none_or(|end| position < end)
+    })
+}
+
+fn resolve_chapters(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Vec<YouTubeChapter>> {
+    let mut command = Command::new(&tools.yt_dlp);
+    command.args([
+        "--no-warnings",
+        "--no-playlist",
+        "--skip-download",
+        "--dump-single-json",
+    ]);
+    configure_youtube_command(&mut command, true)?;
+    let output = command
+        .arg(&track.webpage_url)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to retrieve chapters for {}", track.title))?;
+    if !output.status.success() {
+        bail!(
+            "{}",
+            youtube_request_error("yt-dlp chapter metadata lookup failed", &output.stderr)
+        );
+    }
+    let metadata: Value = serde_json::from_slice(&output.stdout)
+        .context("yt-dlp returned invalid chapter metadata JSON")?;
+    Ok(parse_youtube_chapters(&metadata))
+}
+
+fn request_chapters(
+    cache: &mut HashMap<String, ChapterLoadState>,
+    sender: &Sender<(String, Result<Vec<YouTubeChapter>, String>)>,
+    tools: &YouTubeTools,
+    track: &YouTubeTrack,
+) {
+    let id = track.video_id.clone();
+    cache.insert(id.clone(), ChapterLoadState::Loading);
+    let sender = sender.clone();
+    let tools = tools.clone();
+    let track = track.clone();
+    thread::spawn(move || {
+        let result = resolve_chapters(&tools, &track).map_err(|error| error.to_string());
+        let _ = sender.send((id, result));
+    });
+}
+
+fn chapter_page_size(height: u16) -> usize {
+    usize::from(height).saturating_sub(6).max(1)
+}
+
+fn chapter_menu_rows(
+    menu: &mut ChaptersMenu,
+    state: &ChapterLoadState,
+    elapsed: Duration,
+    columns: u16,
+    height: u16,
+) -> Vec<String> {
+    let content_width = usize::from(columns).saturating_sub(5).min(60);
+    let available_rows = chapter_page_size(height);
+    let mut rows = Vec::new();
+    match state {
+        ChapterLoadState::Loading => rows.push(tr("msg.chapters_loading").to_string()),
+        ChapterLoadState::Failed(error) => {
+            rows.push(tr("msg.chapters_failed").to_string());
+            if available_rows >= 3 {
+                rows.push(fit_text(error, content_width));
+            }
+            rows.push(tr("msg.chapters_retry").to_string());
+        }
+        ChapterLoadState::Ready(chapters) if chapters.is_empty() => {
+            rows.push(tr("msg.no_chapters_available").to_string());
+        }
+        ChapterLoadState::Ready(chapters) => {
+            let page_size = available_rows
+                .saturating_sub(usize::from(menu.seek_error.is_some()))
+                .max(1);
+            menu.selected = menu.selected.min(chapters.len() - 1);
+            menu.scroll = menu.scroll.min(chapters.len().saturating_sub(page_size));
+            if menu.selected < menu.scroll {
+                menu.scroll = menu.selected;
+            } else if menu.selected >= menu.scroll + page_size {
+                menu.scroll = menu.selected + 1 - page_size;
+            }
+            let active = active_chapter(chapters, elapsed);
+            for (index, chapter) in chapters
+                .iter()
+                .enumerate()
+                .skip(menu.scroll)
+                .take(page_size)
+            {
+                let prefix = format!(
+                    "{} {}  ",
+                    if index == menu.selected { '>' } else { ' ' },
+                    format_duration(chapter.start)
+                );
+                let suffix = if Some(index) == active { " ♪" } else { "" };
+                let remaining =
+                    content_width.saturating_sub(prefix.chars().count() + suffix.chars().count());
+                rows.push(format!(
+                    "{prefix}{}{suffix}",
+                    fit_text(&chapter.title, remaining)
+                ));
+            }
+            if let Some(error) = &menu.seek_error {
+                rows.push(fit_text(error, content_width));
+            }
+        }
+    }
+    let hint = if content_width < 30 {
+        tr("msg.chapters_keys_short")
+    } else if content_width < 60 {
+        tr("msg.chapters_keys_medium")
+    } else {
+        tr("msg.chapters_keys")
+    };
+    // Keep a full row for the menu footer, including on short terminals.
+    rows.truncate(available_rows);
+    if usize::from(height) >= 7 {
+        rows.push(fit_text(&hint, content_width));
+    }
+    rows
+}
+
+fn draw_chapters_menu(
+    stdout: &mut io::Stdout,
+    menu: &mut ChaptersMenu,
+    state: &ChapterLoadState,
+    elapsed: Duration,
+) -> Result<()> {
+    let (columns, height) = terminal::size().unwrap_or((80, 24));
+    if columns < 18 || height < 8 {
+        return crate::util::draw_frame(stdout, "Resize terminal");
+    }
+    let title = if columns < 27 {
+        tr("msg.chapters")
+    } else {
+        tr("msg.youtube_chapters")
+    };
+    let rows = chapter_menu_rows(menu, state, elapsed, columns, height);
+    draw_panel(stdout, &title, &rows)
+}
+
 fn resolve_transcript(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Option<Lyrics>> {
     let cache_path = transcript_cache_path(track);
     if let Ok(text) = fs::read_to_string(&cache_path)
@@ -1243,15 +1955,15 @@ fn resolve_transcript(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Opti
         return Ok(Some(transcript));
     }
 
-    let metadata_output = Command::new(&tools.yt_dlp)
-        .args([
-            "--no-warnings",
-            "--no-playlist",
-            "--skip-download",
-            "--extractor-args",
-            youtube_extractor_args(),
-            "--dump-single-json",
-        ])
+    let mut metadata_command = Command::new(&tools.yt_dlp);
+    metadata_command.args([
+        "--no-warnings",
+        "--no-playlist",
+        "--skip-download",
+        "--dump-single-json",
+    ]);
+    configure_youtube_command(&mut metadata_command, true)?;
+    let metadata_output = metadata_command
         .arg(&track.webpage_url)
         .stdin(Stdio::null())
         .output()
@@ -1283,12 +1995,11 @@ fn resolve_transcript(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<Opti
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
-        "--extractor-args",
-        youtube_extractor_args(),
         "--sub-format",
         "vtt",
         "--sub-langs",
     ]);
+    configure_youtube_command(&mut command, true)?;
     command.arg(&choice.language);
     if choice.automatic {
         command.arg("--write-auto-subs");
@@ -1467,24 +2178,27 @@ fn parse_resolved_audio_stream(line: &str) -> Option<ResolvedAudioStream> {
 }
 
 fn resolve_audio_url(tools: &YouTubeTools, track: &YouTubeTrack) -> Result<ResolvedAudioStream> {
-    let output = Command::new(&tools.yt_dlp)
-        .args([
-            "--no-warnings",
-            "--no-playlist",
-            "--extractor-args",
-            youtube_extractor_args(),
-            "--format",
-            youtube_stream_format(),
-            "--print",
-            "%(format_id)s\t%(url)s\t%(abr)s",
-        ])
+    let mut command = Command::new(&tools.yt_dlp);
+    command.args([
+        "--no-warnings",
+        "--no-playlist",
+        "--format",
+        youtube_stream_format(),
+        "--print",
+        "%(format_id)s\t%(url)s\t%(abr)s",
+    ]);
+    configure_youtube_command(&mut command, true)?;
+    let output = command
         .arg(&track.webpage_url)
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("failed to resolve {}", track.title))?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        bail!("yt-dlp failed to resolve audio stream: {}", error.trim());
+        bail!(
+            "{}",
+            youtube_request_error("yt-dlp failed to resolve audio stream", error.as_bytes())
+        );
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1739,6 +2453,9 @@ fn play_youtube_tracks(
     let mut last_skipped = None;
     let mut stream_failures = 0usize;
     let mut transcript_cache = HashMap::<String, Option<Lyrics>>::new();
+    let mut chapter_cache = HashMap::<String, ChapterLoadState>::new();
+    let (chapter_sender, chapter_receiver) = mpsc::channel();
+    let mut chapter_menu: Option<ChaptersMenu> = None;
     let mut transcript_visible = load_setting_bool("playback.transcript", true);
     let mut transcript_settings = None;
     cache_sponsor_segments(&mut tracks[index], &categories_json);
@@ -1748,6 +2465,32 @@ fn play_youtube_tracks(
     media_controls.set_playing(true);
 
     loop {
+        while let Ok((video_id, result)) = chapter_receiver.try_recv() {
+            if matches!(
+                chapter_cache.get(&video_id),
+                Some(ChapterLoadState::Loading)
+            ) {
+                let state = match result {
+                    Ok(chapters) => ChapterLoadState::Ready(chapters),
+                    Err(error) => ChapterLoadState::Failed(error),
+                };
+                if let (Some(menu), ChapterLoadState::Ready(chapters)) = (&mut chapter_menu, &state)
+                    && menu.video_id == video_id
+                {
+                    menu.selected =
+                        active_chapter(chapters, playback.elapsed(tracks[index].duration))
+                            .unwrap_or(0);
+                    menu.scroll = 0;
+                }
+                chapter_cache.insert(video_id, state);
+            }
+        }
+        if chapter_menu
+            .as_ref()
+            .is_some_and(|menu| menu.video_id != tracks[index].video_id)
+        {
+            chapter_menu = None;
+        }
         if transcript_visible {
             ensure_transcript(&mut transcript_cache, tools, &tracks[index]);
         }
@@ -2013,20 +2756,31 @@ fn play_youtube_tracks(
             }
         }
 
-        draw_youtube_player(
-            &mut stdout,
-            &tracks,
-            index,
-            &playback,
-            volume,
-            last_volume_change,
-            shuffle,
-            loop_mode,
-            sponsor_enabled,
-            cached_transcript(&transcript_cache, &tracks[index]),
-            transcript_visible,
-            transcript_settings.as_ref(),
-        )?;
+        if let Some(menu) = chapter_menu.as_mut() {
+            if let Some(state) = chapter_cache.get(&menu.video_id) {
+                draw_chapters_menu(
+                    &mut stdout,
+                    menu,
+                    state,
+                    playback.elapsed(tracks[index].duration),
+                )?;
+            }
+        } else {
+            draw_youtube_player(
+                &mut stdout,
+                &tracks,
+                index,
+                &playback,
+                volume,
+                last_volume_change,
+                shuffle,
+                loop_mode,
+                sponsor_enabled,
+                cached_transcript(&transcript_cache, &tracks[index]),
+                transcript_visible,
+                transcript_settings.as_ref(),
+            )?;
+        }
 
         if playback.empty() {
             let Some((next, new_pass, advance_queue)) = forward_track_index(
@@ -2079,6 +2833,57 @@ fn play_youtube_tracks(
             return Ok(PlayerExit::Quit);
         }
 
+        if let Some(menu) = chapter_menu.as_mut() {
+            let state = chapter_cache.get(&menu.video_id);
+            match key.code {
+                KeyCode::Esc => chapter_menu = None,
+                KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                    if let Some(ChapterLoadState::Ready(chapters)) = state
+                        && !chapters.is_empty()
+                    {
+                        let page = chapter_page_size(terminal::size().unwrap_or((80, 24)).1);
+                        let last = chapters.len() - 1;
+                        menu.selected = match key.code {
+                            KeyCode::Up => menu.selected.saturating_sub(1),
+                            KeyCode::Down => menu.selected.saturating_add(1).min(last),
+                            KeyCode::PageUp => menu.selected.saturating_sub(page),
+                            KeyCode::PageDown => menu.selected.saturating_add(page).min(last),
+                            _ => menu.selected,
+                        };
+                        menu.seek_error = None;
+                    }
+                }
+                KeyCode::Char('r') | KeyCode::Enter
+                    if matches!(state, Some(ChapterLoadState::Failed(_))) =>
+                {
+                    request_chapters(&mut chapter_cache, &chapter_sender, tools, &tracks[index]);
+                    menu.seek_error = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(ChapterLoadState::Ready(chapters)) = state
+                        && let Some(chapter) = chapters.get(menu.selected)
+                    {
+                        match restart_playback(
+                            &mut playback,
+                            output.stream(),
+                            tools,
+                            volume,
+                            chapter.start,
+                            rate,
+                        ) {
+                            Ok(()) => {
+                                last_skipped = None;
+                                chapter_menu = None;
+                            }
+                            Err(error) => menu.seek_error = Some(error.to_string()),
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         if let Some(editor) = transcript_settings.as_mut() {
             match editor.handle_key(key.code, key.modifiers, transcript_visible)? {
                 TranscriptEditorResult::Visibility(visible) => {
@@ -2096,6 +2901,24 @@ fn play_youtube_tracks(
         }
 
         match key.code {
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                let track = &tracks[index];
+                if !chapter_cache.contains_key(&track.video_id) {
+                    request_chapters(&mut chapter_cache, &chapter_sender, tools, track);
+                }
+                let selected = match chapter_cache.get(&track.video_id) {
+                    Some(ChapterLoadState::Ready(chapters)) => {
+                        active_chapter(chapters, playback.elapsed(track.duration)).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                chapter_menu = Some(ChaptersMenu {
+                    video_id: track.video_id.clone(),
+                    selected,
+                    scroll: 0,
+                    seek_error: None,
+                });
+            }
             KeyCode::Char('q') => return Ok(PlayerExit::Quit),
             KeyCode::Char('b') => {
                 transcript_settings = Some(TranscriptSettingsEditor::new());
@@ -2378,21 +3201,139 @@ mod youtube_tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use unicode_width::UnicodeWidthStr;
+
     use crate::lyrics::Lyrics;
 
     use super::{
-        PlaybackInterruption, SPONSORBLOCK_CATEGORIES, SponsorBlockSettings, SponsorSegment,
-        TranscriptChoice, YouTubeTools, choose_transcript, compare_versions, install_staged_tool,
+        ChapterLoadState, ChaptersMenu, PlaybackInterruption, SPONSORBLOCK_CATEGORIES,
+        SponsorBlockSettings, SponsorSegment, TranscriptChoice, YouTubeTools, active_chapter,
+        chapter_menu_rows, choose_transcript, compare_versions, install_staged_tool,
         installed_version, is_portable_ffmpeg, is_portable_yt_dlp, logical_elapsed,
         parse_resolved_audio_stream, parse_sponsor_segments, parse_sponsorblock_settings,
-        parse_webvtt_transcript, parse_youtube_track_line, parse_yt_dlp_release,
-        playback_ended_early, playback_interruption, portable_ffmpeg_update_paths,
-        portable_tool_pair, portable_yt_dlp_update_paths, recovery_message,
-        relocated_portable_tools, resume_gap_detected, seek_target,
+        parse_webvtt_transcript, parse_youtube_chapters, parse_youtube_track_line,
+        parse_yt_dlp_release, playback_ended_early, playback_interruption,
+        portable_ffmpeg_update_paths, portable_tool_pair, portable_yt_dlp_update_paths,
+        recovery_message, relocated_portable_tools, resume_gap_detected, seek_target,
         serialize_sponsorblock_settings, sponsor_skip_target, sponsorblock_categories_json,
         stepped_rate, update_status, youtube_extractor_args, youtube_playback_controls,
         youtube_stream_format,
     };
+
+    #[test]
+    fn youtube_chapters_parse_and_sort_full_metadata() {
+        let metadata = serde_json::json!({
+            "chapters": [
+                {"title": "Kết thúc", "start_time": 130.5, "end_time": 190},
+                {"title": "Introduction", "start_time": 0, "end_time": 60},
+                {"title": "Bài hát thứ hai", "start_time": 60, "end_time": 130.5},
+                {"title": "Duplicate timestamp", "start_time": 60, "end_time": 100}
+            ]
+        });
+        let chapters = parse_youtube_chapters(&metadata);
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(chapters[0].title, "Introduction");
+        assert_eq!(chapters[1].title, "Bài hát thứ hai");
+        assert_eq!(chapters[1].start, Duration::from_secs(60));
+        assert_eq!(chapters[2].start, Duration::from_millis(130500));
+        assert_eq!(chapters[2].end, Some(Duration::from_secs(190)));
+        assert!(parse_youtube_chapters(&serde_json::json!({})).is_empty());
+        assert!(parse_youtube_chapters(&serde_json::json!({"chapters": []})).is_empty());
+    }
+
+    #[test]
+    fn youtube_chapters_ignore_invalid_entries_and_find_active_segment() {
+        let metadata = serde_json::json!({
+            "chapters": [
+                {"title": "", "start_time": 0, "end_time": 10},
+                {"title": "Negative", "start_time": -1, "end_time": 3},
+                {"title": "Missing start"},
+                {"title": "Bad end", "start_time": 5, "end_time": 4},
+                {"title": "Not numeric", "start_time": "10"},
+                {"title": "First", "start_time": 0, "end_time": 10},
+                {"title": "Later", "start_time": 20, "end_time": 30}
+            ]
+        });
+        let chapters = parse_youtube_chapters(&metadata);
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(active_chapter(&chapters, Duration::ZERO), Some(0));
+        assert_eq!(active_chapter(&chapters, Duration::from_secs(10)), None);
+        assert_eq!(active_chapter(&chapters, Duration::from_secs(20)), Some(1));
+        assert_eq!(active_chapter(&chapters, Duration::from_secs(30)), None);
+    }
+
+    #[test]
+    fn chapter_menu_is_responsive_and_scrolls_to_selection() {
+        let chapters = (0..40)
+            .map(|index| super::YouTubeChapter {
+                title: format!("Chương {index}: Bài hát dài có tiếng Việt và emoji 🎶"),
+                start: Duration::from_secs(index * 60),
+                end: Some(Duration::from_secs((index + 1) * 60)),
+            })
+            .collect::<Vec<_>>();
+        let state = ChapterLoadState::Ready(chapters);
+        for columns in [20, 24, 40, 52, 80, 120] {
+            for height in [8, 12, 24] {
+                let mut menu = ChaptersMenu {
+                    video_id: "video".to_string(),
+                    selected: 35,
+                    scroll: 0,
+                    seek_error: None,
+                };
+                let rows = chapter_menu_rows(
+                    &mut menu,
+                    &state,
+                    Duration::from_secs(35 * 60),
+                    columns,
+                    height,
+                );
+                let max_width = usize::from(columns).saturating_sub(5).min(60);
+                assert!(
+                    rows.iter()
+                        .all(|row| UnicodeWidthStr::width(row.as_str()) <= max_width)
+                );
+                assert!(rows.iter().any(|row| row.starts_with("> 35:00")));
+                assert!(rows.iter().any(|row| row.contains('♪')));
+                assert!(rows.len() + 4 < usize::from(height));
+                assert!(menu.scroll <= menu.selected);
+            }
+        }
+
+        let mut menu = ChaptersMenu {
+            video_id: "empty".to_string(),
+            selected: 0,
+            scroll: 0,
+            seek_error: None,
+        };
+        let no_chapters = chapter_menu_rows(
+            &mut menu,
+            &ChapterLoadState::Ready(Vec::new()),
+            Duration::ZERO,
+            52,
+            24,
+        );
+        assert!(
+            no_chapters
+                .iter()
+                .any(|row| row.contains("No chapters available"))
+        );
+        let failed = chapter_menu_rows(
+            &mut menu,
+            &ChapterLoadState::Failed("Network unavailable".to_string()),
+            Duration::ZERO,
+            52,
+            24,
+        );
+        assert!(failed.iter().any(|row| row.contains("Retry")));
+        let failed_small = chapter_menu_rows(
+            &mut menu,
+            &ChapterLoadState::Failed("Network unavailable".to_string()),
+            Duration::ZERO,
+            20,
+            8,
+        );
+        assert!(failed_small.iter().any(|row| row.contains("Retry")));
+    }
 
     #[test]
     fn metadata_line_parses_duration_and_missing_duration() {
@@ -2696,6 +3637,7 @@ mod youtube_tests {
         assert!(controls.iter().any(|row| row.contains("[,/.] ±0.25x")));
         assert!(controls.iter().any(|row| row.contains("[s] sponsors")));
         assert!(controls.iter().any(|row| row.contains("[b] transcript")));
+        assert!(controls.iter().any(|row| row.contains("[c] chapters")));
         assert!(controls.last().unwrap().starts_with('└'));
         assert!(controls.last().unwrap().ends_with('┘'));
     }
@@ -2759,5 +3701,226 @@ mod youtube_tests {
             sponsor_skip_target(&[segment], Duration::from_secs(20), None),
             None
         );
+    }
+
+    #[test]
+    fn youtube_authentication_settings_default_and_restore_method_and_profile() {
+        use super::YouTubeAuthentication as Auth;
+
+        assert_eq!(Auth::from_values(None, None, None), Auth::None);
+        assert_eq!(Auth::from_values(Some("unknown"), None, None), Auth::None);
+        assert_eq!(
+            Auth::from_values(Some("thorium"), None, None),
+            Auth::Thorium {
+                profile: "Default".into()
+            }
+        );
+        assert_eq!(
+            Auth::from_values(Some("thorium"), Some("Profile 2"), None),
+            Auth::Thorium {
+                profile: "Profile 2".into()
+            }
+        );
+        assert_eq!(
+            Auth::from_values(Some("chrome"), Some("Profile 3"), None),
+            Auth::Chrome {
+                profile: "Profile 3".into()
+            }
+        );
+        assert_eq!(
+            Auth::from_values(Some("vivaldi"), None, None),
+            Auth::Vivaldi {
+                profile: "Default".into()
+            }
+        );
+        assert_eq!(
+            Auth::from_values(Some("zen"), Some("a1b2c3.default"), None),
+            Auth::Zen {
+                profile: "a1b2c3.default".into()
+            }
+        );
+        assert_eq!(
+            Auth::from_values(Some("file"), None, Some(r"C:\cookies.txt")),
+            Auth::CookiesFile {
+                path: r"C:\cookies.txt".into()
+            }
+        );
+    }
+
+    #[test]
+    fn youtube_authentication_discovers_profiles_and_handles_missing_data() {
+        use super::{YouTubeAuthentication as Auth, thorium_profiles, youtube_auth_arguments};
+
+        let root = std::env::temp_dir().join(format!(
+            "music-terminal-thorium-profiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(thorium_profiles(&root).is_err());
+        for name in ["Profile 10", "Default", "Profile 2", "Cache"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        assert_eq!(
+            thorium_profiles(&root).unwrap(),
+            ["Default", "Profile 2", "Profile 10"]
+        );
+
+        let profile = Auth::Thorium {
+            profile: "Profile 2".into(),
+        };
+        assert!(youtube_auth_arguments(&profile, Some(&root)).is_err());
+        fs::create_dir_all(root.join("Profile 2").join("Network")).unwrap();
+        fs::write(root.join("Profile 2").join("Network").join("Cookies"), b"").unwrap();
+        let args = youtube_auth_arguments(&profile, Some(&root)).unwrap();
+        assert_eq!(args[0], "--cookies-from-browser");
+        assert_eq!(
+            args[1],
+            std::ffi::OsString::from(format!("chromium:{}", root.join("Profile 2").display()))
+        );
+        assert!(
+            youtube_auth_arguments(
+                &Auth::Thorium {
+                    profile: "../Default".into()
+                },
+                Some(&root)
+            )
+            .is_err()
+        );
+        assert!(
+            youtube_auth_arguments(
+                &Auth::Thorium {
+                    profile: "Profile 3".into()
+                },
+                Some(&root)
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn youtube_authentication_cookies_file_and_android_client_flags() {
+        use super::{
+            YouTubeAuthentication as Auth, append_youtube_auth_options, youtube_auth_arguments,
+        };
+        use std::process::Command;
+
+        let mut command = Command::new("yt-dlp");
+        append_youtube_auth_options(&mut command, &Auth::None, None, true).unwrap();
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            ["--extractor-args", "youtube:player_client=android"]
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("music-terminal-auth-{}.txt", std::process::id()));
+        let auth = Auth::CookiesFile { path: path.clone() };
+        assert!(youtube_auth_arguments(&auth, None).is_err());
+        fs::write(&path, b"invalid cookies file\n").unwrap();
+        assert!(youtube_auth_arguments(&auth, None).is_err());
+        fs::write(&path, b"# Netscape HTTP Cookie File\n").unwrap();
+
+        let mut command = Command::new("yt-dlp");
+        append_youtube_auth_options(&mut command, &auth, None, true).unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_os_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "--cookies");
+        assert_eq!(args[1], path.as_os_str());
+        assert_eq!(args.len(), 2);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn youtube_authentication_new_browser_profiles_and_cookie_flags() {
+        use super::{browser_auth_arguments, browser_profiles};
+
+        let root = std::env::temp_dir().join(format!(
+            "music-terminal-browser-profiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let chromium = root.join("chromium");
+        let zen = root.join("zen");
+        fs::create_dir_all(chromium.join("Default").join("Network")).unwrap();
+        fs::create_dir_all(chromium.join("Profile 2").join("Network")).unwrap();
+        fs::create_dir_all(zen.join("abc123.default-release")).unwrap();
+        fs::write(zen.join("abc123.default-release").join("prefs.js"), b"").unwrap();
+
+        assert_eq!(
+            browser_profiles("chrome", &chromium).unwrap(),
+            ["Default", "Profile 2"]
+        );
+        assert_eq!(
+            browser_profiles("zen", &zen).unwrap(),
+            ["abc123.default-release"]
+        );
+        assert!(browser_auth_arguments("chrome", "Default", &chromium).is_err());
+        assert!(browser_auth_arguments("zen", "abc123.default-release", &zen).is_err());
+        assert!(browser_auth_arguments("zen", "../chromium", &zen).is_err());
+
+        fs::write(
+            chromium.join("Default").join("Network").join("Cookies"),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            zen.join("abc123.default-release").join("cookies.sqlite"),
+            b"",
+        )
+        .unwrap();
+        for (method, profile, directory, prefix) in [
+            ("chrome", "Default", &chromium, "chrome:"),
+            ("vivaldi", "Default", &chromium, "vivaldi:"),
+            ("zen", "abc123.default-release", &zen, "firefox:"),
+        ] {
+            let args = browser_auth_arguments(method, profile, directory).unwrap();
+            assert_eq!(args[0], "--cookies-from-browser");
+            assert_eq!(
+                args[1],
+                std::ffi::OsString::from(format!("{prefix}{}", directory.join(profile).display()))
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn youtube_authentication_errors_explain_decryption_without_exposing_diagnostics() {
+        use super::{YouTubeAuthentication as Auth, youtube_request_error_for};
+        use crate::i18n::tr;
+
+        let auth = Auth::Thorium {
+            profile: "Default".into(),
+        };
+        let private_diagnostic =
+            b"WARNING: Failed to decrypt with DPAPI: private-profile-path\nERROR: failed to load cookies";
+        let error = youtube_request_error_for(&auth, "metadata", private_diagnostic);
+        assert!(error.contains(tr("msg.youtube_cookie_decryption_error")));
+        assert!(!error.contains("private-profile-path"));
+
+        let error =
+            youtube_request_error_for(&auth, "metadata", b"Sign in to confirm you are not a bot");
+        assert!(error.contains(tr("msg.youtube_login_error")));
+
+        let error = youtube_request_error_for(&auth, "metadata", b"HTTP Error 403: Forbidden");
+        assert!(error.contains(tr("msg.youtube_http_error")));
+
+        let error =
+            youtube_request_error_for(&auth, "metadata", b"Unknown failure with private-token");
+        assert!(error.contains(tr("msg.youtube_auth_request_failed")));
+        assert!(!error.contains("private-token"));
+
+        let no_auth = youtube_request_error_for(&Auth::None, "metadata", b"network error");
+        assert!(no_auth.contains("network error"));
     }
 }

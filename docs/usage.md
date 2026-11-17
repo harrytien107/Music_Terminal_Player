@@ -59,6 +59,35 @@ Changing the volume temporarily replaces the existing playback progress row with
 
 Resizing the terminal redraws menus and playback panels using the available space. The queue switches from three columns to a stacked list on narrower terminals, keeping the highlighted entry visible. Lyrics use a consistent width for the whole track, limited by the current window size.
 
+## YouTube authentication
+
+Go to **YouTube → YouTube Authentication** and select **No authentication** (default), **Thorium browser cookies**, **Google Chrome cookies**, **Vivaldi browser cookies**, **Zen Browser cookies**, or **Cookies file**. Browser choices prompt for an installed profile; each browser's last selected profile is remembered separately. Zen uses yt-dlp's Firefox profile support. The player uses only the currently selected browser and applies its cookies to YouTube video and playlist metadata, chapters, subtitles, transcript resolution, and audio streams.
+
+Browser-cookie extraction can fail because of encrypted or locked cookie databases, and successful extraction does not guarantee YouTube will accept a session. Close the selected browser and retry, or choose a Netscape-format `cookies.txt` export if necessary. Keep exported cookies private; they grant access to your signed-in session. The player stores profile paths and settings, not cookie values.
+
+See [yt-dlp's cookie documentation](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies).
+
+## YouTube chapters
+
+While playing a YouTube video, press `c` to open **YouTube Chapters**. Chapter metadata is requested with yt-dlp in the background when first needed for that video, and the result is cached for the current playback session. Playback continues while the chapter list is loading.
+
+- `Up` / `Down`: move the selection one chapter.
+- `Page Up` / `Page Down`: jump through a long chapter list.
+- `Enter`: seek to the selected chapter's start time and close the menu. The current volume, playback speed, pause state, and SponsorBlock settings are preserved.
+- `Esc`: close Chapters without seeking.
+
+Each entry shows the chapter start time and title. `>` marks your selection, while `♪` marks the chapter corresponding to the current playback position. The menu opens with the current chapter selected when metadata is available. If the video has no chapters, it shows **No chapters available**. If metadata retrieval fails, press `r` or `Enter` to retry; an unavailable connection does not stop audio playback. Short terminal windows display a scrollable subset of chapters.
+
+## Optional Spicy Lyrics for Local and Telegram
+
+Open **Lyrics settings → Lyrics source**. **Embedded only** is the default and makes no requests to Spicy Lyrics. **Auto** preserves synchronized embedded lyrics and looks online when lyrics are absent or plain. **Spicy Lyrics preferred** looks online first and falls back to available embedded lyrics when there is no usable match or the request fails. The lookup runs asynchronously so playback and Telegram downloads can continue.
+
+For API access, open **Settings → Lyrics Settings → SpicyLyrics API Key** and enter an approved **publishable** key (`sl_pk_...`). The input is masked; press **Enter** to save, **Delete** to clear the saved key, or **Esc** to cancel. The key persists in `.music-terminal/settings.txt` as plaintext, so keep that file private. The previously supported `SPICY_LYRICS_PUBLISHABLE_KEY` environment variable still works when no saved key exists; deleting a saved key returns to that fallback. A saved key takes precedence. A valid key alone does not enable online lyrics: select **Auto** or **SpicyLyrics preferred** in **Lyrics source**.
+
+Spicy Lyrics must enable **client access without an Origin header** for the native desktop application. A public application distributed to other users needs an approved [Spicy Lyrics app template](https://developers.spicylyrics.org/docs/keys), allowing individual user keys. Do not distribute a secret (`sl_sk_...`) key in an EXE or configuration file.
+
+The player searches for reliable track matches using audio tags or filenames for Local and track names for Telegram, together with available durations. Results may contain word-level, line-level, or unsynchronized lyrics. Provider and available uploader/maker links appear with the lyrics. Cached API results are kept inside `.music-terminal/spicylyrics-cache` for less than 30 days; no lyrics export or download action is provided. Without a valid key or network connection, embedded lyrics and audio playback continue to work. See [API attribution requirements](https://developers.spicylyrics.org/docs/attribution) and [developer terms](https://developers.spicylyrics.org/terms).
+
 ## Optional automatic startup tasks
 
 Open **Settings** to configure **Automatic Telegram sync**, **Select startup channels**, and **GitHub Updates**. Telegram synchronization is **OFF by default**; GitHub checks for new versions in the background at every interactive launch.
@@ -73,6 +102,7 @@ GitHub version checking uses the latest stable release and runs without blocking
 - `Right` / `Left`: volume up or down 1% during local/Telegram playback; seek forward/backward 10 seconds during YouTube playback
 - `,` / `.`: decrease or increase YouTube speed by 0.25x from 0.5x through 2.0x
 - `s`: toggle all configured YouTube SponsorBlock categories for the current queue session
+- `c`: open YouTube Chapters during YouTube playback
 - `n`: next track
 - `v`: previous track
 - `r`: toggle shuffle for unplayed tracks; `Next in queue` keeps its manual order
@@ -88,7 +118,7 @@ The player displays the current local song, Telegram song, or YouTube video titl
 
 Local and Telegram players read lyrics embedded in the audio file metadata. Standard timestamped LRC follows playback, bolds the current line, and marks it with `>`. Enhanced LRC word timestamps such as `<00:21.347>` are hidden from the displayed text and bold the current word inside the marked row. Plain lyrics can be scrolled with `Page Up` and `Page Down`. Long lines wrap at word boundaries; scripts without spaces wrap safely by Unicode character.
 
-Open `Lyrics settings` from the main Settings menu or press `b` during Local or Telegram playback. The in-player editor leaves playback and Telegram downloading active. It can show or hide lyrics, place the panel beside or below the player, align rows left or center, and independently color active synchronized rows, inactive synchronized rows, and plain lyrics. Pressing `y` toggles visibility directly, including while the editor is open. A beside panel falls back below the player if the terminal is too narrow. Telegram lyrics may appear only after the full temporary file is cached when its metadata is stored at the end of the file. The player does not search online for lyrics.
+Open `Lyrics settings` from the main Settings menu or press `b` during Local or Telegram playback. The in-player editor leaves playback and Telegram downloading active. It can show or hide lyrics, place the panel beside or below the player, select the lyrics source, align rows left or center, and independently color active synchronized rows, inactive synchronized rows, and plain lyrics. Pressing `y` toggles visibility directly, including while the editor is open. When the position is set to beside, the player and lyrics panels shrink together; very narrow windows show a resize message. Telegram embedded lyrics may appear only after the full temporary file is cached when its metadata is stored at the end of the file. Optional online lookup is described above.
 
 A track-list entry is consumed once per playback pass. Duplicate entries remain separate plays, a manually queued copy is an extra play, and manual Previous may replay an entry without changing automatic forward progress. Loop Off stops after the remaining channel or track list is exhausted. Loop All starts a new full pass only after exhaustion. Loop One repeats only the current track. Toggling shuffle changes only the unplayed `Next from track list` tail; the current track, already consumed tracks, and manually ordered `Next in queue` entries do not move.
 

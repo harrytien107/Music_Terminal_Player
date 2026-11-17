@@ -10,6 +10,7 @@ mod i18n;
 mod local;
 mod lyrics;
 mod media_controls;
+mod spicylyrics;
 mod startup_window;
 mod telegram;
 #[cfg(test)]
@@ -19,6 +20,7 @@ mod util;
 mod youtube;
 
 fn main() {
+    spicylyrics::prune_expired_cache();
     let mut args: Vec<String> = env::args().skip(1).collect();
     let is_relaunch = startup_window::consume_relaunch_marker(&mut args);
     #[cfg(windows)]

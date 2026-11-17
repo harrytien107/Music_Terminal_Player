@@ -16,19 +16,26 @@ A small terminal player for local libraries and online sources without the overh
 - Combined multi-channel Telegram queues
 - YouTube video and playlist audio streaming without saving complete media files
 - YouTube persistent per-category SponsorBlock auto-skip settings
+- YouTube chapter navigation: press `c` to view chapters and seek to their start times
+- Optional YouTube authentication with Thorium, Google Chrome, Vivaldi, Zen Browser, or a cookies.txt file
 - Synchronized YouTube transcripts
 - Editable queues, playlists, shuffle, loop modes, and persistent volume
 - Configurable embedded lyrics for local and Telegram tracks, including line-synchronized LRC and word-synchronized Enhanced LRC
+- Optional Spicy Lyrics synchronized lyrics for local and Telegram tracks (requires approved client API access)
 
 ### Lyrics support for local files and telegram
 
 Local and Telegram tracks can display embedded plain lyrics, synchronized LRC, and word-synchronized Enhanced LRC directly beside or below the player.
+
+In **Lyrics settings**, choose **Lyrics source**: **Embedded only** (default, offline), **Auto** (prefer synchronized embedded lyrics), or **Spicy Lyrics preferred**. To use online lyrics, enter an approved publishable key through **Settings → Lyrics Settings → SpicyLyrics API Key** (or use the existing `SPICY_LYRICS_PUBLISHABLE_KEY` environment variable). The app shows available provider and contributor credits alongside online lyrics; it does not export them. See the [usage guide](docs/usage.md) for setup, local key storage, and API requirements.
 
 ![Music Terminal Player synchronized lyrics](docs/media/lyric-local-tele.png)
 
 ### YouTube synchronized transcripts
 
 YouTube playback can display available manual subtitles or automatic captions as a synchronized transcript beside or below the player.
+
+Press `c` during YouTube playback to open **YouTube Chapters**. Navigate with `Up`/`Down` or `Page Up`/`Page Down`, press `Enter` to seek to the selected chapter, and press `Esc` to close the menu. The `♪` marker identifies the chapter currently playing. Chapter metadata loads in the background when needed; videos without chapter metadata show **No chapters available**. See the [YouTube tutorial](docs/youtube-tutorial.md) for details.
 
 ![Music Terminal Player YouTube synchronized transcript](docs/media/transcripts-yt.png)
 
@@ -43,7 +50,7 @@ Don't know how to use? Start with the guide for the source you want to play:
 
 - [Local music tutorial](docs/local-tutorial.md) — add a music folder, play saved folders, and use playback controls.
 - [Telegram tutorial](docs/telegram-tutorial.md) — create API credentials, log in, synchronize channels, and stream or download music.
-- [YouTube tutorial](docs/youtube-tutorial.md) — set up yt-dlp and FFmpeg, play videos or playlists, and update the tools.
+- [YouTube tutorial](docs/youtube-tutorial.md) — set up yt-dlp and FFmpeg, authenticate, navigate chapters, and update the tools.
 
 ### Playlist quick tutorial
 

@@ -15,6 +15,7 @@ use crate::audio_output::{AudioOutput, device_unavailable_error};
 use crate::i18n::tr;
 use crate::lyrics::{Lyrics, read_embedded_lyrics};
 use crate::media_controls::{MediaCommand, MediaControls};
+use crate::spicylyrics::{SpicyLyricsLookup, TrackQuery};
 use crate::util::{
     LoopMode, LyricsEditorResult, LyricsSettingsEditor, MAX_VOLUME, PlayerExit, RawMode,
     draw_frame, draw_player_panels, format_duration, forward_track_index, insert_queue_next,
@@ -109,6 +110,7 @@ fn play_tracks_inner(
     let mut lyrics_settings = None;
     let mut lyrics_scroll = 0usize;
     let mut lyrics_index = index;
+    let mut spicy_lyrics = SpicyLyricsLookup::new();
     let mut duration;
     let mut sink;
     let mut lyrics;
@@ -179,6 +181,11 @@ fn play_tracks_inner(
             continue;
         }
 
+        spicy_lyrics.update(
+            &format!("{}:{}", index, tracks[index].display()),
+            TrackQuery::from_local(&tracks[index], duration),
+            lyrics.as_ref(),
+        );
         draw_player(
             &mut stdout,
             title,
@@ -191,7 +198,8 @@ fn play_tracks_inner(
             shuffle,
             loop_mode,
             add_tracks.is_some(),
-            lyrics.as_ref(),
+            spicy_lyrics.display(lyrics.as_ref()),
+            spicy_lyrics.attribution(lyrics.as_ref()),
             lyrics_scroll,
             lyrics_visible,
             lyrics_settings.as_ref(),
@@ -464,6 +472,7 @@ fn draw_player(
     loop_mode: LoopMode,
     can_add_tracks: bool,
     lyrics: Option<&Lyrics>,
+    attribution: Option<&[String]>,
     lyrics_scroll: usize,
     lyrics_visible: bool,
     lyrics_settings: Option<&LyricsSettingsEditor>,
@@ -519,6 +528,7 @@ fn draw_player(
         &format!("Music Terminal Player · {title}"),
         &rows,
         lyrics,
+        attribution,
         elapsed,
         lyrics_scroll,
         lyrics_visible,

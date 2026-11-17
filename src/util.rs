@@ -11,6 +11,10 @@ use anyhow::Result;
 
 use crate::i18n::tr;
 use crate::lyrics::Lyrics;
+use crate::spicylyrics::{
+    LyricsSource, PublishableKeyOrigin, SPICY_KEY_SETTING, publishable_key_origin,
+    valid_publishable_key,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, ClearType};
@@ -176,6 +180,9 @@ pub(crate) struct LyricsSettingsEditor {
     selected: usize,
     color_target: Option<LyricColorTarget>,
     color_selected: usize,
+    editing_spicy_key: bool,
+    spicy_key_input: String,
+    spicy_key_invalid: bool,
 }
 
 pub(crate) enum TranscriptEditorResult {
@@ -406,16 +413,33 @@ impl LyricsSettingsEditor {
             selected: 0,
             color_target: None,
             color_selected: 0,
+            editing_spicy_key: false,
+            spicy_key_input: String::new(),
+            spicy_key_invalid: false,
         }
     }
 
     fn title(&self) -> &'static str {
+        if self.editing_spicy_key {
+            return tr("msg.spicy_key_title");
+        }
         self.color_target
             .map(LyricColorTarget::label)
             .unwrap_or_else(|| tr("msg.lyrics_settings"))
     }
 
     fn rows(&self, lyrics_visible: bool) -> Vec<String> {
+        if self.editing_spicy_key {
+            let mut rows = vec![
+                tr("msg.spicy_key_prompt").to_string(),
+                format!("> {}", "*".repeat(self.spicy_key_input.len().min(48))),
+                tr("msg.spicy_key_controls").to_string(),
+            ];
+            if self.spicy_key_invalid {
+                rows.push(tr("msg.spicy_key_invalid").to_string());
+            }
+            return rows;
+        }
         if self.color_target.is_some() {
             let mut rows = LyricColor::ALL
                 .into_iter()
@@ -485,6 +509,24 @@ impl LyricsSettingsEditor {
                 tr("msg.plain_lyrics_color"),
                 color_text(plain.label(), plain)
             ),
+            format!(
+                "{}: {}",
+                tr("msg.lyrics_source"),
+                match LyricsSource::load() {
+                    LyricsSource::Embedded => tr("msg.lyrics_source_embedded"),
+                    LyricsSource::Auto => tr("msg.lyrics_source_auto"),
+                    LyricsSource::Spicy => tr("msg.lyrics_source_spicy"),
+                }
+            ),
+            format!(
+                "{}: {}",
+                tr("msg.spicy_key_title"),
+                match publishable_key_origin() {
+                    PublishableKeyOrigin::Saved => tr("msg.spicy_key_saved"),
+                    PublishableKeyOrigin::Environment => tr("msg.spicy_key_environment"),
+                    PublishableKeyOrigin::Missing => tr("msg.spicy_key_missing"),
+                }
+            ),
             format!("← {}", tr("msg.back")),
         ];
         items
@@ -502,6 +544,42 @@ impl LyricsSettingsEditor {
         modifiers: KeyModifiers,
         lyrics_visible: bool,
     ) -> Result<LyricsEditorResult> {
+        if self.editing_spicy_key {
+            match code {
+                KeyCode::Esc => {
+                    self.spicy_key_input.clear();
+                    self.editing_spicy_key = false;
+                }
+                KeyCode::Delete => {
+                    save_setting_value(SPICY_KEY_SETTING, "")?;
+                    self.spicy_key_input.clear();
+                    self.editing_spicy_key = false;
+                }
+                KeyCode::Backspace => {
+                    self.spicy_key_input.pop();
+                    self.spicy_key_invalid = false;
+                }
+                KeyCode::Enter => {
+                    if valid_publishable_key(&self.spicy_key_input) {
+                        save_setting_value(SPICY_KEY_SETTING, &self.spicy_key_input)?;
+                        self.spicy_key_input.clear();
+                        self.editing_spicy_key = false;
+                    } else {
+                        self.spicy_key_invalid = true;
+                    }
+                }
+                KeyCode::Char(character)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if self.spicy_key_input.len() < 511 {
+                        self.spicy_key_input.push(character);
+                    }
+                    self.spicy_key_invalid = false;
+                }
+                _ => {}
+            }
+            return Ok(LyricsEditorResult::Handled);
+        }
         if code == KeyCode::Char('y') && modifiers.is_empty() {
             let visible = !lyrics_visible;
             save_setting_bool("playback.lyrics", visible)?;
@@ -535,8 +613,8 @@ impl LyricsSettingsEditor {
         }
 
         match code {
-            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(6),
-            KeyCode::Down => self.selected = (self.selected + 1) % 7,
+            KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(8),
+            KeyCode::Down => self.selected = (self.selected + 1) % 9,
             KeyCode::Enter => match self.selected {
                 0 => {
                     let visible = !lyrics_visible;
@@ -568,13 +646,52 @@ impl LyricsSettingsEditor {
                         .unwrap_or(0);
                     self.color_target = Some(target);
                 }
-                6 => return Ok(LyricsEditorResult::Close),
+                6 => save_setting_value("lyrics.source", LyricsSource::load().next().key())?,
+                7 => {
+                    self.editing_spicy_key = true;
+                    self.spicy_key_invalid = false;
+                    self.spicy_key_input.clear();
+                }
+                8 => return Ok(LyricsEditorResult::Close),
                 _ => unreachable!(),
             },
             KeyCode::Esc | KeyCode::Char('b') => return Ok(LyricsEditorResult::Close),
             _ => return Ok(LyricsEditorResult::Pass),
         }
         Ok(LyricsEditorResult::Handled)
+    }
+}
+
+#[cfg(test)]
+mod spicy_key_editor_tests {
+    use super::*;
+
+    #[test]
+    fn editor_masks_input_and_refuses_secret_keys_without_saving() {
+        let mut editor = LyricsSettingsEditor::new();
+        editor.selected = 7;
+        editor
+            .handle_key(KeyCode::Enter, KeyModifiers::NONE, false)
+            .unwrap();
+        assert!(editor.editing_spicy_key);
+
+        for character in "sl_sk_qexample".chars() {
+            editor
+                .handle_key(KeyCode::Char(character), KeyModifiers::NONE, false)
+                .unwrap();
+        }
+        assert!(!editor.rows(false).join("\n").contains("sl_sk_qexample"));
+        editor
+            .handle_key(KeyCode::Enter, KeyModifiers::NONE, false)
+            .unwrap();
+        assert!(editor.editing_spicy_key);
+        assert!(editor.spicy_key_invalid);
+
+        editor
+            .handle_key(KeyCode::Esc, KeyModifiers::NONE, false)
+            .unwrap();
+        assert!(!editor.editing_spicy_key);
+        assert!(editor.spicy_key_input.is_empty());
     }
 }
 
@@ -1080,7 +1197,9 @@ pub(crate) fn manage_lyrics_settings() -> Result<()> {
         if key.kind == KeyEventKind::Release {
             continue;
         }
-        if menu_quit_key(key.code, key.modifiers) {
+        if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (!editor.editing_spicy_key && menu_quit_key(key.code, key.modifiers))
+        {
             drop(_raw);
             clear_screen()?;
             std::process::exit(0);
@@ -1727,6 +1846,7 @@ fn playback_controls_with_middle(middle: &str, youtube: bool, width: usize) -> V
                 .map(str::trim)
                 .filter(|cell| !cell.is_empty()),
         );
+        controls.push(tr("msg.c_chapters"));
     }
     playback_control_grid(&controls, width)
 }
@@ -2430,6 +2550,7 @@ pub(crate) fn draw_player_panels(
     title: &str,
     rows: &[String],
     lyrics: Option<&Lyrics>,
+    attribution: Option<&[String]>,
     elapsed: Duration,
     lyrics_scroll: usize,
     show_lyrics: bool,
@@ -2468,11 +2589,28 @@ pub(crate) fn draw_player_panels(
     let (right_title, mut right_rows, center_right) = if let Some(editor) = lyrics_editor {
         (editor.title(), editor.rows(show_lyrics), false)
     } else {
-        (
-            tr("msg.lyrics"),
-            render_lyrics_panel_rows(lyrics, lyrics_width, lyrics_height, elapsed, lyrics_scroll),
-            center_lyrics,
-        )
+        let mut credits = attribution.map_or_else(Vec::new, |lines| {
+            lines
+                .iter()
+                .flat_map(|line| crate::lyrics::wrap_line(line, lyrics_width))
+                .collect::<Vec<_>>()
+        });
+        // Leave the user at least one lyric row; tiny terminals keep a resize prompt.
+        if credits.len() + 2 > lyrics_height && !credits.is_empty() {
+            return resize_terminal_message(stdout);
+        }
+        let content_height = lyrics_height.saturating_sub(if credits.is_empty() {
+            0
+        } else {
+            credits.len() + 1
+        });
+        let mut rendered =
+            render_lyrics_panel_rows(lyrics, lyrics_width, content_height, elapsed, lyrics_scroll);
+        if !credits.is_empty() {
+            rendered.push("─".repeat(lyrics_width));
+            rendered.append(&mut credits);
+        }
+        (tr("msg.lyrics"), rendered, center_lyrics)
     };
     if side_by_side {
         right_rows.truncate(usable_height.saturating_sub(4));
