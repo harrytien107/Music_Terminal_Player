@@ -27,7 +27,7 @@ A small terminal player for local libraries and online sources without the overh
 
 Local and Telegram tracks can display embedded plain lyrics, synchronized LRC, and word-synchronized Enhanced LRC directly beside or below the player.
 
-In **Lyrics settings**, choose **Lyrics source**: **Embedded only** (default, offline), **Auto** (prefer synchronized embedded lyrics), or **Spicy Lyrics preferred**. To use online lyrics, enter an approved publishable key through **Settings → Lyrics Settings → SpicyLyrics API Key** (or use the existing `SPICY_LYRICS_PUBLISHABLE_KEY` environment variable). The app shows available provider and contributor credits alongside online lyrics; it does not export them. See the [usage guide](docs/usage.md) for setup, local key storage, and API requirements.
+In **Lyrics settings**, choose **Lyrics source**: **Auto** (default; prefer synchronized embedded lyrics), **Embedded only** (offline), or **Spicy Lyrics preferred**. To use online lyrics, enter an approved publishable key through **Settings → Lyrics Settings → SpicyLyrics API Key** (or use the existing `SPICY_LYRICS_PUBLISHABLE_KEY` environment variable). The app shows available provider and contributor credits alongside online lyrics; it does not export them. See the [usage guide](docs/usage.md) for setup, local key storage, and API requirements.
 
 ![Music Terminal Player synchronized lyrics](docs/media/lyric-local-tele.png)
 
@@ -42,7 +42,7 @@ Press `c` during YouTube playback to open **YouTube Chapters**. Navigate with `U
 ## Installing
 Windows is supported. macOS and Linux support are planned.
 
-Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/tag/v3.1.0)
+Windows binaries are available in the [releases](https://github.com/harrytien107/Music_Terminal_Player/releases/latest)
 
 ## Tutorials
 

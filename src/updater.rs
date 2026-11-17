@@ -12,6 +12,9 @@ use crate::util::DATA_DIR;
 
 const LATEST: &str =
     "https://api.github.com/repos/harrytien107/Music_Terminal_Player/releases/latest";
+// Embedded in release binaries via --version. Validate bytes without running downloaded code.
+pub(crate) const VERSION_LINE: &str =
+    concat!("music-terminal-player v", env!("CARGO_PKG_VERSION"), "\n");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ZipAsset {
@@ -245,6 +248,22 @@ fn valid_windows_x64_executable(bytes: &[u8]) -> bool {
     header.starts_with(b"PE\0\0") && header[4..6] == [0x64, 0x86]
 }
 
+fn verify_release_exe_version(bytes: &[u8], release_tag: &str) -> Result<()> {
+    let [major, minor, patch] = version_numbers(release_tag).context("invalid release version")?;
+    let expected = format!("music-terminal-player v{major}.{minor}.{patch}\n");
+    if !bytes
+        .windows(expected.len())
+        .any(|part| part == expected.as_bytes())
+    {
+        bail!(
+            "Release {release_tag} contains an EXE without matching version metadata. \
+             Rebuild the release with Cargo.toml version {major}.{minor}.{patch} \
+             and upload the corrected Windows ZIP."
+        );
+    }
+    Ok(())
+}
+
 fn check_latest_release() -> Result<UpdateState> {
     let response = curl_output(LATEST, None)?;
     let release: Value =
@@ -316,6 +335,7 @@ fn stage_release_update(release: &ReleaseInfo) -> Result<()> {
     if !valid_windows_x64_executable(&binary) {
         bail!("release ZIP contains an invalid Windows x64 executable");
     }
+    verify_release_exe_version(&binary, &release.tag)?;
     let _ = fs::remove_file(&archive);
     fs::write(
         Path::new(DATA_DIR).join("update-status.txt"),
@@ -400,6 +420,16 @@ if (!$backupReady) {
 for ($attempt = 0; $attempt -lt 20; $attempt++) {
   try {
     Copy-Item -LiteralPath $Staged -Destination $Exe -Force -ErrorAction Stop
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $installedStream = [System.IO.File]::OpenRead($Exe)
+      try { $installedHash = [Convert]::ToBase64String($sha.ComputeHash($installedStream)) }
+      finally { $installedStream.Dispose() }
+      $stagedStream = [System.IO.File]::OpenRead($Staged)
+      try { $stagedHash = [Convert]::ToBase64String($sha.ComputeHash($stagedStream)) }
+      finally { $stagedStream.Dispose() }
+      if ($installedHash -ne $stagedHash) { throw 'Installed EXE does not match the staged update' }
+    } finally { $sha.Dispose() }
     if ($WindowMode -eq 'borderless') {
       Start-Process -FilePath $Exe -WorkingDirectory $WorkDir -ArgumentList '--borderless' -ErrorAction Stop
     } else {
@@ -586,6 +616,16 @@ mod tests {
         bytes[132..134].copy_from_slice(&0x014cu16.to_le_bytes());
         assert!(!valid_windows_x64_executable(&bytes));
         assert!(!valid_windows_x64_executable(b"MZ"));
+    }
+
+    #[test]
+    fn release_exe_must_embed_its_actual_package_version() {
+        let correct = format!("prefix{}suffix", VERSION_LINE);
+        assert!(verify_release_exe_version(correct.as_bytes(), env!("CARGO_PKG_VERSION")).is_ok());
+        assert!(verify_release_exe_version(correct.as_bytes(), "v3.1.0").is_err());
+        assert!(
+            verify_release_exe_version(b"old binary without version marker", "v3.1.1").is_err()
+        );
     }
 
     #[cfg(windows)]

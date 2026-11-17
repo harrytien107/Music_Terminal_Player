@@ -25,10 +25,14 @@ pub(crate) enum LyricsSource {
 
 impl LyricsSource {
     pub(crate) fn load() -> Self {
-        match load_setting_value("lyrics.source").as_deref() {
-            Some("auto") => Self::Auto,
+        Self::from_setting(load_setting_value("lyrics.source").as_deref())
+    }
+
+    fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("embedded") => Self::Embedded,
             Some("spicy") => Self::Spicy,
-            _ => Self::Embedded,
+            _ => Self::Auto,
         }
     }
 
@@ -565,6 +569,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lyrics_source_defaults_to_auto_and_preserves_saved_choices() {
+        assert_eq!(LyricsSource::from_setting(None), LyricsSource::Auto);
+        assert_eq!(LyricsSource::from_setting(Some("auto")), LyricsSource::Auto);
+        assert_eq!(
+            LyricsSource::from_setting(Some("embedded")),
+            LyricsSource::Embedded
+        );
+        assert_eq!(
+            LyricsSource::from_setting(Some("spicy")),
+            LyricsSource::Spicy
+        );
+    }
+
+    #[test]
     fn validate_only_publishable_client_keys() {
         assert!(valid_publishable_key("sl_pk_abc-123_XYZ"));
         assert!(!valid_publishable_key("sl_sk_abc-123_XYZ"));
@@ -633,7 +651,7 @@ mod tests {
         assert!(!cache_valid(now, now + 1));
         let lookup = SpicyLyricsLookup::new();
         let embedded = Lyrics::Plain(vec!["Existing".into()]);
-        // Embedded is always returned when the source is disabled (the default).
+        // Without an API key, embedded lyrics remain usable even with Auto selected.
         assert!(lookup.online.is_none());
         assert!(embedded.is_plain());
     }

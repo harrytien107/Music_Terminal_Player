@@ -20,6 +20,10 @@ mod util;
 mod youtube;
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("--version") {
+        print!("{}", updater::VERSION_LINE);
+        return;
+    }
     spicylyrics::prune_expired_cache();
     let mut args: Vec<String> = env::args().skip(1).collect();
     let is_relaunch = startup_window::consume_relaunch_marker(&mut args);
