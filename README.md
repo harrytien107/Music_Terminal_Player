@@ -1,6 +1,6 @@
 # Music Terminal Player
 
-Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, display embedded synchronized lyrics, or stream YouTube audio with synchronized transcripts through yt-dlp and FFmpeg.
+Lightweight, keyboard-driven terminal music player for Windows. Play local audio, stream synchronized Telegram public or private channels, manage playlists and queues, display embedded synchronized lyrics or spicy lyrics integrated, or stream YouTube audio with synchronized transcripts.
 
 ![Music Terminal Player playback](docs/media/player.png)
 
