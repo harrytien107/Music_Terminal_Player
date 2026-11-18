@@ -2,6 +2,19 @@
 
 Music Terminal Player currently supports Windows.
 
+## Table of contents
+
+| Topic | Sections |
+| --- | --- |
+| Getting started | [Start here](#start-here) · [Build and run](#build-and-run) · [Startup window size](#startup-window-size) · [Language](#language) |
+| Playback and lyrics | [Player controls](#player-controls) · [SpicyLyrics for Local and Telegram](#optional-spicy-lyrics-for-local-and-telegram) · [Windows media controls and output devices](#windows-media-controls-and-output-devices) |
+| YouTube | [Authentication](#youtube-authentication) · [Chapters](#youtube-chapters) · [Audio](#youtube-audio) |
+| Telegram | [Setup](#telegram-setup) · [Sync and streaming](#telegram-synchronization-and-streaming) · [Offline download](#telegram-offline-download) |
+| Library and settings | [Local playback](#local-playback) · [Playlists](#playlists) · [Automatic startup tasks and GitHub updates](#optional-automatic-startup-tasks) |
+| Reference | [Data files](#data-files) · [Terminal UI notes](#terminal-ui-notes) |
+
+For a shorter walkthrough, start at the [documentation index](README.md) and choose the Local, Telegram, or YouTube tutorial.
+
 ## Start here
 
 New users can follow one short tutorial at a time:

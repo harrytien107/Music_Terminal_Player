@@ -23,11 +23,20 @@ A small terminal player for local libraries and online sources without the overh
 - Configurable embedded lyrics for local and Telegram tracks, including line-synchronized LRC and word-synchronized Enhanced LRC
 - Optional Spicy Lyrics synchronized lyrics for local and Telegram tracks (requires approved client API access)
 
-### Lyrics support for local files and telegram
+### Lyrics support for local files and Telegram
 
 Local and Telegram tracks can display embedded plain lyrics, synchronized LRC, and word-synchronized Enhanced LRC directly beside or below the player.
 
-In **Lyrics settings**, choose **Lyrics source**: **Auto** (default; prefer synchronized embedded lyrics), **Embedded only** (offline), or **Spicy Lyrics preferred**. To use online lyrics, enter an approved publishable key through **Settings → Lyrics Settings → SpicyLyrics API Key** (or use the existing `SPICY_LYRICS_PUBLISHABLE_KEY` environment variable). The app shows available provider and contributor credits alongside online lyrics; it does not export them. See the [usage guide](docs/usage.md) for setup, local key storage, and API requirements.
+In **Lyrics settings**, choose **Lyrics source**: **Auto** (default; use synchronized embedded lyrics first), **Embedded only** (offline), or **Spicy Lyrics preferred**.
+
+**SpicyLyrics quick start (optional):**
+
+1. Visit the [SpicyLyrics developer portal](https://developers.spicylyrics.org/) and obtain an **approved publishable key** beginning with `sl_pk_`. A secret key (`sl_sk_`) will not work in this setting.
+2. In the player, open **Settings → Lyrics Settings → SpicyLyrics API Key**, enter your publishable key, and press **Enter** to save.
+3. Open **Settings → Lyrics Settings → Lyrics source**. Keep **Auto** to prefer embedded synchronized lyrics, or choose **Spicy Lyrics preferred** to try online lyrics first.
+4. Play a local or Telegram track. Matching lyrics appear in the existing Lyrics panel when available; playback still works if the lookup fails.
+
+For native-client access requirements, key storage, and troubleshooting, see the [SpicyLyrics section in the usage guide](docs/usage.md#optional-spicy-lyrics-for-local-and-telegram).
 
 ![Music Terminal Player synchronized lyrics](docs/media/lyric-local-tele.png)
 
@@ -82,4 +91,4 @@ open a dedicated Windows Terminal window on the next launch. Other windows and
 global terminal settings are unaffected. If Windows Terminal cannot start, the
 player uses its existing window and displays a warning.
 
-See the [usage guide](docs/usage.md) for CLI commands, queues, playlists, language packs, data files, and current limitations.
+Start at the [documentation index](docs/README.md) to find the right tutorial or topic. The [usage guide](docs/usage.md) covers CLI commands, queues, playlists, language packs, data files, and current limitations.
