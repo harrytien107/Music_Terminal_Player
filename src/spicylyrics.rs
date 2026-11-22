@@ -460,7 +460,7 @@ fn parse_lyrics(reply: &Value) -> Option<OnlineLyrics> {
                 if !url.starts_with("https://") {
                     return None;
                 }
-                credits.push(format!("{role}: {name} ({url})"));
+                credits.push(format!("{role}: {name}"));
             } else if role == "Uploader" {
                 return None;
             }
@@ -615,8 +615,12 @@ mod tests {
 
     #[test]
     fn parse_syllables_lines_static_and_attribution() {
-        let credits = json!({"Uploader":{"username":"alex","url":"https://spicylyrics.org/uid/1"},"Maker":{"username":"sam","url":"https://spicylyrics.org/uid/2"}});
+        let credits = json!({"Uploader":{"username":"iPixelGalaxy","url":"https://spicylyrics.org/uid/1"},"Maker":{"username":"ItsNoot3rch <3","url":"https://spicylyrics.org/uid/2"}});
         let response = json!({"Body":{"source":"spicy_lyrics","UploadAttribution":credits,"Type":"Syllable","Content":[{"Lead":{"Syllables":[{"Text":"Hello","StartTime":1.0},{"Text":"world","StartTime":1.4}]}}]}});
+        let mut invalid_url_response = response.clone();
+        invalid_url_response["Body"]["UploadAttribution"]["Uploader"]["url"] =
+            json!("http://spicylyrics.org/uid/1");
+        assert!(parse_lyrics(&invalid_url_response).is_none());
         let Some(OnlineLyrics {
             lyrics: Lyrics::Enhanced(tokens),
             attribution,
@@ -624,12 +628,19 @@ mod tests {
         else {
             panic!("expected enhanced")
         };
+        assert_eq!(
+            attribution,
+            [
+                "Lyrics: Spicy Lyrics",
+                "Uploader: iPixelGalaxy",
+                "Maker: ItsNoot3rch <3"
+            ]
+        );
         assert!(
             attribution
                 .iter()
-                .any(|line| line.contains("Uploader: alex"))
+                .all(|line| crate::lyrics::wrap_line(line, 35).len() == 1)
         );
-        assert!(attribution.iter().any(|line| line.contains("Maker: sam")));
         assert_eq!(tokens[0].at, Duration::from_secs(1));
         let response = json!({"Body":{"source":"spotify","Type":"Line","Content":[{"Text":"Line one","StartTime":2.0}]}});
         assert!(matches!(
